@@ -7,6 +7,9 @@ outputs/
 runs/
 reports/generated/
 tensorboard_logs/
+config/*/code/
+config/*/recon/
+config/*/modulations/
 *.ckpt
 *.pth
 *.pt
