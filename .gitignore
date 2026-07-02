@@ -2,14 +2,15 @@
 __pycache__/
 
 datasets/
+datasets
 external/
 outputs/
 runs/
 reports/generated/
 tensorboard_logs/
-config/*/code/
-config/*/recon/
-config/*/modulations/
+config/*/*/code/
+config/*/*/recon/
+config/*/*/modulations/
 *.ckpt
 *.pth
 *.pt
