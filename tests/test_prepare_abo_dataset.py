@@ -11,10 +11,10 @@ from scripts.prepare_abo_dataset import (
 
 
 class PrepareAboDatasetSplitTests(unittest.TestCase):
-    def test_compute_split_counts_preserves_val_and_test(self) -> None:
-        self.assertEqual(compute_split_counts(10, 0.8), (8, 1, 1))
-        self.assertEqual(compute_split_counts(4, 0.8), (2, 1, 1))
-        self.assertEqual(compute_split_counts(3, 0.8), (1, 1, 1))
+    def test_compute_split_counts_preserves_validation_split(self) -> None:
+        self.assertEqual(compute_split_counts(10, 0.8), (8, 2))
+        self.assertEqual(compute_split_counts(4, 0.8), (3, 1))
+        self.assertEqual(compute_split_counts(3, 0.8), (2, 1))
 
     def test_build_split_sets_balances_aggregate_classes(self) -> None:
         type_to_ids = {
@@ -26,11 +26,10 @@ class PrepareAboDatasetSplitTests(unittest.TestCase):
         all_splits, per_type_splits = build_split_sets(type_to_ids, 0.8, seed=7)
 
         self.assertEqual(len(all_splits["all"]), 12)
-        self.assertEqual(len(all_splits["train"]), 6)
+        self.assertEqual(len(all_splits["train"]), 9)
         self.assertEqual(len(all_splits["val"]), 3)
-        self.assertEqual(len(all_splits["test"]), 3)
 
-        for split_name, expected_per_class in (("train", 2), ("val", 1), ("test", 1)):
+        for split_name, expected_per_class in (("train", 3), ("val", 1)):
             counts = {}
             for model_id in all_splits[split_name]:
                 class_name = model_id.split("_", 1)[0]
@@ -38,15 +37,12 @@ class PrepareAboDatasetSplitTests(unittest.TestCase):
             self.assertEqual(counts, {"chair": expected_per_class, "lamp": expected_per_class, "table": expected_per_class})
 
         self.assertEqual(len(per_type_splits["chair"]["train"]), 4)
-        self.assertEqual(len(per_type_splits["chair"]["val"]), 1)
-        self.assertEqual(len(per_type_splits["chair"]["test"]), 1)
+        self.assertEqual(len(per_type_splits["chair"]["val"]), 2)
         self.assertTrue(set(per_type_splits["chair"]["train"]).isdisjoint(per_type_splits["chair"]["val"]))
-        self.assertTrue(set(per_type_splits["chair"]["train"]).isdisjoint(per_type_splits["chair"]["test"]))
         self.assertEqual(
             sorted(
                 per_type_splits["chair"]["train"]
                 + per_type_splits["chair"]["val"]
-                + per_type_splits["chair"]["test"]
             ),
             per_type_splits["chair"]["all"],
         )
@@ -62,10 +58,10 @@ class PrepareAboDatasetSplitTests(unittest.TestCase):
 
         self.assertEqual(first, second)
 
-    def test_build_split_sets_rejects_tiny_classes(self) -> None:
+    def test_build_split_sets_rejects_singleton_classes(self) -> None:
         type_to_ids = {
             "chair": [f"chair_{idx}" for idx in range(6)],
-            "lamp": ["lamp_0", "lamp_1"],
+            "lamp": ["lamp_0"],
         }
 
         with self.assertRaises(ValueError):
@@ -76,10 +72,9 @@ class PrepareAboDatasetSplitTests(unittest.TestCase):
             "all": ["chair_0", "lamp_0"],
             "train": ["chair_0"],
             "val": ["lamp_0"],
-            "test": [],
         }
         per_type_splits = {
-            "chair": {"all": ["chair_0"], "train": ["chair_0"], "val": [], "test": []},
+            "chair": {"all": ["chair_0"], "train": ["chair_0"], "val": []},
         }
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -99,7 +94,7 @@ class PrepareAboDatasetSplitTests(unittest.TestCase):
                 {"abo": {"ABO": ["chair_0"]}},
             )
             self.assertIn("chair", split_paths["by_product_type"])
-            self.assertIn("test", split_paths["by_product_type"]["chair"])
+            self.assertIn("val", split_paths["by_product_type"]["chair"])
 
 
 if __name__ == "__main__":
