@@ -22,8 +22,8 @@ year={2023}
 root directory
   ├── config  
   │   └── // folders for checkpoints and training configs
-  ├── data  
-  │   └── // folders for data (in csv format) and train test splits (json)
+  ├── data / datasets  
+  │   └── // preprocessed SDF csv files, grid csv files, and split manifests (json)
   ├── models  
   │   ├── // models and lightning modules; main model is 'combined_model.py'
   │   └── archs
@@ -55,6 +55,46 @@ conda activate diffusionsdf
 For training, we preprocess all meshes and store query coordinates and signed distance values in csv files. Each csv file corresponds to one object, and each line represents a coordinate followed by its signed distance value. See `data/acronym` for examples. Modify the dataloader according to your file format. <br>
 
 When sampling query points, make sure to also **sample uniformly within the 3D grid space** (i.e. from (-1,-1,-1) to (1,1,1)) rather than only sampling near the surface to avoid artifacts. For each training batch, we take 70% of query points sampled near the object surface and 30% sampled uniformly in the grid. `grid_source` in our dataloader and config file refers to the latter. <br>
+
+The loaders expect split files with the following JSON shape:
+
+```json
+{
+  "abo": {
+    "ABO": [
+      "3dmodel_id_1",
+      "3dmodel_id_2"
+    ]
+  }
+}
+```
+
+The preprocessed directory layout used by the ABO scripts is:
+
+```text
+datasets/
+  abo/
+    ABO/
+      <3dmodel_id>/
+        sdf_data.csv
+  grid_data/
+    abo/
+      ABO/
+        <3dmodel_id>/
+          grid_gt.csv
+  splits/
+    abo_all_all.json
+    abo_all_train.json
+    abo_all_val.json
+    abo_<product_type>_all.json
+    abo_<product_type>_train.json
+    abo_<product_type>_val.json
+    abo_metadata.json
+```
+
+`scripts/prepare_abo_dataset.py` writes balanced aggregate splits in `datasets/splits/abo_all_{train,val}.json` by downsampling every `product_type_key` to the smallest category before splitting. It also writes per-category manifests under `datasets/splits/abo_<product_type>_{train,val}.json`. By default, `--train-ratio 0.8` produces a simple `80/20` `train/val` split, and the output is deterministic for a fixed `--seed`.
+
+ABO training configs can point `TrainSplit` and `TestSplit` directly at these manifest files, for example `datasets/splits/abo_all_train.json` and `datasets/splits/abo_all_val.json`.
 
 ## Training
 As described in our [paper](https://arxiv.org/abs/2211.13757), there are three stages of training. All corresponding config files can be found in the `config` folders. Logs are created in a `tensorboard_logs` folder in the root directory. We recommend tuning the `"kld_weight"` when training the joint SDF-VAE model as it enforces the continuity of the latent space. A higher value (e.g. 0.1) will result in better interpolation and generalization but sometimes more artifacts. A lower value (e.g. 0.00001) will result in worse interpolation but higher quality of generations. <br>
