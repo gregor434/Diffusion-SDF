@@ -19,22 +19,26 @@ class PointCloudConditionEncoder(ConditionEncoder):
 
 
 class ImageConditionEncoder(ConditionEncoder):
-    def __init__(self, condition_dim, patch_size=16, in_channels=3, **kwargs):
+    def __init__(self, condition_dim, clip_feature_dim=512, **kwargs):
         super().__init__()
-        self.patch_size = patch_size
-        self.proj = nn.Conv2d(
-            in_channels,
-            condition_dim,
-            kernel_size=patch_size,
-            stride=patch_size,
-            **kwargs,
-        )
+        self.clip_feature_dim = clip_feature_dim
+        if clip_feature_dim == condition_dim:
+            self.proj = nn.Identity()
+        else:
+            self.proj = nn.Linear(clip_feature_dim, condition_dim)
 
-    def forward(self, image):
-        if image.dim() != 4:
-            raise ValueError(f"image condition must have shape [B, C, H, W], got {tuple(image.shape)}")
-        tokens = self.proj(image)
-        return tokens.flatten(2).transpose(1, 2)
+    def forward(self, image_features):
+        if image_features.dim() == 2:
+            image_features = image_features.unsqueeze(1)
+        if image_features.dim() != 3:
+            raise ValueError(
+                f"image condition must have shape [B, 1, {self.clip_feature_dim}], got {tuple(image_features.shape)}"
+            )
+        if image_features.shape[-1] != self.clip_feature_dim:
+            raise ValueError(
+                f"image condition last dimension must be {self.clip_feature_dim}, got {image_features.shape[-1]}"
+            )
+        return self.proj(image_features)
 
 
 class ConditionEncoderSet(nn.Module):

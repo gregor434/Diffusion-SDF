@@ -18,31 +18,43 @@ class ConditionEncoderSetTests(unittest.TestCase):
 
         self.assertEqual(tokens.shape, torch.Size([2, 5, 6]))
 
-    def test_image_condition_returns_patch_tokens(self):
+    def test_image_condition_projects_clip_token(self):
         encoder = ConditionEncoderSet(
             condition_dim=7,
-            condition_encoders=[{"type": "image", "patch_size": 4}],
+            condition_encoders=[{"type": "image"}],
         )
 
-        tokens = encoder({"image": torch.randn(2, 3, 8, 12)})
+        tokens = encoder({"image": torch.randn(2, 1, 512)})
 
-        self.assertEqual(tokens.shape, torch.Size([2, 6, 7]))
+        self.assertEqual(tokens.shape, torch.Size([2, 1, 7]))
+
+    def test_image_condition_uses_identity_when_dims_match(self):
+        encoder = ConditionEncoderSet(
+            condition_dim=512,
+            condition_encoders=[{"type": "image"}],
+        )
+
+        image_features = torch.randn(2, 1, 512)
+        tokens = encoder({"image": image_features})
+
+        self.assertEqual(tokens.shape, torch.Size([2, 1, 512]))
+        self.assertTrue(torch.equal(tokens, image_features))
 
     def test_multiple_modalities_concatenate_tokens(self):
         encoder = ConditionEncoderSet(
             condition_dim=5,
             condition_encoders=[
                 {"type": "point_cloud", "plane_resolution": 8, "unet": False},
-                {"type": "image", "patch_size": 4},
+                {"type": "image"},
             ],
         )
 
         tokens = encoder({
             "point_cloud": torch.randn(2, 3, 3),
-            "image": torch.randn(2, 3, 8, 8),
+            "image": torch.randn(2, 1, 512),
         })
 
-        self.assertEqual(tokens.shape, torch.Size([2, 7, 5]))
+        self.assertEqual(tokens.shape, torch.Size([2, 4, 5]))
 
 
 class DiffusionConditioningSmokeTests(unittest.TestCase):
@@ -66,11 +78,11 @@ class DiffusionConditioningSmokeTests(unittest.TestCase):
     def test_image_conditional_diffusion_net_accepts_conditioning_dict(self):
         model = self.make_net(
             cond=True,
-            condition_encoders=[{"type": "image", "patch_size": 4}],
+            condition_encoders=[{"type": "image"}],
         )
 
         out = model(
-            (torch.randn(2, 16), {"image": torch.randn(2, 3, 8, 8)}),
+            (torch.randn(2, 16), {"image": torch.randn(2, 1, 512)}),
             torch.tensor([0, 1]),
         )
 
@@ -98,13 +110,13 @@ class DiffusionConditioningSmokeTests(unittest.TestCase):
                 "condition_dim": 8,
                 "dim_head": 4,
                 "heads": 2,
-                "condition_encoders": [{"type": "image", "patch_size": 4}],
+                "condition_encoders": [{"type": "image"}],
             },
         }
         model = CombinedModel(specs)
         batch = {
             "latent": torch.randn(2, 16),
-            "conditioning": {"image": torch.randn(2, 3, 8, 8)},
+            "conditioning": {"image": torch.randn(2, 1, 512)},
         }
 
         loss = model.train_diffusion(batch)

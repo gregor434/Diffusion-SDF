@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import os
+import re
+import hashlib
 
 import numpy as np
 import torch
@@ -11,6 +13,30 @@ from diff_utils.helpers import sample_pc
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
 DEFAULT_IMAGE_SIZE = 224
+DEFAULT_CLIP_MODEL = "ViT-B/32"
+DEFAULT_CLIP_FEATURE_DIM = 512
+
+
+_CLIP_CACHE = {}
+
+
+def load_clip_model(clip_model):
+    if clip_model not in _CLIP_CACHE:
+        try:
+            import clip
+        except ImportError as exc:
+            raise ImportError(
+                "Image conditioning requires OpenAI CLIP. Install it with "
+                "`pip install git+https://github.com/openai/CLIP.git`."
+            ) from exc
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model, preprocess = clip.load(clip_model, device=device)
+        model.eval()
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        _CLIP_CACHE[clip_model] = (model, preprocess, device)
+    return _CLIP_CACHE[clip_model]
 
 
 class ConditioningSource:
@@ -56,6 +82,11 @@ class PointCloudConditioning(ConditioningSource):
 class ImageConditioning(ConditioningSource):
     name = "image"
 
+    def __init__(self, path, cache_path=None, clip_model=DEFAULT_CLIP_MODEL):
+        super().__init__(path)
+        self.cache_path = cache_path or os.path.join(path, ".clip_cache")
+        self.clip_model = clip_model
+
     def resolve(self, record):
         image_dir = os.path.join(self.path, record["instance_name"])
         if not os.path.isdir(image_dir):
@@ -68,12 +99,44 @@ class ImageConditioning(ConditioningSource):
         )
         return image_paths[0] if image_paths else None
 
+    def load(self, record):
+        path = self.resolve(record)
+        cache_path = self.resolve_cache_path(record)
+        if os.path.isfile(cache_path):
+            return torch.load(cache_path, map_location="cpu").float()
+
+        feature = self.load_from_path(path)
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        tmp_path = "{}.tmp.{}".format(cache_path, os.getpid())
+        torch.save(feature, tmp_path)
+        os.replace(tmp_path, cache_path)
+        return feature
+
+    def resolve_cache_path(self, record):
+        model_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", self.clip_model).strip("_")
+        identifier = "{}/{}/{}".format(
+            record["dataset"],
+            record["class_name"],
+            record["instance_name"],
+        )
+        digest = hashlib.sha1("{}::{}".format(self.clip_model, identifier).encode("utf8")).hexdigest()[:12]
+        filename = "{}-{}.pt".format(model_name, digest)
+        return os.path.join(
+            self.cache_path,
+            record["dataset"],
+            record["class_name"],
+            record["instance_name"],
+            filename,
+        )
+
     def load_from_path(self, path):
         image = Image.open(path)
         image = ImageOps.exif_transpose(image).convert("RGB")
-        image = resize_and_center_crop(image, DEFAULT_IMAGE_SIZE)
-        array = np.asarray(image, dtype=np.float32) / 255.0
-        return torch.from_numpy(array).permute(2, 0, 1).contiguous()
+        model, preprocess, device = load_clip_model(self.clip_model)
+        image_tensor = preprocess(image).unsqueeze(0).to(device)
+        with torch.no_grad():
+            feature = model.encode_image(image_tensor)
+        return feature.cpu().float().view(1, -1).contiguous()
 
 
 def resize_and_center_crop(image, size):
@@ -96,7 +159,11 @@ def build_conditioning_sources(conditioning_specs=None):
     sources = []
     for spec in conditioning_specs:
         if spec["type"] == "image":
-            sources.append(ImageConditioning(spec["path"]))
+            sources.append(ImageConditioning(
+                spec["path"],
+                cache_path=spec.get("cache_path"),
+                clip_model=spec.get("clip_model", DEFAULT_CLIP_MODEL),
+            ))
         elif spec["type"] == "point_cloud":
             sources.append(PointCloudConditioning(spec["path"], spec.get("pc_size", 1024)))
         else:
