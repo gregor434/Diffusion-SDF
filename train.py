@@ -33,19 +33,22 @@ def train():
     
     # initialize dataset and loader
     split = json.load(open(specs["TrainSplit"], "r"))
-    if specs['training_task'] == 'diffusion':
-        train_dataset = ModulationLoader(
-            specs["data_path"],
-            split_file=split,
-            conditioning=get_conditioning_specs(specs),
-        )
-    else:
-        train_dataset = SdfLoader(specs["DataSource"], split, pc_size=specs.get("PCsize",1024), grid_source=specs.get("GridSource", None), modulation_path=specs.get("modulation_path", None))
+    train_dataset = build_dataset(split)
     train_dataloader = torch.utils.data.DataLoader(
             train_dataset,
             batch_size=args.batch_size, num_workers=args.workers,
-            drop_last=True, shuffle=True, pin_memory=True, persistent_workers=True
+            drop_last=True, shuffle=True, pin_memory=True, persistent_workers=args.workers > 0
         )
+
+    val_dataloader = None
+    if specs.get("ValSplit") is not None:
+        val_split = json.load(open(specs["ValSplit"], "r"))
+        val_dataset = build_dataset(val_split)
+        val_dataloader = torch.utils.data.DataLoader(
+                val_dataset,
+                batch_size=args.batch_size, num_workers=args.workers,
+                drop_last=False, shuffle=False, pin_memory=True, persistent_workers=args.workers > 0
+            )
 
     # creates a copy of current code / files in the config folder
     save_code_to_conf(args.exp_dir) 
@@ -81,7 +84,28 @@ def train():
     # precision 16 can be unstable (nan loss); recommend using 32
     trainer = pl.Trainer(accelerator='gpu', devices=-1, precision=32, max_epochs=specs["num_epochs"], callbacks=callbacks, log_every_n_steps=1,
                         default_root_dir=os.path.join("tensorboard_logs", args.exp_dir))
-    trainer.fit(model=model, train_dataloaders=train_dataloader, ckpt_path=resume)
+    if val_dataloader is not None:
+        trainer.fit(model=model, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader, ckpt_path=resume)
+    else:
+        trainer.fit(model=model, train_dataloaders=train_dataloader, ckpt_path=resume)
+
+
+def build_dataset(split):
+    if specs['training_task'] == 'diffusion':
+        return ModulationLoader(
+            specs["data_path"],
+            split_file=split,
+            conditioning=get_conditioning_specs(specs),
+        )
+
+    return SdfLoader(
+        specs["DataSource"],
+        split,
+        samples_per_mesh=specs.get("SampPerMesh", 16000),
+        pc_size=specs.get("PCsize",1024),
+        grid_source=specs.get("GridSource", None),
+        modulation_path=specs.get("modulation_path", None),
+    )
 
 
 def get_conditioning_specs(specs):

@@ -2,6 +2,7 @@ import torch
 import torch.utils.data 
 from torch.nn import functional as F
 import pytorch_lightning as pl
+from einops import reduce
 
 # add paths in model/__init__.py for new models
 from models import * 
@@ -34,6 +35,21 @@ class CombinedModel(pl.LightningModule):
             return self.train_modulation(x)
         elif self.task == 'diffusion':
             return self.train_diffusion(x)
+
+
+    def validation_step(self, x, idx):
+
+        if self.task == 'combined':
+            losses = self.combined_losses(x)
+        elif self.task == 'modulation':
+            losses = self.modulation_losses(x)
+        elif self.task == 'diffusion':
+            losses = self.diffusion_losses(x)
+        else:
+            return None
+
+        self.log_prefixed_losses("val", losses, on_step=False, on_epoch=True)
+        return losses["loss"]
         
 
     def configure_optimizers(self):
@@ -64,7 +80,7 @@ class CombinedModel(pl.LightningModule):
 
     #-----------different training steps for sdf modulation, diffusion, combined----------
 
-    def train_modulation(self, x):
+    def modulation_losses(self, x):
 
         xyz = x['xyz'] # (B, N, 3)
         gt = x['gt_sdf'] # (B, N)
@@ -92,15 +108,28 @@ class CombinedModel(pl.LightningModule):
 
         loss = sdf_loss + vae_loss
 
-        loss_dict =  {"sdf": sdf_loss, "vae": vae_loss}
-        self.log_dict(loss_dict, prog_bar=True, enable_graph=False)
-
-        return loss
+        return {"loss": loss, "sdf": sdf_loss, "vae": vae_loss}
 
 
-    def train_diffusion(self, x):
+    def log_prefixed_losses(self, prefix, losses, on_step, on_epoch):
 
-        self.train()
+        loss_dict = {
+            "{}/{}".format(prefix, key): value
+            for key, value in losses.items()
+        }
+        self.log_dict(loss_dict, prog_bar=True, enable_graph=False, on_step=on_step, on_epoch=on_epoch)
+
+
+    def train_modulation(self, x):
+
+        losses = self.modulation_losses(x)
+        self.log_prefixed_losses("train", losses, on_step=True, on_epoch=False)
+
+        return losses["loss"]
+
+
+    def diffusion_losses(self, x):
+
 
         latent = x['latent'] # (B, D)
 
@@ -115,18 +144,23 @@ class CombinedModel(pl.LightningModule):
         # visualizing loss curves can help with debugging if training is unstable
         diff_loss, diff_100_loss, diff_1000_loss, pred_latent, perturbed_cond = self.diffusion_model.diffusion_model_from_latent(latent, cond=cond)
 
-        loss_dict =  {
-                        "total": diff_loss,
+        return {
+                        "loss": diff_loss,
                         "diff100": diff_100_loss, # note that this can appear as nan when the training batch does not have sampled timesteps < 100
                         "diff1000": diff_1000_loss
                     }
-        self.log_dict(loss_dict, prog_bar=True, enable_graph=False)
 
-        return diff_loss
+
+    def train_diffusion(self, x):
+
+        losses = self.diffusion_losses(x)
+        self.log_prefixed_losses("train", losses, on_step=True, on_epoch=False)
+
+        return losses["loss"]
 
     # the first half is the same as "train_sdf_modulation"
     # the reconstructed latent is used as input to the diffusion model, rather than loading latents from the dataloader as in "train_diffusion"
-    def train_combined(self, x):
+    def combined_losses(self, x):
         xyz = x['xyz'] # (B, N, 3)
         gt = x['gt_sdf'] # (B, N)
         pc = x['point_cloud'] # (B, 1024, 3)
@@ -170,8 +204,8 @@ class CombinedModel(pl.LightningModule):
         # results could potentially improve with a grid search 
         loss = sdf_loss + vae_loss + diff_loss + generated_sdf_loss
 
-        loss_dict =  {
-                        "total": loss,
+        return {
+                        "loss": loss,
                         "sdf": sdf_loss,
                         "vae": vae_loss,
                         "diff": diff_loss,
@@ -182,6 +216,11 @@ class CombinedModel(pl.LightningModule):
                         #"diff1000": diff_1000_loss,
                         "gensdf": generated_sdf_loss,
                     }
-        self.log_dict(loss_dict, prog_bar=True, enable_graph=False)
 
-        return loss
+
+    def train_combined(self, x):
+
+        losses = self.combined_losses(x)
+        self.log_prefixed_losses("train", losses, on_step=True, on_epoch=False)
+
+        return losses["loss"]

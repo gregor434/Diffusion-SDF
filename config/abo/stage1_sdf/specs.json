@@ -1,9 +1,10 @@
 {
-  "Description" : "training joint SDF-VAE model for modulating SDFs on the ABO chair dataset",
+  "Description" : "single-sample overfit run for stage-1 SDF-VAE pipeline verification",
   "DataSource" : "datasets",
   "GridSource" : "datasets/grid_data",
-  "TrainSplit" : "datasets/splits/abo_CHAIR_train.json",
-  "TestSplit" : "datasets/splits/abo_CHAIR_val.json",
+  "TrainSplit" : "config/abo/stage1_sdf/overfit_one.json",
+  "ValSplit" : "config/abo/stage1_sdf/overfit_one.json",
+  "TestSplit" : "config/abo/stage1_sdf/overfit_one.json",
 
   "training_task": "modulation",
 
