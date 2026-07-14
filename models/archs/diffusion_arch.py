@@ -10,6 +10,7 @@ from einops_exts import rearrange_many, repeat_many, check_shape
 from rotary_embedding_torch import RotaryEmbedding
 
 from diff_utils.model_utils import * 
+from models.archs.condition_encoders import ConditionEncoderSet
 
 from random import sample
 
@@ -44,24 +45,24 @@ class CausalTransformer(nn.Module):
 
         dim_in_out = default(dim_in_out, dim)
         self.use_same_dims = (dim_in_out is None) or (dim_in_out==dim)
-        point_feature_dim = kwargs.get('point_feature_dim', dim)
+        condition_dim = kwargs.get('condition_dim', kwargs.get('point_feature_dim', dim))
 
         if cross_attn:
             #print("using CROSS ATTN, with dropout {}".format(attn_dropout))
             self.layers.append(nn.ModuleList([
                     Attention(dim = dim_in_out, out_dim=dim, causal = True, dim_head = dim_head, heads = heads, rotary_emb = rotary_emb),
-                    Attention(dim = dim, kv_dim=point_feature_dim, causal = True, dim_head = dim_head, heads = heads, dropout = attn_dropout, rotary_emb = rotary_emb_cross),
+                    Attention(dim = dim, kv_dim=condition_dim, causal = True, dim_head = dim_head, heads = heads, dropout = attn_dropout, rotary_emb = rotary_emb_cross),
                     FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout, post_activation_norm = normformer)
                 ]))
             for _ in range(depth):
                 self.layers.append(nn.ModuleList([
                     Attention(dim = dim, causal = True, dim_head = dim_head, heads = heads, rotary_emb = rotary_emb),
-                    Attention(dim = dim, kv_dim=point_feature_dim, causal = True, dim_head = dim_head, heads = heads, dropout = attn_dropout, rotary_emb = rotary_emb_cross),
+                    Attention(dim = dim, kv_dim=condition_dim, causal = True, dim_head = dim_head, heads = heads, dropout = attn_dropout, rotary_emb = rotary_emb_cross),
                     FeedForward(dim = dim, mult = ff_mult, dropout = ff_dropout, post_activation_norm = normformer)
                 ]))
             self.layers.append(nn.ModuleList([
                     Attention(dim = dim, out_dim=dim, causal = True, dim_head = dim_head, heads = heads, rotary_emb = rotary_emb),
-                    Attention(dim = dim, kv_dim=point_feature_dim, out_dim=dim_in_out, causal = True, dim_head = dim_head, heads = heads, dropout = attn_dropout, rotary_emb = rotary_emb_cross),
+                    Attention(dim = dim, kv_dim=condition_dim, out_dim=dim_in_out, causal = True, dim_head = dim_head, heads = heads, dropout = attn_dropout, rotary_emb = rotary_emb_cross),
                     FeedForward(dim = dim_in_out, out_dim=dim_in_out, mult = ff_mult, dropout = ff_dropout, post_activation_norm = normformer)
                 ]))
         else:
@@ -137,7 +138,8 @@ class DiffusionNet(nn.Module):
         self.cond = cond
         self.cross_attn = kwargs.get('cross_attn', False)
         self.cond_dropout = kwargs.get('cond_dropout', False)
-        self.point_feature_dim = kwargs.get('point_feature_dim', dim)
+        self.condition_dim = kwargs.get('condition_dim', kwargs.get('point_feature_dim', dim))
+        self.point_feature_dim = self.condition_dim
 
         self.dim_in_out = default(dim_in_out, dim)
         #print("dim, in out, point feature dim: ", dim, dim_in_out, self.point_feature_dim)
@@ -150,11 +152,14 @@ class DiffusionNet(nn.Module):
 
         # last input to the transformer: "a final embedding whose output from the Transformer is used to predicted the unnoised CLIP image embedding"
         self.learned_query = nn.Parameter(torch.randn(self.dim_in_out))
+        kwargs["condition_dim"] = self.condition_dim
         self.causal_transformer = CausalTransformer(dim = dim, dim_in_out=self.dim_in_out, **kwargs)
 
         if cond:
-            # output dim of pointnet needs to match model dim; unless add additional linear layer
-            self.pointnet = ConvPointnet(c_dim=self.point_feature_dim) 
+            self.condition_encoder = ConditionEncoderSet(
+                condition_dim=self.condition_dim,
+                condition_encoders=kwargs.get("condition_encoders"),
+            )
 
 
     def forward(
@@ -166,23 +171,19 @@ class DiffusionNet(nn.Module):
     ):
 
         if self.cond:
-            assert type(data) is tuple
+            assert isinstance(data, tuple)
             data, cond = data # adding noise to cond_feature so doing this in diffusion.py
 
             #print("data, cond shape: ", data.shape, cond.shape) # B, dim_in_out; B, N, 3
             #print("pass cond: ", pass_cond)
+            cond_feature = self.condition_encoder(cond)
             if self.cond_dropout:
                 # classifier-free guidance: 20% unconditional 
-                prob = torch.randint(low=0, high=10, size=(1,))
+                prob = torch.randint(low=0, high=10, size=(1,), device=data.device).item()
                 percentage = 8
                 if prob < percentage or pass_cond==0:
-                    cond_feature = torch.zeros( (cond.shape[0], cond.shape[1], self.point_feature_dim), device=data.device )
+                    cond_feature = torch.zeros_like(cond_feature)
                     #print("zeros shape: ", cond_feature.shape) 
-                elif prob >= percentage or pass_cond==1:
-                    cond_feature = self.pointnet(cond, cond)
-                    #print("cond shape: ", cond_feature.shape)
-            else:
-                cond_feature = self.pointnet(cond, cond)
 
             
         batch, dim, device, dtype = *data.shape, data.device, data.dtype
@@ -213,4 +214,3 @@ class DiffusionNet(nn.Module):
         pred = tokens[..., -1, :]
 
         return pred
-

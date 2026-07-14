@@ -102,16 +102,18 @@ class CombinedModel(pl.LightningModule):
 
         self.train()
 
-        pc = x['point_cloud'] # (B, 1024, 3) or False if unconditional 
         latent = x['latent'] # (B, D)
 
         # unconditional training if cond is None 
-        cond = pc if self.specs['diffusion_model_specs']['cond'] else None 
+        if self.specs['diffusion_model_specs']['cond']:
+            cond = x.get('conditioning', x.get('point_cloud'))
+        else:
+            cond = None
 
         # diff_100 and 1000 loss refers to the losses when t<100 and 100<t<1000, respectively 
         # typically diff_100 approaches 0 while diff_1000 can still be relatively high
         # visualizing loss curves can help with debugging if training is unstable
-        diff_loss, diff_100_loss, diff_1000_loss, pred_latent, perturbed_pc = self.diffusion_model.diffusion_model_from_latent(latent, cond=cond)
+        diff_loss, diff_100_loss, diff_1000_loss, pred_latent, perturbed_cond = self.diffusion_model.diffusion_model_from_latent(latent, cond=cond)
 
         loss_dict =  {
                         "total": diff_loss,
@@ -149,8 +151,11 @@ class CombinedModel(pl.LightningModule):
         sdf_loss = reduce(sdf_loss, 'b ... -> b (...)', 'mean').mean()
 
         # STEP 4: use latent as input to diffusion model
-        cond = pc if self.specs['diffusion_model_specs']['cond'] else None
-        diff_loss, diff_100_loss, diff_1000_loss, pred_latent, perturbed_pc = self.diffusion_model.diffusion_model_from_latent(latent, cond=cond)
+        if self.specs['diffusion_model_specs']['cond']:
+            cond = x.get('conditioning', pc)
+        else:
+            cond = None
+        diff_loss, diff_100_loss, diff_1000_loss, pred_latent, perturbed_cond = self.diffusion_model.diffusion_model_from_latent(latent, cond=cond)
         
         # STEP 5: use predicted / reconstructed latent to run SDF loss 
         generated_plane_feature = self.vae_model.decode(pred_latent)

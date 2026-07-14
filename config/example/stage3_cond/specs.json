@@ -44,8 +44,10 @@
     "cond" : true,
     "cross_attn" : true,
     "cond_dropout":true,
-    "point_feature_dim" : 128
+    "condition_dim" : 128,
+    "condition_encoders": [
+      {"type": "point_cloud"}
+    ]
   }
 }
-
 
