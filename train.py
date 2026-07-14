@@ -34,7 +34,11 @@ def train():
     # initialize dataset and loader
     split = json.load(open(specs["TrainSplit"], "r"))
     if specs['training_task'] == 'diffusion':
-        train_dataset = ModulationLoader(specs["data_path"], pc_path=specs.get("pc_path",None), split_file=split, pc_size=specs.get("total_pc_size", None))
+        train_dataset = ModulationLoader(
+            specs["data_path"],
+            split_file=split,
+            conditioning=get_conditioning_specs(specs),
+        )
     else:
         train_dataset = SdfLoader(specs["DataSource"], split, pc_size=specs.get("PCsize",1024), grid_source=specs.get("GridSource", None), modulation_path=specs.get("modulation_path", None))
     train_dataloader = torch.utils.data.DataLoader(
@@ -79,9 +83,22 @@ def train():
                         default_root_dir=os.path.join("tensorboard_logs", args.exp_dir))
     trainer.fit(model=model, train_dataloaders=train_dataloader, ckpt_path=resume)
 
-    
 
-    
+def get_conditioning_specs(specs):
+    conditioning = specs.get("conditioning", None)
+    if conditioning is not None:
+        return conditioning
+
+    if specs.get("pc_path", None) is None:
+        return None
+
+    return {
+        "type": "point_cloud",
+        "path": specs["pc_path"],
+        "pc_size": specs.get("total_pc_size", 1024),
+    }
+
+
 if __name__ == "__main__":
 
     import argparse
