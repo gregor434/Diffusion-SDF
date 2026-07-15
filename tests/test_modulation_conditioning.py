@@ -1,4 +1,6 @@
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -7,6 +9,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+import dataloader.conditioning as conditioning
 from dataloader.conditioning import ImageConditioning
 from dataloader.modulation_loader import ModulationLoader
 
@@ -21,6 +24,9 @@ class StubClipModel:
 
 
 class ModulationConditioningTests(unittest.TestCase):
+    def tearDown(self):
+        conditioning._CLIP_CACHE.clear()
+
     def test_loads_cached_clip_image_conditioning(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -51,6 +57,58 @@ class ModulationConditioningTests(unittest.TestCase):
 
             cache_files = list((root / "images" / ".clip_cache").glob("**/*.pt"))
             self.assertEqual(len(cache_files), 1)
+
+    def test_clip_model_auto_uses_cuda_when_available(self):
+        load_devices = []
+
+        class FakeClipModel:
+            def eval(self):
+                return self
+
+            def parameters(self):
+                return []
+
+        def fake_load(model_name, device):
+            load_devices.append(device)
+            return FakeClipModel(), self.stub_preprocess
+
+        fake_clip = types.SimpleNamespace(load=fake_load)
+        with patch.dict(sys.modules, {"clip": fake_clip}):
+            with patch("torch.cuda.is_available", return_value=True):
+                conditioning.load_clip_model("ViT-B/32")
+
+        self.assertEqual(load_devices, ["cuda"])
+
+    def test_require_cached_image_conditioning_raises_on_cache_miss(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            image_dir = root / "images" / "item0"
+            image_dir.mkdir(parents=True)
+            Image.new("RGB", (320, 240), color=(128, 64, 32)).save(image_dir / "main.jpg")
+
+            source = ImageConditioning(str(root / "images"), require_cached=True)
+
+            with self.assertRaisesRegex(FileNotFoundError, "conditioning preparation"):
+                source.load(self.record())
+
+    def test_modulation_loader_validates_required_image_cache_on_init(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            self.write_latent(root)
+            image_dir = root / "images" / "item0"
+            image_dir.mkdir(parents=True)
+            Image.new("RGB", (320, 240), color=(128, 64, 32)).save(image_dir / "main.jpg")
+
+            with self.assertRaisesRegex(FileNotFoundError, "conditioning preparation"):
+                ModulationLoader(
+                    str(root / "mods"),
+                    split_file=self.split(),
+                    conditioning={
+                        "type": "image",
+                        "path": str(root / "images"),
+                        "require_cached": True,
+                    },
+                )
 
     def test_clip_cache_key_differs_by_model_name(self):
         source_a = ImageConditioning("/tmp/images", clip_model="ViT-B/32")
