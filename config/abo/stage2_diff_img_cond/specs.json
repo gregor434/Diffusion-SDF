@@ -1,7 +1,7 @@
 {
   "Description" : "diffusion training with image conditioning on the ABO chair dataset",
-  "TrainSplit" : "datasets/splits/overfit_one_chiar.json",
-  "ValSplit" : "datasets/splits/overfit_one_chiar.json",
+  "TrainSplit" : "datasets/splits/overfit_one_chair.json",
+  "ValSplit" : "datasets/splits/overfit_one_chair.json",
   "TestSplit" : "datasets/splits/overfit_one_chair.json",
   "data_path" : "config/abo/stage1_sdf/modulations",
 
