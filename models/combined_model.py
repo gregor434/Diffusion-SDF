@@ -146,17 +146,26 @@ class CombinedModel(pl.LightningModule):
     def get_metric_writer(self, split):
 
         if split not in self.metric_writers:
-            log_dir = self.logger.log_dir if self.logger is not None else self.trainer.default_root_dir
+            logger = getattr(self, "logger", None)
+            trainer = getattr(self, "trainer", None)
+            log_dir = logger.log_dir if logger is not None else None
+            if log_dir is None and trainer is not None:
+                log_dir = trainer.default_root_dir
+            if log_dir is None:
+                return None
             self.metric_writers[split] = SummaryWriter(os.path.join(log_dir, split))
         return self.metric_writers[split]
 
 
     def write_losses(self, split, losses, step):
 
-        if self.trainer is not None and not self.trainer.is_global_zero:
+        trainer = getattr(self, "trainer", None)
+        if trainer is not None and not trainer.is_global_zero:
             return
 
         writer = self.get_metric_writer(split)
+        if writer is None:
+            return
         for key, value in losses.items():
             if value is None:
                 continue
