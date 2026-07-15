@@ -1,3 +1,4 @@
+import sys
 import tempfile
 import types
 import unittest
@@ -69,6 +70,29 @@ class ConditioningPreparationTests(unittest.TestCase):
             load_clip_model.assert_not_called()
             self.assertEqual(item["conditioning"]["image"].shape, torch.Size([1, 512]))
             self.assertEqual(clip_model.calls, 1)
+
+    def test_cuda_image_cache_preparation_releases_clip_model(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            self.write_image(root)
+            source = ImageConditioning(str(root / "images"), clip_device="auto")
+
+            fake_clip = types.SimpleNamespace(
+                load=lambda model_name, device: (FakeClipModel(), self.stub_preprocess)
+            )
+
+            with patch.dict(sys.modules, {"clip": fake_clip}):
+                with patch("torch.cuda.is_available", return_value=True):
+                    with patch("torch.cuda.empty_cache") as empty_cache:
+                        with patch.object(
+                            source,
+                            "encode_image",
+                            return_value=torch.arange(512, dtype=torch.float32).view(1, 512),
+                        ):
+                            self.assertTrue(source.prepare([self.record()]))
+
+            self.assertNotIn((source.clip_model, "cuda"), conditioning._CLIP_CACHE)
+            empty_cache.assert_called_once()
 
     def test_point_cloud_prepare_is_noop_and_loading_is_unchanged(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -157,6 +181,14 @@ class StubClipModel:
     def encode_image(self, image):
         self.calls += 1
         return torch.arange(512, dtype=torch.float32).view(1, 512)
+
+
+class FakeClipModel:
+    def eval(self):
+        return self
+
+    def parameters(self):
+        return []
 
 
 class StubConditioningSource:

@@ -50,6 +50,13 @@ def load_clip_model(clip_model, clip_device="auto"):
     return _CLIP_CACHE[cache_key]
 
 
+def release_clip_model(clip_model, clip_device="auto"):
+    device = resolve_clip_device(clip_device)
+    _CLIP_CACHE.pop((clip_model, device), None)
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+
 class ConditioningSource:
     name = None
 
@@ -167,17 +174,22 @@ class ImageConditioning(ConditioningSource):
 
         model, preprocess, device = load_clip_model(self.clip_model, self.clip_device)
         self.prepared_with_cuda = device == "cuda"
-        for record in records_to_prepare:
-            path = self.resolve(record)
-            if path is None:
-                continue
-            cache_path = self.resolve_cache_path(record)
-            if os.path.isfile(cache_path) and not force:
-                continue
-            image = Image.open(path)
-            image = ImageOps.exif_transpose(image).convert("RGB")
-            feature = self.encode_image(model, preprocess, device, image)
-            self.save_cached(feature, cache_path)
+        try:
+            for record in records_to_prepare:
+                path = self.resolve(record)
+                if path is None:
+                    continue
+                cache_path = self.resolve_cache_path(record)
+                if os.path.isfile(cache_path) and not force:
+                    continue
+                image = Image.open(path)
+                image = ImageOps.exif_transpose(image).convert("RGB")
+                feature = self.encode_image(model, preprocess, device, image)
+                self.save_cached(feature, cache_path)
+        finally:
+            if device == "cuda":
+                del model
+                release_clip_model(self.clip_model, device)
 
         return self.prepared_with_cuda
 
