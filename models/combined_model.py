@@ -3,6 +3,8 @@ import torch.utils.data
 from torch.nn import functional as F
 import pytorch_lightning as pl
 from einops import reduce
+from torch.utils.tensorboard import SummaryWriter
+import os
 
 # add paths in model/__init__.py for new models
 from models import * 
@@ -11,6 +13,7 @@ class CombinedModel(pl.LightningModule):
     def __init__(self, specs):
         super().__init__()
         self.specs = specs
+        self.metric_writers = {}
 
         self.task = specs['training_task'] # 'combined' or 'modulation' or 'diffusion'
 
@@ -48,8 +51,37 @@ class CombinedModel(pl.LightningModule):
         else:
             return None
 
-        self.log_prefixed_losses("val", losses, on_step=False, on_epoch=True)
+        if losses is None:
+            return None
+
+        return {
+            key: value.detach()
+            for key, value in losses.items()
+            if value is not None
+        }
+
+
+    def validation_epoch_end(self, outputs):
+
+        outputs = [output for output in outputs if output is not None]
+        if len(outputs) == 0:
+            return None
+
+        losses = {}
+        for key in outputs[0]:
+            values = [output[key].float() for output in outputs if key in output]
+            if len(values) > 0:
+                losses[key] = torch.stack(values).mean()
+
+        self.write_losses("val", losses, self.global_step)
         return losses["loss"]
+
+
+    def on_train_end(self):
+
+        for writer in self.metric_writers.values():
+            writer.close()
+        self.metric_writers = {}
         
 
     def configure_optimizers(self):
@@ -111,19 +143,34 @@ class CombinedModel(pl.LightningModule):
         return {"loss": loss, "sdf": sdf_loss, "vae": vae_loss}
 
 
-    def log_prefixed_losses(self, prefix, losses, on_step, on_epoch):
+    def get_metric_writer(self, split):
 
-        loss_dict = {
-            "{}/{}".format(prefix, key): value
-            for key, value in losses.items()
-        }
-        self.log_dict(loss_dict, prog_bar=True, enable_graph=False, on_step=on_step, on_epoch=on_epoch)
+        if split not in self.metric_writers:
+            log_dir = self.logger.log_dir if self.logger is not None else self.trainer.default_root_dir
+            self.metric_writers[split] = SummaryWriter(os.path.join(log_dir, split))
+        return self.metric_writers[split]
+
+
+    def write_losses(self, split, losses, step):
+
+        if self.trainer is not None and not self.trainer.is_global_zero:
+            return
+
+        writer = self.get_metric_writer(split)
+        for key, value in losses.items():
+            if value is None:
+                continue
+            writer.add_scalar(key, value.detach().float().mean().cpu().item(), step)
+        writer.flush()
 
 
     def train_modulation(self, x):
 
         losses = self.modulation_losses(x)
-        self.log_prefixed_losses("train", losses, on_step=True, on_epoch=False)
+        if losses is None:
+            return None
+
+        self.write_losses("train", losses, self.global_step)
 
         return losses["loss"]
 
@@ -154,7 +201,7 @@ class CombinedModel(pl.LightningModule):
     def train_diffusion(self, x):
 
         losses = self.diffusion_losses(x)
-        self.log_prefixed_losses("train", losses, on_step=True, on_epoch=False)
+        self.write_losses("train", losses, self.global_step)
 
         return losses["loss"]
 
@@ -221,6 +268,9 @@ class CombinedModel(pl.LightningModule):
     def train_combined(self, x):
 
         losses = self.combined_losses(x)
-        self.log_prefixed_losses("train", losses, on_step=True, on_epoch=False)
+        if losses is None:
+            return None
+
+        self.write_losses("train", losses, self.global_step)
 
         return losses["loss"]
