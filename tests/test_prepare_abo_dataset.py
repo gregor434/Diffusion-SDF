@@ -3,14 +3,74 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+import trimesh
+
 from scripts.prepare_abo_dataset import (
     build_split_sets,
+    compute_grid_sdf,
     compute_split_counts,
+    make_raycast_scene,
+    model_ids_from_manifest,
+    normalize_mesh,
+    save_csv,
+    sample_near_surface,
     write_split_manifests,
 )
 
 
 class PrepareAboDatasetSplitTests(unittest.TestCase):
+    def test_normalize_mesh_sets_tight_bounding_box_diagonal_to_one(self) -> None:
+        mesh = trimesh.creation.box(extents=(2.0, 4.0, 6.0))
+        mesh.apply_translation((3.0, -2.0, 7.0))
+
+        normalized = normalize_mesh(mesh)
+
+        extent = normalized.bounds[1] - normalized.bounds[0]
+        np.testing.assert_allclose(normalized.bounds.mean(axis=0), 0.0, atol=1e-7)
+        self.assertAlmostEqual(float(np.linalg.norm(extent)), 1.0, places=6)
+        self.assertLessEqual(float(np.abs(normalized.bounds).max()), 0.5)
+
+    def test_near_surface_sampling_matches_paper_row_layout(self) -> None:
+        mesh = normalize_mesh(trimesh.creation.box(extents=(1.0, 2.0, 3.0)))
+        scene = make_raycast_scene(mesh)
+
+        rows = sample_near_surface(
+            mesh=mesh,
+            scene=scene,
+            surface_point_count=20,
+            near_surface_stds=(0.005, 0.0005),
+            batch_size=16,
+            rng=np.random.default_rng(4),
+        )
+
+        self.assertEqual(rows.shape, (60, 4))
+        self.assertEqual(int(np.count_nonzero(rows[:, 3] == 0.0)), 20)
+        self.assertTrue(np.isfinite(rows).all())
+
+    def test_grid_is_regular_and_covers_cube_boundaries(self) -> None:
+        mesh = normalize_mesh(trimesh.creation.box())
+        rows = compute_grid_sdf(make_raycast_scene(mesh), resolution=3, batch_size=8)
+
+        self.assertEqual(rows.shape, (27, 4))
+        for axis in range(3):
+            np.testing.assert_array_equal(np.unique(rows[:, axis]), [-1.0, 0.0, 1.0])
+
+    def test_model_ids_from_manifest_reads_nested_split(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest = Path(tmpdir) / "split.json"
+            manifest.write_text('{"abo": {"ABO": ["one", "two"]}}', encoding="utf-8")
+            self.assertEqual(model_ids_from_manifest(manifest), {"one", "two"})
+
+    def test_save_csv_preserves_fine_nonzero_distances(self) -> None:
+        rows = np.array([[0.0, 0.0, 0.0, 1e-9]], dtype=np.float32)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "sdf_data.csv"
+            save_csv(path, rows)
+            restored = np.loadtxt(path, delimiter=",")
+            self.assertGreater(float(restored[3]), 0.0)
+            self.assertFalse(path.with_suffix(".csv.tmp").exists())
+
     def test_compute_split_counts_preserves_validation_split(self) -> None:
         self.assertEqual(compute_split_counts(10, 0.8), (8, 2))
         self.assertEqual(compute_split_counts(4, 0.8), (3, 1))
