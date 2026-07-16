@@ -46,6 +46,12 @@ class RepairConfig:
     force_repair: bool = False
 
 
+@dataclass(frozen=True)
+class RepairResult:
+    mesh: trimesh.Trimesh
+    used_cache: bool
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-dir", type=Path, default=DEFAULT_SOURCE_DIR)
@@ -267,14 +273,14 @@ def repair_mesh_with_manifoldplus(
     mesh: trimesh.Trimesh,
     output_path: Path,
     config: RepairConfig,
-) -> trimesh.Trimesh:
+) -> RepairResult:
     if config.method != REPAIR_MANIFOLDPLUS:
         raise ValueError(f"cannot repair with method: {config.method}")
     if config.manifoldplus_bin is None:
         raise ValueError("ManifoldPlus executable is required")
 
     if output_path.is_file() and not config.force_repair:
-        return load_repaired_mesh(output_path)
+        return RepairResult(mesh=load_repaired_mesh(output_path), used_cache=True)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -296,7 +302,7 @@ def repair_mesh_with_manifoldplus(
                 f"{output_path}: {result.stderr.strip() or result.stdout.strip()}"
             )
 
-    return load_repaired_mesh(output_path)
+    return RepairResult(mesh=load_repaired_mesh(output_path), used_cache=False)
 
 
 def sample_surface(
@@ -462,13 +468,15 @@ def process_model(
         if repair_config.repaired_mesh_dir is None:
             raise ValueError("repaired mesh directory is required")
         proxy_path = repaired_mesh_output_path(repair_config.repaired_mesh_dir, dataset_key, class_name, model_id)
-        sdf_mesh = repair_mesh_with_manifoldplus(mesh, proxy_path, repair_config)
+        repair_result = repair_mesh_with_manifoldplus(mesh, proxy_path, repair_config)
+        sdf_mesh = repair_result.mesh
         sign_method = "occupancy"
         repair_info = {
             "method": REPAIR_MANIFOLDPLUS,
             "sdf_sign_method": sign_method,
             "manifoldplus_depth": repair_config.manifoldplus_depth,
             "repaired_mesh_path": str(proxy_path),
+            "cache_hit": repair_result.used_cache,
             "original_mesh": mesh_summary(mesh),
             "repaired_mesh": mesh_summary(sdf_mesh),
         }
@@ -706,6 +714,11 @@ def main() -> None:
             products[model_id]["grid_gt_path"] = str(grid_path)
             products[model_id]["preprocessing_repair"] = repair_info
             products[model_id]["processed"] = True
+            if repair_info.get("method") == REPAIR_MANIFOLDPLUS:
+                repair_status = "reused cached proxy" if repair_info.get("cache_hit") else "generated repaired proxy"
+                print(f"  repair: {repair_status}")
+            elif repair_info.get("skipped_existing"):
+                print("  skipped existing outputs")
             print(f"  wrote {sdf_path}")
             print(f"  wrote {grid_path}")
 
