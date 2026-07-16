@@ -13,6 +13,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
+import subprocess
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +33,17 @@ DEFAULT_CLASS_NAME = "ABO"
 DEFAULT_SPLIT_PREFIX = "abo"
 DEFAULT_METADATA_IN = Path("datasets/ABO/abo_selected_subset.json")
 DEFAULT_TRAIN_RATIO = 0.8
+REPAIR_NONE = "none"
+REPAIR_MANIFOLDPLUS = "manifoldplus"
+
+
+@dataclass(frozen=True)
+class RepairConfig:
+    method: str = REPAIR_NONE
+    manifoldplus_bin: Path | None = None
+    manifoldplus_depth: int = 8
+    repaired_mesh_dir: Path | None = None
+    force_repair: bool = False
 
 
 def parse_args() -> argparse.Namespace:
@@ -68,6 +84,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=200000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--repair-method",
+        choices=(REPAIR_NONE, REPAIR_MANIFOLDPLUS),
+        default=REPAIR_NONE,
+        help="Optional watertight repair method used for SDF signing.",
+    )
+    parser.add_argument(
+        "--manifoldplus-bin",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the ManifoldPlus executable. If omitted, MANIFOLDPLUS_BIN "
+            "and then PATH are checked when --repair-method manifoldplus is used."
+        ),
+    )
+    parser.add_argument(
+        "--manifoldplus-depth",
+        type=int,
+        default=8,
+        help="ManifoldPlus octree depth; higher preserves more detail but costs more time/memory.",
+    )
+    parser.add_argument(
+        "--repaired-mesh-dir",
+        type=Path,
+        default=None,
+        help="Directory for cached watertight proxy meshes. Defaults to <datasets-root>/repaired_meshes.",
+    )
+    parser.add_argument(
+        "--force-repair",
+        action="store_true",
+        help="Regenerate repaired proxy meshes even when cached outputs exist.",
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -90,6 +138,46 @@ def parse_args() -> argparse.Namespace:
         help="Only write splits and metadata; do not generate CSV data.",
     )
     return parser.parse_args()
+
+
+def build_repair_config(args: argparse.Namespace) -> RepairConfig:
+    repaired_mesh_dir = args.repaired_mesh_dir or args.datasets_root / "repaired_meshes"
+    manifoldplus_bin = args.manifoldplus_bin
+    if manifoldplus_bin is None and args.repair_method == REPAIR_MANIFOLDPLUS:
+        env_bin = os.environ.get("MANIFOLDPLUS_BIN")
+        if env_bin:
+            manifoldplus_bin = Path(env_bin)
+        else:
+            path_bin = shutil.which("ManifoldPlus")
+            if path_bin:
+                manifoldplus_bin = Path(path_bin)
+    config = RepairConfig(
+        method=args.repair_method,
+        manifoldplus_bin=manifoldplus_bin,
+        manifoldplus_depth=args.manifoldplus_depth,
+        repaired_mesh_dir=repaired_mesh_dir,
+        force_repair=args.force_repair,
+    )
+    validate_repair_config(config)
+    return config
+
+
+def validate_repair_config(config: RepairConfig) -> None:
+    if config.method == REPAIR_NONE:
+        return
+    if config.method != REPAIR_MANIFOLDPLUS:
+        raise ValueError(f"unsupported repair method: {config.method}")
+    if config.manifoldplus_bin is None:
+        raise ValueError(
+            "ManifoldPlus executable is required when --repair-method manifoldplus is used; "
+            "pass --manifoldplus-bin, set MANIFOLDPLUS_BIN, or put ManifoldPlus on PATH"
+        )
+    if not config.manifoldplus_bin.is_file():
+        raise FileNotFoundError(f"ManifoldPlus executable does not exist: {config.manifoldplus_bin}")
+    if config.manifoldplus_depth <= 0:
+        raise ValueError("--manifoldplus-depth must be positive")
+    if config.repaired_mesh_dir is None:
+        raise ValueError("repaired mesh directory is required for ManifoldPlus repair")
 
 
 def list_model_ids(source_dir: Path) -> list[str]:
@@ -118,8 +206,8 @@ def model_ids_from_manifest(manifest_path: Path) -> set[str]:
     return model_ids
 
 
-def load_mesh(mesh_path: Path) -> trimesh.Trimesh:
-    asset = trimesh.load(mesh_path, force="scene")
+def load_mesh_asset(mesh_path: Path, process: bool = True) -> trimesh.Trimesh:
+    asset = trimesh.load(mesh_path, force="scene", process=process)
     if isinstance(asset, trimesh.Scene):
         if not asset.geometry:
             raise ValueError(f"scene has no geometry: {mesh_path}")
@@ -129,6 +217,11 @@ def load_mesh(mesh_path: Path) -> trimesh.Trimesh:
     else:
         raise TypeError(f"unsupported mesh type {type(asset)!r} for {mesh_path}")
 
+    return mesh.copy()
+
+
+def load_mesh(mesh_path: Path) -> trimesh.Trimesh:
+    mesh = load_mesh_asset(mesh_path)
     mesh = mesh.copy()
     mesh.remove_unreferenced_vertices()
     mesh.remove_degenerate_faces()
@@ -160,6 +253,52 @@ def make_raycast_scene(mesh: trimesh.Trimesh) -> o3d.t.geometry.RaycastingScene:
     return scene
 
 
+def load_repaired_mesh(mesh_path: Path) -> trimesh.Trimesh:
+    # ManifoldPlus can emit coincident vertices and zero-area faces which are
+    # topologically significant. Trimesh's processing merges/removes them and
+    # can turn the closed proxy into a non-manifold mesh.
+    mesh = load_mesh_asset(mesh_path, process=False)
+    if not mesh.is_watertight:
+        raise ValueError(f"repaired mesh is not watertight: {mesh_path}")
+    return mesh
+
+
+def repair_mesh_with_manifoldplus(
+    mesh: trimesh.Trimesh,
+    output_path: Path,
+    config: RepairConfig,
+) -> trimesh.Trimesh:
+    if config.method != REPAIR_MANIFOLDPLUS:
+        raise ValueError(f"cannot repair with method: {config.method}")
+    if config.manifoldplus_bin is None:
+        raise ValueError("ManifoldPlus executable is required")
+
+    if output_path.is_file() and not config.force_repair:
+        return load_repaired_mesh(output_path)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        input_path = Path(tmpdir) / "input.obj"
+        mesh.export(input_path)
+        command = [
+            str(config.manifoldplus_bin),
+            "--input",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--depth",
+            str(config.manifoldplus_depth),
+        ]
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(
+                "ManifoldPlus repair failed for "
+                f"{output_path}: {result.stderr.strip() or result.stdout.strip()}"
+            )
+
+    return load_repaired_mesh(output_path)
+
+
 def sample_surface(
     mesh: trimesh.Trimesh,
     count: int,
@@ -187,23 +326,29 @@ def compute_signed_distances(
     scene: o3d.t.geometry.RaycastingScene,
     query_points: np.ndarray,
     batch_size: int,
+    sign_method: str = "normal",
 ) -> np.ndarray:
     if batch_size <= 0:
         raise ValueError("batch size must be positive")
+    if sign_method not in {"normal", "occupancy"}:
+        raise ValueError(f"unsupported sign method: {sign_method}")
     sdf = np.empty((len(query_points), 1), dtype=np.float32)
     for start in range(0, len(query_points), batch_size):
         stop = min(start + batch_size, len(query_points))
         batch = query_points[start:stop]
-        # ABO meshes are generally not watertight, so Open3D's occupancy-based
-        # signed distance is not reliable here. Use the closest primitive normal.
-        out = scene.compute_closest_points(o3d.core.Tensor(batch))
-        closest_points = out["points"].numpy()
-        normals = out["primitive_normals"].numpy()
-        delta = batch - closest_points
-        unsigned = np.linalg.norm(delta, axis=1, keepdims=True)
-        sign = np.sign(np.sum(delta * normals, axis=1, keepdims=True)).astype(np.float32)
-        sign[sign == 0] = 1.0
-        sdf[start:stop] = unsigned * sign
+        tensor = o3d.core.Tensor(batch)
+        if sign_method == "occupancy":
+            sdf[start:stop] = scene.compute_signed_distance(tensor).numpy().reshape(-1, 1)
+        else:
+            # Non-watertight fallback: closest-normal signs are only a pseudo-SDF.
+            out = scene.compute_closest_points(tensor)
+            closest_points = out["points"].numpy()
+            normals = out["primitive_normals"].numpy()
+            delta = batch - closest_points
+            unsigned = np.linalg.norm(delta, axis=1, keepdims=True)
+            sign = np.sign(np.sum(delta * normals, axis=1, keepdims=True)).astype(np.float32)
+            sign[sign == 0] = 1.0
+            sdf[start:stop] = unsigned * sign
     return sdf
 
 
@@ -214,6 +359,7 @@ def sample_near_surface(
     near_surface_stds: tuple[float, float],
     batch_size: int,
     rng: np.random.Generator,
+    sign_method: str = "normal",
 ) -> np.ndarray:
     if any(std <= 0 for std in near_surface_stds):
         raise ValueError("near-surface standard deviations must be positive")
@@ -227,7 +373,7 @@ def sample_near_surface(
         for std in near_surface_stds
     ]
     query_points = np.concatenate(query_sets, axis=0)
-    query_sdf = compute_signed_distances(scene, query_points, batch_size)
+    query_sdf = compute_signed_distances(scene, query_points, batch_size, sign_method=sign_method)
     rows = np.concatenate([surface_rows, np.concatenate([query_points, query_sdf], axis=1)], axis=0)
     rng.shuffle(rows, axis=0)
     return rows
@@ -237,12 +383,13 @@ def compute_grid_sdf(
     scene: o3d.t.geometry.RaycastingScene,
     resolution: int,
     batch_size: int,
+    sign_method: str = "normal",
 ) -> np.ndarray:
     if resolution < 2:
         raise ValueError("grid resolution must be at least 2")
     axis = np.linspace(-1.0, 1.0, resolution, dtype=np.float32)
     query_points = np.stack(np.meshgrid(axis, axis, axis, indexing="ij"), axis=-1).reshape(-1, 3)
-    sdf = compute_signed_distances(scene, query_points, batch_size)
+    sdf = compute_signed_distances(scene, query_points, batch_size, sign_method=sign_method)
     return np.concatenate([query_points, sdf], axis=1)
 
 
@@ -264,6 +411,25 @@ def object_output_paths(
     return sdf_path, grid_path
 
 
+def repaired_mesh_output_path(
+    repaired_mesh_dir: Path,
+    dataset_key: str,
+    class_name: str,
+    model_id: str,
+) -> Path:
+    return repaired_mesh_dir / dataset_key / class_name / f"{model_id}.obj"
+
+
+def mesh_summary(mesh: trimesh.Trimesh) -> dict[str, Any]:
+    return {
+        "vertices": int(len(mesh.vertices)),
+        "faces": int(len(mesh.faces)),
+        "watertight": bool(mesh.is_watertight),
+        "winding_consistent": bool(mesh.is_winding_consistent),
+        "components": int(len(mesh.split(only_watertight=False))),
+    }
+
+
 def process_model(
     mesh_path: Path,
     datasets_root: Path,
@@ -275,15 +441,39 @@ def process_model(
     batch_size: int,
     rng: np.random.Generator,
     skip_existing: bool,
-) -> tuple[Path, Path]:
+    repair_config: RepairConfig | None = None,
+) -> tuple[Path, Path, dict[str, Any]]:
     model_id = mesh_path.stem
     sdf_path, grid_path = object_output_paths(datasets_root, dataset_key, class_name, model_id)
 
     if skip_existing and sdf_path.is_file() and grid_path.is_file():
-        return sdf_path, grid_path
+        return sdf_path, grid_path, {"skipped_existing": True}
 
     mesh = normalize_mesh(load_mesh(mesh_path))
-    scene = make_raycast_scene(mesh)
+    sdf_mesh = mesh
+    sign_method = "normal"
+    repair_info: dict[str, Any] = {
+        "method": REPAIR_NONE,
+        "sdf_sign_method": sign_method,
+        "original_mesh": mesh_summary(mesh),
+    }
+
+    if repair_config is not None and repair_config.method == REPAIR_MANIFOLDPLUS:
+        if repair_config.repaired_mesh_dir is None:
+            raise ValueError("repaired mesh directory is required")
+        proxy_path = repaired_mesh_output_path(repair_config.repaired_mesh_dir, dataset_key, class_name, model_id)
+        sdf_mesh = repair_mesh_with_manifoldplus(mesh, proxy_path, repair_config)
+        sign_method = "occupancy"
+        repair_info = {
+            "method": REPAIR_MANIFOLDPLUS,
+            "sdf_sign_method": sign_method,
+            "manifoldplus_depth": repair_config.manifoldplus_depth,
+            "repaired_mesh_path": str(proxy_path),
+            "original_mesh": mesh_summary(mesh),
+            "repaired_mesh": mesh_summary(sdf_mesh),
+        }
+
+    scene = make_raycast_scene(sdf_mesh)
 
     near_surface_rows = sample_near_surface(
         mesh=mesh,
@@ -292,16 +482,18 @@ def process_model(
         near_surface_stds=near_surface_stds,
         batch_size=batch_size,
         rng=rng,
+        sign_method=sign_method,
     )
     grid_rows = compute_grid_sdf(
         scene=scene,
         resolution=grid_resolution,
         batch_size=batch_size,
+        sign_method=sign_method,
     )
 
     save_csv(sdf_path, near_surface_rows)
     save_csv(grid_path, grid_rows)
-    return sdf_path, grid_path
+    return sdf_path, grid_path, repair_info
 
 
 def load_input_metadata(metadata_path: Path | None) -> dict[str, Any]:
@@ -447,6 +639,7 @@ def default_metadata_out(args: argparse.Namespace) -> Path:
 def main() -> None:
     args = parse_args()
     rng = np.random.default_rng(args.seed)
+    repair_config = build_repair_config(args)
 
     metadata_payload = load_input_metadata(args.metadata_in)
     source_products = metadata_payload.get("products", {})
@@ -496,7 +689,7 @@ def main() -> None:
         for idx, model_id in enumerate(process_model_ids, start=1):
             mesh_path = args.source_dir / f"{model_id}.glb"
             print(f"[{idx}/{len(process_model_ids)}] processing {mesh_path.name}")
-            sdf_path, grid_path = process_model(
+            sdf_path, grid_path, repair_info = process_model(
                 mesh_path=mesh_path,
                 datasets_root=args.datasets_root,
                 dataset_key=args.dataset_key,
@@ -507,9 +700,11 @@ def main() -> None:
                 batch_size=args.batch_size,
                 rng=rng,
                 skip_existing=args.skip_existing,
+                repair_config=repair_config,
             )
             products[model_id]["sdf_data_path"] = str(sdf_path)
             products[model_id]["grid_gt_path"] = str(grid_path)
+            products[model_id]["preprocessing_repair"] = repair_info
             products[model_id]["processed"] = True
             print(f"  wrote {sdf_path}")
             print(f"  wrote {grid_path}")
@@ -541,6 +736,16 @@ def main() -> None:
             "near_surface_stds": list(args.near_surface_stds),
             "grid_resolution": args.grid_resolution,
             "grid_bounds": [-1.0, 1.0],
+            "repair": {
+                "method": repair_config.method,
+                "manifoldplus_bin": str(repair_config.manifoldplus_bin)
+                if repair_config.manifoldplus_bin is not None
+                else None,
+                "manifoldplus_depth": repair_config.manifoldplus_depth,
+                "repaired_mesh_dir": str(repair_config.repaired_mesh_dir)
+                if repair_config.repaired_mesh_dir is not None
+                else None,
+            },
         },
         "splits": split_paths,
         "products": products,
