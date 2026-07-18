@@ -12,6 +12,7 @@ This generalizes the chair-specific ABO preparation flow:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import shutil
@@ -355,6 +356,8 @@ def compute_signed_distances(
             sign = np.sign(np.sum(delta * normals, axis=1, keepdims=True)).astype(np.float32)
             sign[sign == 0] = 1.0
             sdf[start:stop] = unsigned * sign
+            del out, closest_points, normals, delta, unsigned, sign
+        del batch, tensor
     return sdf
 
 
@@ -371,16 +374,22 @@ def sample_near_surface(
         raise ValueError("near-surface standard deviations must be positive")
 
     surface_points = sample_surface(mesh, surface_point_count, rng)
-    surface_rows = np.concatenate(
-        [surface_points, np.zeros((surface_point_count, 1), dtype=np.float32)], axis=1
-    )
-    query_sets = [
-        surface_points + rng.normal(0.0, std, surface_points.shape).astype(np.float32)
-        for std in near_surface_stds
-    ]
-    query_points = np.concatenate(query_sets, axis=0)
-    query_sdf = compute_signed_distances(scene, query_points, batch_size, sign_method=sign_method)
-    rows = np.concatenate([surface_rows, np.concatenate([query_points, query_sdf], axis=1)], axis=0)
+    total_rows = surface_point_count * (1 + len(near_surface_stds))
+    rows = np.empty((total_rows, 4), dtype=np.float32)
+    rows[:surface_point_count, :3] = surface_points
+    rows[:surface_point_count, 3] = 0.0
+
+    write_start = surface_point_count
+    for std in near_surface_stds:
+        write_stop = write_start + surface_point_count
+        query_points = surface_points + rng.normal(0.0, std, surface_points.shape).astype(np.float32)
+        query_sdf = compute_signed_distances(scene, query_points, batch_size, sign_method=sign_method)
+        rows[write_start:write_stop, :3] = query_points
+        rows[write_start:write_stop, 3:] = query_sdf
+        del query_points, query_sdf
+        write_start = write_stop
+
+    del surface_points
     rng.shuffle(rows, axis=0)
     return rows
 
@@ -396,7 +405,11 @@ def compute_grid_sdf(
     axis = np.linspace(-1.0, 1.0, resolution, dtype=np.float32)
     query_points = np.stack(np.meshgrid(axis, axis, axis, indexing="ij"), axis=-1).reshape(-1, 3)
     sdf = compute_signed_distances(scene, query_points, batch_size, sign_method=sign_method)
-    return np.concatenate([query_points, sdf], axis=1)
+    rows = np.empty((len(query_points), 4), dtype=np.float32)
+    rows[:, :3] = query_points
+    rows[:, 3:] = sdf
+    del query_points, sdf
+    return rows
 
 
 def save_csv(csv_path: Path, rows: np.ndarray) -> None:
@@ -449,12 +462,16 @@ def process_model(
     skip_existing: bool,
     repair_config: RepairConfig | None = None,
 ) -> tuple[Path, Path, dict[str, Any]]:
+    def log_phase(message: str) -> None:
+        print(f"  phase: {message}")
+
     model_id = mesh_path.stem
     sdf_path, grid_path = object_output_paths(datasets_root, dataset_key, class_name, model_id)
 
     if skip_existing and sdf_path.is_file() and grid_path.is_file():
         return sdf_path, grid_path, {"skipped_existing": True}
 
+    log_phase("mesh load/normalize")
     mesh = normalize_mesh(load_mesh(mesh_path))
     sdf_mesh = mesh
     sign_method = "normal"
@@ -468,9 +485,12 @@ def process_model(
         if repair_config.repaired_mesh_dir is None:
             raise ValueError("repaired mesh directory is required")
         proxy_path = repaired_mesh_output_path(repair_config.repaired_mesh_dir, dataset_key, class_name, model_id)
+        log_phase("manifold repair")
         repair_result = repair_mesh_with_manifoldplus(mesh, proxy_path, repair_config)
         sdf_mesh = repair_result.mesh
         sign_method = "occupancy"
+        repair_status = "reused cached proxy" if repair_result.used_cache else "generated repaired proxy"
+        print(f"  repair: {repair_status}")
         repair_info = {
             "method": REPAIR_MANIFOLDPLUS,
             "sdf_sign_method": sign_method,
@@ -480,9 +500,15 @@ def process_model(
             "original_mesh": mesh_summary(mesh),
             "repaired_mesh": mesh_summary(sdf_mesh),
         }
+    else:
+        log_phase("manifold repair skipped")
 
+    log_phase("raycast scene creation")
     scene = make_raycast_scene(sdf_mesh)
+    if sdf_mesh is not mesh:
+        del sdf_mesh
 
+    log_phase("near-surface sampling")
     near_surface_rows = sample_near_surface(
         mesh=mesh,
         scene=scene,
@@ -492,15 +518,22 @@ def process_model(
         rng=rng,
         sign_method=sign_method,
     )
+    del mesh
+
+    log_phase("grid SDF generation")
     grid_rows = compute_grid_sdf(
         scene=scene,
         resolution=grid_resolution,
         batch_size=batch_size,
         sign_method=sign_method,
     )
+    del scene
 
+    log_phase("CSV writes")
     save_csv(sdf_path, near_surface_rows)
+    del near_surface_rows
     save_csv(grid_path, grid_rows)
+    del grid_rows
     return sdf_path, grid_path, repair_info
 
 
@@ -721,6 +754,7 @@ def main() -> None:
                 print("  skipped existing outputs")
             print(f"  wrote {sdf_path}")
             print(f"  wrote {grid_path}")
+            gc.collect()
 
     for model_id in model_ids:
         products.setdefault(model_id, {})

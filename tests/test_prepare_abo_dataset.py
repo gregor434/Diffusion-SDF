@@ -1,6 +1,9 @@
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
 
@@ -9,6 +12,7 @@ import trimesh
 
 from scripts.prepare_abo_dataset import (
     REPAIR_MANIFOLDPLUS,
+    REPAIR_NONE,
     RepairConfig,
     build_repair_config,
     build_split_sets,
@@ -19,6 +23,7 @@ from scripts.prepare_abo_dataset import (
     make_raycast_scene,
     model_ids_from_manifest,
     normalize_mesh,
+    process_model,
     repair_mesh_with_manifoldplus,
     repaired_mesh_output_path,
     save_csv,
@@ -165,14 +170,186 @@ class PrepareAboDatasetSplitTests(unittest.TestCase):
             with mock.patch("scripts.prepare_abo_dataset.subprocess.run", side_effect=fake_run) as run:
                 repaired = repair_mesh_with_manifoldplus(mesh, output_path, config)
 
-            self.assertTrue(repaired.is_watertight)
+            self.assertTrue(repaired.mesh.is_watertight)
+            self.assertFalse(repaired.used_cache)
             self.assertEqual(run.call_count, 1)
 
             with mock.patch("scripts.prepare_abo_dataset.subprocess.run") as cached_run:
                 cached = repair_mesh_with_manifoldplus(mesh, output_path, config)
 
-            self.assertTrue(cached.is_watertight)
+            self.assertTrue(cached.mesh.is_watertight)
+            self.assertTrue(cached.used_cache)
             cached_run.assert_not_called()
+
+    def test_process_model_records_repair_cache_hits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            mesh_path = tmp / "chair_0.glb"
+            normalized_mesh = normalize_mesh(trimesh.creation.box())
+            normalized_mesh.export(mesh_path)
+            config = RepairConfig(
+                method=REPAIR_MANIFOLDPLUS,
+                manifoldplus_bin=tmp / "ManifoldPlus",
+                manifoldplus_depth=8,
+                repaired_mesh_dir=tmp / "repaired",
+            )
+            config.manifoldplus_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+
+            run_calls: list[str] = []
+
+            def fake_run(command, capture_output, text):
+                run_calls.append(command[command.index("--output") + 1])
+                normalized_mesh.export(Path(command[command.index("--output") + 1]))
+                return mock.Mock(returncode=0, stdout="", stderr="")
+
+            with mock.patch("scripts.prepare_abo_dataset.subprocess.run", side_effect=fake_run):
+                _, _, first_info = process_model(
+                    mesh_path=mesh_path,
+                    datasets_root=tmp / "datasets",
+                    dataset_key="abo",
+                    class_name="ABO",
+                    surface_point_count=8,
+                    near_surface_stds=(0.005, 0.0005),
+                    grid_resolution=2,
+                    batch_size=16,
+                    rng=np.random.default_rng(0),
+                    skip_existing=False,
+                    repair_config=config,
+                )
+                _, _, second_info = process_model(
+                    mesh_path=mesh_path,
+                    datasets_root=tmp / "datasets",
+                    dataset_key="abo",
+                    class_name="ABO",
+                    surface_point_count=8,
+                    near_surface_stds=(0.005, 0.0005),
+                    grid_resolution=2,
+                    batch_size=16,
+                    rng=np.random.default_rng(0),
+                    skip_existing=False,
+                    repair_config=config,
+                )
+
+            self.assertEqual(len(run_calls), 1)
+            self.assertFalse(first_info["cache_hit"])
+            self.assertTrue(second_info["cache_hit"])
+            self.assertEqual(first_info["method"], REPAIR_MANIFOLDPLUS)
+            self.assertEqual(second_info["method"], REPAIR_MANIFOLDPLUS)
+
+    def test_main_logs_cached_proxy_reuse(self) -> None:
+        args = SimpleNamespace(
+            seed=0,
+            source_dir=Path("source"),
+            datasets_root=Path("datasets"),
+            dataset_key="abo",
+            class_name="ABO",
+            split_prefix="abo",
+            metadata_in=None,
+            metadata_out=Path("datasets/splits/abo_metadata.json"),
+            limit=None,
+            only_models_in=None,
+            train_ratio=0.8,
+            surface_point_count=8,
+            near_surface_stds=(0.005, 0.0005),
+            grid_resolution=2,
+            batch_size=16,
+            skip_existing=False,
+            manifest_only=False,
+        )
+        repair_config = RepairConfig(
+            method=REPAIR_MANIFOLDPLUS,
+            manifoldplus_bin=Path("/tmp/ManifoldPlus"),
+            manifoldplus_depth=8,
+            repaired_mesh_dir=Path("datasets/repaired_meshes"),
+        )
+        fake_process_result = (
+            Path("datasets/SDF_v1_64/abo/ABO/chair_0/sdf_data.csv"),
+            Path("datasets/SDF_v1_64/abo/ABO/chair_0/grid_gt.csv"),
+            {
+                "method": REPAIR_MANIFOLDPLUS,
+                "cache_hit": True,
+                "repaired_mesh_path": "datasets/repaired_meshes/abo/ABO/chair_0.obj",
+            },
+        )
+
+        stdout = io.StringIO()
+        with (
+            mock.patch("scripts.prepare_abo_dataset.parse_args", return_value=args),
+            mock.patch("scripts.prepare_abo_dataset.build_repair_config", return_value=repair_config),
+            mock.patch("scripts.prepare_abo_dataset.load_input_metadata", return_value={"products": {}}),
+            mock.patch("scripts.prepare_abo_dataset.list_model_ids", return_value=["chair_0"]),
+            mock.patch("scripts.prepare_abo_dataset.build_split_sets", return_value=({"all": ["chair_0"], "train": ["chair_0"], "val": []}, {"ABO": {"all": ["chair_0"], "train": ["chair_0"], "val": []}})),
+            mock.patch("scripts.prepare_abo_dataset.write_split_manifests", return_value={"all": {}, "by_product_type": {}}),
+            mock.patch("scripts.prepare_abo_dataset.process_model", return_value=fake_process_result),
+            mock.patch("pathlib.Path.mkdir"),
+            mock.patch("pathlib.Path.write_text"),
+            redirect_stdout(stdout),
+        ):
+            from scripts.prepare_abo_dataset import main
+
+            main()
+
+        output = stdout.getvalue()
+        self.assertIn("repair: reused cached proxy", output)
+        self.assertIn("wrote datasets/SDF_v1_64/abo/ABO/chair_0/sdf_data.csv", output)
+
+    def test_main_collects_garbage_once_per_processed_model(self) -> None:
+        args = SimpleNamespace(
+            seed=0,
+            source_dir=Path("source"),
+            datasets_root=Path("datasets"),
+            dataset_key="abo",
+            class_name="ABO",
+            split_prefix="abo",
+            metadata_in=None,
+            metadata_out=Path("datasets/splits/abo_metadata.json"),
+            limit=None,
+            only_models_in=None,
+            train_ratio=0.8,
+            surface_point_count=8,
+            near_surface_stds=(0.005, 0.0005),
+            grid_resolution=2,
+            batch_size=16,
+            skip_existing=False,
+            manifest_only=False,
+        )
+        repair_config = RepairConfig(method=REPAIR_NONE)
+        process_results = [
+            (
+                Path("datasets/abo/ABO/chair_0/sdf_data.csv"),
+                Path("datasets/grid_data/abo/ABO/chair_0/grid_gt.csv"),
+                {"method": REPAIR_NONE},
+            ),
+            (
+                Path("datasets/abo/ABO/chair_1/sdf_data.csv"),
+                Path("datasets/grid_data/abo/ABO/chair_1/grid_gt.csv"),
+                {"method": REPAIR_NONE},
+            ),
+        ]
+
+        with (
+            mock.patch("scripts.prepare_abo_dataset.parse_args", return_value=args),
+            mock.patch("scripts.prepare_abo_dataset.build_repair_config", return_value=repair_config),
+            mock.patch("scripts.prepare_abo_dataset.load_input_metadata", return_value={"products": {}}),
+            mock.patch("scripts.prepare_abo_dataset.list_model_ids", return_value=["chair_0", "chair_1"]),
+            mock.patch(
+                "scripts.prepare_abo_dataset.build_split_sets",
+                return_value=(
+                    {"all": ["chair_0", "chair_1"], "train": ["chair_0"], "val": ["chair_1"]},
+                    {"ABO": {"all": ["chair_0", "chair_1"], "train": ["chair_0"], "val": ["chair_1"]}},
+                ),
+            ),
+            mock.patch("scripts.prepare_abo_dataset.write_split_manifests", return_value={"all": {}, "by_product_type": {}}),
+            mock.patch("scripts.prepare_abo_dataset.process_model", side_effect=process_results),
+            mock.patch("scripts.prepare_abo_dataset.gc.collect") as collect,
+            mock.patch("pathlib.Path.mkdir"),
+            mock.patch("pathlib.Path.write_text"),
+        ):
+            from scripts.prepare_abo_dataset import main
+
+            main()
+
+        self.assertEqual(collect.call_count, 2)
 
     def test_compute_split_counts_preserves_validation_split(self) -> None:
         self.assertEqual(compute_split_counts(10, 0.8), (8, 2))
