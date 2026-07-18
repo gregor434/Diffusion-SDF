@@ -114,8 +114,10 @@ def train():
     else:
         resume = None  
 
+    log_every_n_steps = specs.get("log_every_n_steps", 1)
+
     # precision 16 can be unstable (nan loss); recommend using 32
-    trainer = pl.Trainer(accelerator='gpu', devices=-1, precision=32, max_epochs=specs["num_epochs"], callbacks=callbacks, log_every_n_steps=1,
+    trainer = pl.Trainer(accelerator='gpu', devices=-1, precision=32, max_epochs=specs["num_epochs"], callbacks=callbacks, log_every_n_steps=log_every_n_steps,
                         default_root_dir=os.path.join("tensorboard_logs", args.exp_dir))
     if val_dataloader is not None:
         trainer.fit(model=model, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader, ckpt_path=resume)

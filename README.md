@@ -102,6 +102,25 @@ For example, this replaces the derived data for the ABO chair split used by `con
 python scripts/prepare_abo_dataset.py --only-models-in datasets/splits/abo_CHAIR_all.json
 ```
 
+ABO meshes are often not watertight. For categories such as chairs, the default non-watertight fallback signs SDF samples with the closest triangle normal, which can create incorrect negative regions in the uniform grid. To generate SDF labels from a watertight proxy while still sampling the training point cloud from the original cleaned mesh, build [ManifoldPlus](https://github.com/hjwdzh/ManifoldPlus) outside this repository. `environment.yml` includes the generic build tools (`git`, `cmake`, `make`, and a Linux C++ compiler), but the ManifoldPlus checkout and build output should stay untracked because the build is machine-specific:
+
+```bash
+git clone --recursive https://github.com/hjwdzh/ManifoldPlus /path/to/ManifoldPlus
+cd /path/to/ManifoldPlus
+mkdir build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release
+make -j8
+
+cd /path/to/Diffusion-SDF
+export MANIFOLDPLUS_BIN=/path/to/ManifoldPlus/build/ManifoldPlus
+python scripts/prepare_abo_dataset.py \
+  --only-models-in datasets/splits/abo_CHAIR_all.json \
+  --repair-method manifoldplus \
+  --manifoldplus-depth 8
+```
+
+The script resolves the executable from `--manifoldplus-bin`, then `MANIFOLDPLUS_BIN`, then `PATH`. The repaired OBJ proxies are cached under `datasets/repaired_meshes` by default. Use `--force-repair` to regenerate them, `--repaired-mesh-dir` to choose a different cache location, and increase `--manifoldplus-depth` only after visual inspection if thin chair parts are over-smoothed. ManifoldPlus is external C++/CMake software with its own license terms, including non-commercial-use language in its README.
+
 ABO training configs can point `TrainSplit` and `TestSplit` directly at these manifest files, for example `datasets/splits/abo_all_train.json` and `datasets/splits/abo_all_val.json`.
 
 Image-conditioned diffusion training prepares cached CLIP features in `train.py` before DataLoader workers start, then reads those cached CPU tensors from the dataloader so workers do not initialize CUDA.
