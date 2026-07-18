@@ -14,6 +14,7 @@ class CombinedModel(pl.LightningModule):
         super().__init__()
         self.specs = specs
         self.metric_writers = {}
+        self.log_every_n_steps = max(1, int(specs.get("log_every_n_steps", 1)))
 
         self.task = specs['training_task'] # 'combined' or 'modulation' or 'diffusion'
 
@@ -162,6 +163,8 @@ class CombinedModel(pl.LightningModule):
         trainer = getattr(self, "trainer", None)
         if trainer is not None and not trainer.is_global_zero:
             return
+        if not self.should_write_losses(split, step):
+            return
 
         writer = self.get_metric_writer(split)
         if writer is None:
@@ -171,6 +174,15 @@ class CombinedModel(pl.LightningModule):
                 continue
             writer.add_scalar(key, value.detach().float().mean().cpu().item(), step)
         writer.flush()
+
+
+    def should_write_losses(self, split, step):
+
+        if self.log_every_n_steps <= 1:
+            return True
+        if split != "train":
+            return step % self.log_every_n_steps == 0
+        return (step + 1) % self.log_every_n_steps == 0
 
 
     def train_modulation(self, x):
