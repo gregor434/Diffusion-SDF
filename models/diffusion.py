@@ -91,6 +91,25 @@ class DiffusionModel(nn.Module):
         # calculate p2 reweighting
         register_buffer('p2_loss_weight', (p2_loss_weight_k + alphas_cumprod / (1 - alphas_cumprod)) ** -p2_loss_weight_gamma)
 
+    @staticmethod
+    def _normalize_conditioning(cond):
+        if cond is None or isinstance(cond, dict):
+            return cond
+        if torch.is_tensor(cond):
+            return {"point_cloud": cond}
+        raise TypeError("cond must be None, a point-cloud tensor, or a conditioning dict")
+
+    def _perturb_conditioning(self, cond):
+        cond = self._normalize_conditioning(cond)
+        if cond is None:
+            return None
+
+        cond = dict(cond)
+        point_cloud = cond.get("point_cloud")
+        if point_cloud is not None:
+            cond["point_cloud"] = perturb_point_cloud(point_cloud, self.perturb_pc, self.pc_size, self.crop_percent)
+        return cond
+
     def predict_start_from_noise(self, x_t, t, noise):
         return (
             extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
@@ -257,14 +276,14 @@ class DiffusionModel(nn.Module):
         t = torch.randint(0, self.num_timesteps, (x_start.shape[0],), device=x_start.device).long()
 
         # STEP 2: perturb condition
-        pc = perturb_point_cloud(cond, self.perturb_pc, self.pc_size, self.crop_percent) if cond is not None else None
+        cond = self._perturb_conditioning(cond)
 
         # STEP 3: pass to forward function
-        loss, x, target, model_out, unreduced_loss = self(x_start, t, cond=pc, ret_pred_x=True)
+        loss, x, target, model_out, unreduced_loss = self(x_start, t, cond=cond, ret_pred_x=True)
         loss_100 = unreduced_loss[t<100].mean().detach()
         loss_1000 = unreduced_loss[t>100].mean().detach()
 
-        return loss, loss_100, loss_1000, model_out, pc
+        return loss, loss_100, loss_1000, model_out, cond
 
 
     def generate_from_pc(self, pc, load_pc=False, batch=5, save_pc=False, return_pc=False, ddim=False, perturb_pc=True):

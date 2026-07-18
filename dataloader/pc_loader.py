@@ -27,7 +27,6 @@ class PCloader(base.Dataset):
         self.return_filename = return_filename
 
         self.pc_paths = self.get_instance_filenames(data_source, split_file)
-        self.pc_paths = self.pc_paths[:5] 
         print("loading {} point clouds into memory...".format(len(self.pc_paths)))
         lst = []
         with tqdm(self.pc_paths) as pbar:

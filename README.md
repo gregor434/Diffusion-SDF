@@ -94,7 +94,17 @@ datasets/
 
 `scripts/prepare_abo_dataset.py` writes balanced aggregate splits in `datasets/splits/abo_all_{train,val}.json` by downsampling every `product_type_key` to the smallest category before splitting. It also writes per-category manifests under `datasets/splits/abo_<product_type>_{train,val}.json`. By default, `--train-ratio 0.8` produces a simple `80/20` `train/val` split, and the output is deterministic for a fixed `--seed`.
 
+The preprocessing defaults match the paper: meshes are centered and uniformly scaled so the diagonal of the tight bounding box has length 1; 235,000 surface points are stored with zero SDF; two isotropic Gaussian query sets with standard deviations 0.005 and 0.0005 are generated from those points and evaluated against the mesh; and a regular 128 x 128 x 128 grid spanning `[-1, 1]^3` is stored. Existing CSV files are overwritten unless `--skip-existing` is supplied. To regenerate only the objects in an existing split, pass its path with `--only-models-in`.
+
+For example, this replaces the derived data for the ABO chair split used by `config/abo/stage1_sdf/specs.json` while retaining all existing split definitions:
+
+```bash
+python scripts/prepare_abo_dataset.py --only-models-in datasets/splits/abo_CHAIR_all.json
+```
+
 ABO training configs can point `TrainSplit` and `TestSplit` directly at these manifest files, for example `datasets/splits/abo_all_train.json` and `datasets/splits/abo_all_val.json`.
+
+Image-conditioned diffusion training prepares cached CLIP features in `train.py` before DataLoader workers start, then reads those cached CPU tensors from the dataloader so workers do not initialize CUDA.
 
 ## Training
 As described in our [paper](https://arxiv.org/abs/2211.13757), there are three stages of training. All corresponding config files can be found in the `config` folders. Logs are created in a `tensorboard_logs` folder in the root directory. We recommend tuning the `"kld_weight"` when training the joint SDF-VAE model as it enforces the continuity of the latent space. A higher value (e.g. 0.1) will result in better interpolation and generalization but sometimes more artifacts. A lower value (e.g. 0.00001) will result in worse interpolation but higher quality of generations. <br>

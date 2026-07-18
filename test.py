@@ -60,7 +60,14 @@ def test_modulations():
             recon = model.vae_model.generate(plane_features) # ([1, D*3, resolution, resolution])
             #print("mesh filename: ", mesh_filename)
             # N is the grid resolution for marching cubes; set max_batch to largest number gpu can hold
-            mesh.create_mesh(model.sdf_model, recon, mesh_filename, N=256, max_batch=2**21, from_plane_features=True)
+            mesh.create_mesh(
+                model.sdf_model,
+                recon,
+                mesh_filename,
+                N=args.recon_resolution,
+                max_batch=args.max_batch,
+                from_plane_features=True,
+            )
 
             # load the created mesh (mesh_filename), and compare with input point cloud
             # to calculate and log chamfer distance 
@@ -72,21 +79,23 @@ def test_modulations():
 
 
             # save modulation vectors for training diffusion model for next stage
-            # filter based on the chamfer distance so that all training data for diffusion model is clean 
-            # would recommend visualizing some reconstructed meshes and manually determining what chamfer distance threshold to use
+            # optionally filter based on chamfer distance so that diffusion training data is clean
             try:
-                # skips modulations that have chamfer distance > 0.0018
-                # the filter also weighs gaps / empty space higher
-                if not filter_threshold(mesh_filename, point_cloud, 0.0018): 
-                    continue
+                if args.modulation_filter_threshold is not None:
+                    # the filter also weighs gaps / empty space higher
+                    if not filter_threshold(mesh_filename, point_cloud, args.modulation_filter_threshold):
+                        print(
+                            "Skipping modulation for {} because CD is above threshold {}".format(
+                                mesh_log_name, args.modulation_filter_threshold
+                            )
+                        )
+                        continue
                 outdir = os.path.join(latent_dir, "{}/{}".format(cls_name, mesh_name))
                 os.makedirs(outdir, exist_ok=True)
-                features = model.sdf_model.pointnet.get_plane_features(point_cloud.cuda())
-                features = torch.cat(features, dim=1) # ([1, D*3, resolution, resolution])
-                latent = model.vae_model.get_latent(features) # (1, D*3)
+                latent = model.vae_model.get_latent(plane_features) # (1, D*3)
                 np.savetxt(os.path.join(outdir, "latent.txt"), latent.cpu().numpy())
             except Exception as e:
-                print(e)
+                print("Failed to save modulation for {}: {}".format(mesh_log_name, e))
 
 
            
@@ -122,7 +131,14 @@ def test_generation():
         plane_features = model.vae_model.decode(samples)
         for i in range(len(plane_features)):
             plane_feature = plane_features[i].unsqueeze(0)
-            mesh.create_mesh(model.sdf_model, plane_feature, recon_dir+"/{}_recon".format(i), N=128, max_batch=2**21, from_plane_features=True)
+            mesh.create_mesh(
+                model.sdf_model,
+                plane_feature,
+                recon_dir+"/{}_recon".format(i),
+                N=args.recon_resolution,
+                max_batch=args.max_batch,
+                from_plane_features=True,
+            )
             
     else:
         # load dataset, dataloader, model checkpoint
@@ -174,7 +190,14 @@ def test_generation():
                 
                 for i in range(len(plane_features)):
                     plane_feature = plane_features[i].unsqueeze(0)
-                    mesh.create_mesh(model.sdf_model, plane_feature, outdir+"/{}_recon".format(i), N=128, max_batch=2**21, from_plane_features=True)
+                    mesh.create_mesh(
+                        model.sdf_model,
+                        plane_feature,
+                        outdir+"/{}_recon".format(i),
+                        N=args.recon_resolution,
+                        max_batch=args.max_batch,
+                        from_plane_features=True,
+                    )
             
 
 
@@ -196,6 +219,14 @@ if __name__ == "__main__":
     arg_parser.add_argument("--num_samples", "-n", default=5, type=int, help='number of samples to generate and reconstruct')
 
     arg_parser.add_argument("--filter", default=False, help='whether to filter when sampling conditionally')
+    arg_parser.add_argument("--recon_resolution", default=256, type=int, help="marching-cubes grid resolution")
+    arg_parser.add_argument("--max_batch", default=2**18, type=int, help="maximum SDF query points per reconstruction batch")
+    arg_parser.add_argument(
+        "--modulation_filter_threshold",
+        default=None,
+        type=float,
+        help="optional Chamfer Distance threshold for saving stage-1 modulation latents; omit to save all latents",
+    )
 
     args = arg_parser.parse_args()
     specs = json.load(open(os.path.join(args.exp_dir, "specs.json")))

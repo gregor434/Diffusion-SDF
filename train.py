@@ -27,20 +27,60 @@ from diff_utils.helpers import *
 from dataloader.pc_loader import PCloader
 from dataloader.sdf_loader import SdfLoader
 from dataloader.modulation_loader import ModulationLoader
+from dataloader.conditioning import build_conditioning_sources
 
 
 def train():
     
     # initialize dataset and loader
     split = json.load(open(specs["TrainSplit"], "r"))
+    val_split = None
+    if specs.get("ValSplit") is not None:
+        val_split = json.load(open(specs["ValSplit"], "r"))
+
+    use_spawn_workers = False
     if specs['training_task'] == 'diffusion':
-        train_dataset = ModulationLoader(specs["data_path"], pc_path=specs.get("pc_path",None), split_file=split, pc_size=specs.get("total_pc_size", None))
+        conditioning_sources = build_conditioning_sources(get_conditioning_specs(specs))
+        train_records = ModulationLoader.build_records(specs["data_path"], split, conditioning_sources)
+        val_records = (
+            ModulationLoader.build_records(specs["data_path"], val_split, conditioning_sources)
+            if val_split is not None
+            else None
+        )
+        all_records = train_records + (val_records or [])
+        use_spawn_workers = prepare_conditioning_sources(conditioning_sources, all_records) and args.workers > 0
+        train_dataset = build_dataset(
+            split,
+            conditioning_sources=conditioning_sources,
+            records=train_records,
+        )
+        val_dataset = (
+            build_dataset(
+                val_split,
+                conditioning_sources=conditioning_sources,
+                records=val_records,
+            )
+            if val_split is not None
+            else None
+        )
     else:
-        train_dataset = SdfLoader(specs["DataSource"], split, pc_size=specs.get("PCsize",1024), grid_source=specs.get("GridSource", None), modulation_path=specs.get("modulation_path", None))
-    train_dataloader = torch.utils.data.DataLoader(
-            train_dataset,
-            batch_size=args.batch_size, num_workers=args.workers,
-            drop_last=True, shuffle=True, pin_memory=True, persistent_workers=True
+        train_dataset = build_dataset(split)
+        val_dataset = build_dataset(val_split) if val_split is not None else None
+
+    train_dataloader = build_dataloader(
+        train_dataset,
+        drop_last=True,
+        shuffle=True,
+        use_spawn_workers=use_spawn_workers,
+    )
+
+    val_dataloader = None
+    if val_dataset is not None:
+        val_dataloader = build_dataloader(
+            val_dataset,
+            drop_last=False,
+            shuffle=False,
+            use_spawn_workers=use_spawn_workers,
         )
 
     # creates a copy of current code / files in the config folder
@@ -77,11 +117,77 @@ def train():
     # precision 16 can be unstable (nan loss); recommend using 32
     trainer = pl.Trainer(accelerator='gpu', devices=-1, precision=32, max_epochs=specs["num_epochs"], callbacks=callbacks, log_every_n_steps=1,
                         default_root_dir=os.path.join("tensorboard_logs", args.exp_dir))
-    trainer.fit(model=model, train_dataloaders=train_dataloader, ckpt_path=resume)
+    if val_dataloader is not None:
+        trainer.fit(model=model, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader, ckpt_path=resume)
+    else:
+        trainer.fit(model=model, train_dataloaders=train_dataloader, ckpt_path=resume)
 
-    
 
-    
+def build_dataloader(dataset, drop_last, shuffle, use_spawn_workers=False):
+    dataloader_kwargs = {
+        "batch_size": args.batch_size,
+        "num_workers": args.workers,
+        "drop_last": drop_last,
+        "shuffle": shuffle,
+        "pin_memory": True,
+        "persistent_workers": args.workers > 0,
+    }
+    if use_spawn_workers:
+        dataloader_kwargs["multiprocessing_context"] = "spawn"
+    return torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
+
+
+def build_dataset(split, conditioning_sources=None, records=None):
+    if specs['training_task'] == 'diffusion':
+        return ModulationLoader(
+            specs["data_path"],
+            split_file=split,
+            conditioning=get_conditioning_specs(specs),
+            conditioning_sources=conditioning_sources,
+            records=records,
+        )
+
+    return SdfLoader(
+        specs["DataSource"],
+        split,
+        samples_per_mesh=specs.get("SampPerMesh", 16000),
+        pc_size=specs.get("PCsize",1024),
+        grid_source=specs.get("GridSource", None),
+        modulation_path=specs.get("modulation_path", None),
+    )
+
+
+def prepare_conditioning_sources(conditioning_sources, records, force=False):
+    prepared_with_cuda = False
+    for source in conditioning_sources:
+        source.prepare(records, force=force)
+        prepared_with_cuda = prepared_with_cuda or getattr(source, "prepared_with_cuda", False)
+    return prepared_with_cuda
+
+
+def get_conditioning_specs(specs):
+    conditioning = specs.get("conditioning", None)
+    if conditioning is not None:
+        single_spec = isinstance(conditioning, dict)
+        conditioning_specs = [conditioning] if single_spec else list(conditioning)
+        normalized_specs = []
+        for spec in conditioning_specs:
+            normalized_spec = dict(spec)
+            if normalized_spec.get("type") == "image":
+                normalized_spec["require_cached"] = True
+            normalized_specs.append(normalized_spec)
+        return normalized_specs[0] if single_spec else normalized_specs
+
+    if specs.get("pc_path", None) is None:
+        return None
+
+    return {
+        "type": "point_cloud",
+        "path": specs["pc_path"],
+        "pc_size": specs.get("total_pc_size", 1024),
+    }
+
+
 if __name__ == "__main__":
 
     import argparse
@@ -100,8 +206,8 @@ if __name__ == "__main__":
     arg_parser.add_argument( "--workers", "-w", default=8, type=int)
 
     args = arg_parser.parse_args()
-    specs = json.load(open(os.path.join(args.exp_dir, "specs.json")))
+    specs_path = os.path.join(args.exp_dir, "specs.json")
+    specs = json.load(open(specs_path))
     print(specs["Description"])
-
 
     train()

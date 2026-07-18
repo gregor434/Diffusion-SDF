@@ -2,6 +2,9 @@ import torch
 import torch.utils.data 
 from torch.nn import functional as F
 import pytorch_lightning as pl
+from einops import reduce
+from torch.utils.tensorboard import SummaryWriter
+import os
 
 # add paths in model/__init__.py for new models
 from models import * 
@@ -10,6 +13,7 @@ class CombinedModel(pl.LightningModule):
     def __init__(self, specs):
         super().__init__()
         self.specs = specs
+        self.metric_writers = {}
 
         self.task = specs['training_task'] # 'combined' or 'modulation' or 'diffusion'
 
@@ -34,6 +38,50 @@ class CombinedModel(pl.LightningModule):
             return self.train_modulation(x)
         elif self.task == 'diffusion':
             return self.train_diffusion(x)
+
+
+    def validation_step(self, x, idx):
+
+        if self.task == 'combined':
+            losses = self.combined_losses(x)
+        elif self.task == 'modulation':
+            losses = self.modulation_losses(x)
+        elif self.task == 'diffusion':
+            losses = self.diffusion_losses(x)
+        else:
+            return None
+
+        if losses is None:
+            return None
+
+        return {
+            key: value.detach()
+            for key, value in losses.items()
+            if value is not None
+        }
+
+
+    def validation_epoch_end(self, outputs):
+
+        outputs = [output for output in outputs if output is not None]
+        if len(outputs) == 0:
+            return None
+
+        losses = {}
+        for key in outputs[0]:
+            values = [output[key].float() for output in outputs if key in output]
+            if len(values) > 0:
+                losses[key] = torch.stack(values).mean()
+
+        self.write_losses("val", losses, self.global_step)
+        return losses["loss"]
+
+
+    def on_train_end(self):
+
+        for writer in self.metric_writers.values():
+            writer.close()
+        self.metric_writers = {}
         
 
     def configure_optimizers(self):
@@ -64,7 +112,7 @@ class CombinedModel(pl.LightningModule):
 
     #-----------different training steps for sdf modulation, diffusion, combined----------
 
-    def train_modulation(self, x):
+    def modulation_losses(self, x):
 
         xyz = x['xyz'] # (B, N, 3)
         gt = x['gt_sdf'] # (B, N)
@@ -92,39 +140,83 @@ class CombinedModel(pl.LightningModule):
 
         loss = sdf_loss + vae_loss
 
-        loss_dict =  {"sdf": sdf_loss, "vae": vae_loss}
-        self.log_dict(loss_dict, prog_bar=True, enable_graph=False)
-
-        return loss
+        return {"loss": loss, "sdf": sdf_loss, "vae": vae_loss}
 
 
-    def train_diffusion(self, x):
+    def get_metric_writer(self, split):
 
-        self.train()
+        if split not in self.metric_writers:
+            logger = getattr(self, "logger", None)
+            trainer = getattr(self, "trainer", None)
+            log_dir = logger.log_dir if logger is not None else None
+            if log_dir is None and trainer is not None:
+                log_dir = trainer.default_root_dir
+            if log_dir is None:
+                return None
+            self.metric_writers[split] = SummaryWriter(os.path.join(log_dir, split))
+        return self.metric_writers[split]
 
-        pc = x['point_cloud'] # (B, 1024, 3) or False if unconditional 
+
+    def write_losses(self, split, losses, step):
+
+        trainer = getattr(self, "trainer", None)
+        if trainer is not None and not trainer.is_global_zero:
+            return
+
+        writer = self.get_metric_writer(split)
+        if writer is None:
+            return
+        for key, value in losses.items():
+            if value is None:
+                continue
+            writer.add_scalar(key, value.detach().float().mean().cpu().item(), step)
+        writer.flush()
+
+
+    def train_modulation(self, x):
+
+        losses = self.modulation_losses(x)
+        if losses is None:
+            return None
+
+        self.write_losses("train", losses, self.global_step)
+
+        return losses["loss"]
+
+
+    def diffusion_losses(self, x):
+
+
         latent = x['latent'] # (B, D)
 
         # unconditional training if cond is None 
-        cond = pc if self.specs['diffusion_model_specs']['cond'] else None 
+        if self.specs['diffusion_model_specs']['cond']:
+            cond = x.get('conditioning', x.get('point_cloud'))
+        else:
+            cond = None
 
         # diff_100 and 1000 loss refers to the losses when t<100 and 100<t<1000, respectively 
         # typically diff_100 approaches 0 while diff_1000 can still be relatively high
         # visualizing loss curves can help with debugging if training is unstable
-        diff_loss, diff_100_loss, diff_1000_loss, pred_latent, perturbed_pc = self.diffusion_model.diffusion_model_from_latent(latent, cond=cond)
+        diff_loss, diff_100_loss, diff_1000_loss, pred_latent, perturbed_cond = self.diffusion_model.diffusion_model_from_latent(latent, cond=cond)
 
-        loss_dict =  {
-                        "total": diff_loss,
+        return {
+                        "loss": diff_loss,
                         "diff100": diff_100_loss, # note that this can appear as nan when the training batch does not have sampled timesteps < 100
                         "diff1000": diff_1000_loss
                     }
-        self.log_dict(loss_dict, prog_bar=True, enable_graph=False)
 
-        return diff_loss
+
+    def train_diffusion(self, x):
+
+        losses = self.diffusion_losses(x)
+        self.write_losses("train", losses, self.global_step)
+
+        return losses["loss"]
 
     # the first half is the same as "train_sdf_modulation"
     # the reconstructed latent is used as input to the diffusion model, rather than loading latents from the dataloader as in "train_diffusion"
-    def train_combined(self, x):
+    def combined_losses(self, x):
         xyz = x['xyz'] # (B, N, 3)
         gt = x['gt_sdf'] # (B, N)
         pc = x['point_cloud'] # (B, 1024, 3)
@@ -149,8 +241,11 @@ class CombinedModel(pl.LightningModule):
         sdf_loss = reduce(sdf_loss, 'b ... -> b (...)', 'mean').mean()
 
         # STEP 4: use latent as input to diffusion model
-        cond = pc if self.specs['diffusion_model_specs']['cond'] else None
-        diff_loss, diff_100_loss, diff_1000_loss, pred_latent, perturbed_pc = self.diffusion_model.diffusion_model_from_latent(latent, cond=cond)
+        if self.specs['diffusion_model_specs']['cond']:
+            cond = x.get('conditioning', pc)
+        else:
+            cond = None
+        diff_loss, diff_100_loss, diff_1000_loss, pred_latent, perturbed_cond = self.diffusion_model.diffusion_model_from_latent(latent, cond=cond)
         
         # STEP 5: use predicted / reconstructed latent to run SDF loss 
         generated_plane_feature = self.vae_model.decode(pred_latent)
@@ -165,8 +260,8 @@ class CombinedModel(pl.LightningModule):
         # results could potentially improve with a grid search 
         loss = sdf_loss + vae_loss + diff_loss + generated_sdf_loss
 
-        loss_dict =  {
-                        "total": loss,
+        return {
+                        "loss": loss,
                         "sdf": sdf_loss,
                         "vae": vae_loss,
                         "diff": diff_loss,
@@ -177,6 +272,14 @@ class CombinedModel(pl.LightningModule):
                         #"diff1000": diff_1000_loss,
                         "gensdf": generated_sdf_loss,
                     }
-        self.log_dict(loss_dict, prog_bar=True, enable_graph=False)
 
-        return loss
+
+    def train_combined(self, x):
+
+        losses = self.combined_losses(x)
+        if losses is None:
+            return None
+
+        self.write_losses("train", losses, self.global_step)
+
+        return losses["loss"]

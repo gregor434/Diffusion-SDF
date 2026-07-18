@@ -1,10 +1,11 @@
 {
-  "Description" : "training joint SDF-VAE model for modulating SDFs on the ABO chair dataset",
+  "Description" : "single-sample overfit run for stage-1 SDF-VAE pipeline verification",
   "DataSource" : "datasets",
   "GridSource" : "datasets/grid_data",
   "TrainSplit" : "datasets/splits/abo_CHAIR_train.json",
+  "ValSplit" : "datasets/splits/abo_CHAIR_val.json",
   "TestSplit" : "datasets/splits/abo_CHAIR_val.json",
-
+ 
   "training_task": "modulation",
 
   "SdfModelSpecs" : {
@@ -17,7 +18,7 @@
   "SampPerMesh" : 16000,
   "PCsize" : 1024,
 
-  "num_epochs" : 1000,
+  "num_epochs" : 10000,
   "log_freq" : 5000,
   "kld_weight" : 1e-5,
   "latent_std" : 0.25,
