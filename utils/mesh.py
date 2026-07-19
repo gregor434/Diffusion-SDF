@@ -20,6 +20,7 @@ def create_mesh(
     ply_filename = filename
 
     model.eval()
+    device = next(model.parameters()).device
 
     # the voxel_origin is the (bottom, left, down) corner, not the middle
     voxel_origin = [-1, -1, -1]
@@ -35,9 +36,13 @@ def create_mesh(
         # inference defined in forward function per pytorch lightning convention
         #print("shapes: ", shape_feature.shape, query.shape)
         if from_plane_features:
-            pred_sdf = model.forward_with_plane_features(shape_feature.cuda(), query.cuda()).detach().cpu()
+            pred_sdf = model.forward_with_plane_features(
+                shape_feature.to(device), query.to(device)
+            ).detach().cpu()
         else:
-            pred_sdf = model(shape_feature.cuda(), query.cuda()).detach().cpu()
+            pred_sdf = model(
+                shape_feature.to(device), query.to(device)
+            ).detach().cpu()
 
         cube[head : min(head + max_batch, cube_points), 3] = pred_sdf.squeeze()
             
@@ -140,5 +145,4 @@ def convert_sdf_samples_to_ply(
 
     ply_data = plyfile.PlyData([el_verts, el_faces])
     ply_data.write(ply_filename_out)
-
 

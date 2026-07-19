@@ -1,38 +1,44 @@
 {
-  "Description" : "diffusion training (conditional) on couch dataset",
-  "pc_path" : "data",
-  "total_pc_size" : 10000,
-  "TrainSplit" : "data/splits/couch_all.json",
-  "TestSplit" : "data/splits/couch_all.json",
-  "data_path" : "config/stage1_sdf/modulations",
-
+  "Description": "COD token EDM diffusion (point conditioned) on couch example",
+  "TrainSplit": "data/splits/couch_all.json",
+  "TestSplit": "data/splits/couch_all.json",
+  "data_path": "config/example/stage1_sdf/modulations",
+  "modulation_ckpt_path": "config/example/stage1_sdf/last.ckpt",
+  "conditioning": {
+    "type": "point_cloud",
+    "path": "data",
+    "pc_size": 1024
+  },
+  "num_epochs": 50001,
+  "log_freq": 5000,
   "training_task": "diffusion",
-
-  
-  "num_epochs" : 50001,
-  "log_freq" : 5000,
-
-  "diff_lr" : 1e-5,
-
-  "diffusion_specs" : {
-    "timesteps" : 1000,
-    "objective" : "pred_x0",
-    "loss_type" : "l2",
-    "perturb_pc" : "partial",
-    "crop_percent": 0.5,
-    "sample_pc_size" : 128
+  "latent_stats_path": "config/example/stage1_sdf/modulations/latent_stats.npz",
+  "diffusion_specs": {
+    "sigma_data": 1,
+    "P_mean": -1.2,
+    "P_std": 1.2,
+    "sigma_min": 0.002,
+    "sigma_max": 80,
+    "rho": 7,
+    "sampling_steps": 18
   },
   "diffusion_model_specs": {
-    "dim" : 768,
-    "depth" : 4,
-    "ff_dropout" : 0.3,
-    "cond" : true,
-    "cross_attn" : true,
-    "cond_dropout":true,
-    "condition_dim" : 128,
+    "latent_tokens": 32,
+    "latent_dimension": 32,
+    "width": 512,
+    "depth": 12,
+    "heads": 8,
+    "mlp_ratio": 4,
+    "dropout": 0,
+    "cond": true,
+    "condition_dim": 128,
     "condition_encoders": [
-      {"type": "point_cloud"}
+      {
+        "type": "point_cloud"
+      }
     ]
+  },
+  "learning_rates": {
+    "diffusion": 0.00001
   }
 }
-

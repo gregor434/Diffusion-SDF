@@ -1,195 +1,164 @@
-# Diffusion-SDF: Conditional Generative Modeling of Signed Distance Functions
+# Diffusion-SDF with COD-VAE
 
-[**Paper**](https://arxiv.org/abs/2211.13757) | [**Supplement**](https://light.princeton.edu/wp-content/uploads/2023/03/diffusionsdf_supp.pdf) | [**Project Page**](https://light.princeton.edu/publication/diffusion-sdf/) <br>
+This branch replaces Diffusion-SDF's PointNet/global-VAE representation with
+[COD-VAE](https://github.com/join16/COD-VAE), while retaining the original
+three-stage training workflow, Lightning checkpoints, JSON specification files,
+marching-cubes reconstruction, conditioning, and shape metrics.
 
-This repository contains the official implementation of <br> 
-**[ICCV 2023] Diffusion-SDF: Conditional Generative Modeling of Signed Distance Functions** <br>
-[Gene Chou](https://genechou.com), [Yuval Bahat](https://sites.google.com/view/yuval-bahat/home), [Felix Heide](https://www.cs.princeton.edu/~fheide/) <br>
+The representation path is:
 
+    surface points [B,N,3]
+      -> COD point/patch encoder
+      -> diagonal posterior and COD tokens [B,M,D]
+      -> COD latent decoder
+      -> COD tri-planes [B,3,C,R,R]
+      -> original Diffusion-SDF neural SDF head
+      -> signed distances [B,Q]
 
-If you find our code or paper useful, please consider citing
-```bibtex
-@inproceedings{chou2022diffusionsdf,
-title={Diffusion-SDF: Conditional Generative Modeling of Signed Distance Functions},
-author={Gene Chou and Yuval Bahat and Felix Heide},
-journal={The IEEE International Conference on Computer Vision (ICCV)},
-year={2023}
-}
-```
-
-
-```cpp
-root directory
-  ├── config  
-  │   └── // folders for checkpoints and training configs
-  ├── data / datasets  
-  │   └── // preprocessed SDF csv files, grid csv files, and split manifests (json)
-  ├── models  
-  │   ├── // models and lightning modules; main model is 'combined_model.py'
-  │   └── archs
-  │       └── // architectures such as PointNets, SDF MLPs, diffusion network..etc
-  ├── dataloader  
-  │   └── // dataloaders for different stages of training and generation
-  ├── utils  
-  │   └── // reconstruction and evaluation
-  ├── metrics  
-  │   └── // reconstruction and evaluation
-  ├── diff_utils  
-  │   └── // helper functions for diffusion
-  ├── environment.yml  // package requirements
-  ├── train.py  // script for training, specify the stage of training in the config files
-  ├── test.py  // script for testing, specify the stage of testing in the config files
-  └── tensorboard_logs  // created when running any training script
-  
-```
+The official COD plane order, axis projection, bilinear interpolation, and sum
+fusion are unchanged. COD's occupancy head remains instantiated so official
+weights load strictly, but it is never used for SDF prediction. Uncertainty
+pruning defaults to an effective keep ratio of 1 because its published head was
+trained for occupancy.
 
 ## Installation
-We recommend creating an [anaconda](https://www.anaconda.com/) environment using our provided `environment.yml`:
 
-```
-conda env create -f environment.yml
-conda activate diffusionsdf
-```
+    conda env create -f environment.yml
+    conda activate diffusionsdf
 
-## Dataset
-For training, we preprocess all meshes and store query coordinates and signed distance values in csv files. Each csv file corresponds to one object, and each line represents a coordinate followed by its signed distance value. See `data/acronym` for examples. Modify the dataloader according to your file format. <br>
+COD-VAE's CUDA pointops extension is optional. When unavailable, the runtime
+uses a checkpoint-neutral PyTorch farthest-point-sampling fallback.
 
-When sampling query points, make sure to also **sample uniformly within the 3D grid space** (i.e. from (-1,-1,-1) to (1,1,1)) rather than only sampling near the surface to avoid artifacts. For each training batch, we take 70% of query points sampled near the object surface and 30% sampled uniformly in the grid. `grid_source` in our dataloader and config file refers to the latter. <br>
+Store downloaded reference repositories and checkpoints only in this
+workspace's ignored `tmp/` directory. The included m32 profiles expect
+`tmp/cod_vae_m32_weights.pt`. Download either official vae_m32 or vae_m64
+weights from the
+[COD-VAE weight folder](https://drive.google.com/drive/folders/1aJE_LbnyV8lBqjRc7tcXjui52N1Kvvjm)
+and set CODVaeSpecs.checkpoint_path. The matching latent_tokens value must be
+32 or 64. The vendored runtime and provenance notes are in models/cod_vae/.
 
-The loaders expect split files with the following JSON shape:
+## Data preprocessing
 
-```json
-{
-  "abo": {
-    "ABO": [
-      "3dmodel_id_1",
-      "3dmodel_id_2"
-    ]
-  }
-}
-```
+ABO preprocessing writes one record per object:
 
-The preprocessed directory layout used by the ABO scripts is:
+    datasets/<dataset>/<class>/<object>/cod_sdf.npz
 
-```text
-datasets/
-  abo/
-    ABO/
-      <3dmodel_id>/
-        sdf_data.csv
-  grid_data/
-    abo/
-      ABO/
-        <3dmodel_id>/
-          grid_gt.csv
-  splits/
-    abo_all_all.json
-    abo_all_train.json
-    abo_all_val.json
-    abo_<product_type>_all.json
-    abo_<product_type>_train.json
-    abo_<product_type>_val.json
-    abo_metadata.json
-```
+Each record contains surface_points, surface_normals,
+near_surface_query_points, near_surface_sdf, uniform_query_points, uniform_sdf,
+normalization_center, and normalization_scale.
 
-`scripts/prepare_abo_dataset.py` writes balanced aggregate splits in `datasets/splits/abo_all_{train,val}.json` by downsampling every `product_type_key` to the smallest category before splitting. It also writes per-category manifests under `datasets/splits/abo_<product_type>_{train,val}.json`. By default, `--train-ratio 0.8` produces a simple `80/20` `train/val` split, and the output is deterministic for a fixed `--seed`.
+All coordinates use one isotropic transform:
 
-The preprocessing defaults match the paper: meshes are centered and uniformly scaled so the diagonal of the tight bounding box has length 1; 235,000 surface points are stored with zero SDF; two isotropic Gaussian query sets with standard deviations 0.005 and 0.0005 are generated from those points and evaluated against the mesh; and a regular 128 x 128 x 128 grid spanning `[-1, 1]^3` is stored. Existing CSV files are overwritten unless `--skip-existing` is supplied. To regenerate only the objects in an existing split, pass its path with `--only-models-in`.
+    x' = normalization_scale * (x - normalization_center)
+    d' = normalization_scale * d
 
-For example, this replaces the derived data for the ABO chair split used by `config/abo/stage1_sdf/specs.json` while retaining all existing split definitions:
+The tight bounding box is centered and scaled to a maximum absolute coordinate
+of 0.999, matching COD's [-1,1] query domain. SDF values are evaluated after
+this transform, so they already have the correctly scaled units.
 
-```bash
-python scripts/prepare_abo_dataset.py --only-models-in datasets/splits/abo_CHAIR_all.json
-```
+    python scripts/prepare_abo_dataset.py \
+      --only-models-in datasets/splits/abo_CHAIR_all.json \
+      --surface-point-count 235000 \
+      --uniform-point-count 262144
 
-ABO meshes are often not watertight. For categories such as chairs, the default non-watertight fallback signs SDF samples with the closest triangle normal, which can create incorrect negative regions in the uniform grid. To generate SDF labels from a watertight proxy while still sampling the training point cloud from the original cleaned mesh, build [ManifoldPlus](https://github.com/hjwdzh/ManifoldPlus) outside this repository. `environment.yml` includes the generic build tools (`git`, `cmake`, `make`, and a Linux C++ compiler), but the ManifoldPlus checkout and build output should stay untracked because the build is machine-specific:
+For non-watertight ABO meshes, the existing ManifoldPlus path remains:
 
-```bash
-git clone --recursive https://github.com/hjwdzh/ManifoldPlus /path/to/ManifoldPlus
-cd /path/to/ManifoldPlus
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j8
+    python scripts/prepare_abo_dataset.py \
+      --only-models-in datasets/splits/abo_CHAIR_all.json \
+      --repair-method manifoldplus \
+      --manifoldplus-bin tmp/ManifoldPlus/build/manifold \
+      --repaired-mesh-dir datasets/repaired_meshes_cod_0999 \
+      --manifoldplus-depth 8
 
-cd /path/to/Diffusion-SDF
-export MANIFOLDPLUS_BIN=/path/to/ManifoldPlus/build/ManifoldPlus
-python scripts/prepare_abo_dataset.py \
-  --only-models-in datasets/splits/abo_CHAIR_all.json \
-  --repair-method manifoldplus \
-  --manifoldplus-depth 8
-```
+COD-normalized repaired proxies are cached separately under
+datasets/repaired_meshes_cod_0999. Do not reuse datasets/repaired_meshes: that
+legacy cache was generated after diagonal normalization and is in a different
+coordinate system. The proxies are used for SDF signing; COD surface samples
+still come from the normalized source mesh. SurfacePointCount, SampPerMesh, and
+NearSurfaceRatio remain JSON spec fields. Preprocessing metadata is written to
+datasets/abo/preprocessing_metadata.json; datasets/splits remains reserved for
+split manifests.
 
-The script resolves the executable from `--manifoldplus-bin`, then `MANIFOLDPLUS_BIN`, then `PATH`. The repaired OBJ proxies are cached under `datasets/repaired_meshes` by default. Use `--force-repair` to regenerate them, `--repaired-mesh-dir` to choose a different cache location, and increase `--manifoldplus-depth` only after visual inspection if thin chair parts are over-smoothed. ManifoldPlus is external C++/CMake software with its own license terms, including non-commercial-use language in its README.
+## Stage one: COD-VAE SDF reconstruction
 
-ABO training configs can point `TrainSplit` and `TestSplit` directly at these manifest files, for example `datasets/splits/abo_all_train.json` and `datasets/splits/abo_all_val.json`.
+    python train.py -e config/cod/stage1_frozen_pretrained -b 8 -w 8
 
-Image-conditioned diffusion training prepares cached CLIP features in `train.py` before DataLoader workers start, then reads those cached CPU tensors from the dataloader so workers do not initialize CUDA.
+For the single-object overfit profile, a virtual training size keeps batches
+full while each repeated access independently resamples surface and SDF query
+points:
 
-## Training
-As described in our [paper](https://arxiv.org/abs/2211.13757), there are three stages of training. All corresponding config files can be found in the `config` folders. Logs are created in a `tensorboard_logs` folder in the root directory. We recommend tuning the `"kld_weight"` when training the joint SDF-VAE model as it enforces the continuity of the latent space. A higher value (e.g. 0.1) will result in better interpolation and generalization but sometimes more artifacts. A lower value (e.g. 0.00001) will result in worse interpolation but higher quality of generations. <br>
+    python train.py -e config/cod/stage1_overfit_one -b 10 -w 8 --virtual_train_size 100
 
-1. Training SDF modulations
+Available stage1_mode values are sdf_head_only, cod_decoder_finetune,
+full_cod_finetune, and train_from_scratch.
 
-```
-python train.py -e config/stage1_sdf/ -b 32 -w 8    # -b for batch size, -w for workers, -r to resume training
-```
-Training notes: For Acronym / ShapeNet datasets, the loss should go down to $6 \sim 8 \times 10^{-4}$. Run testing to visualize whether the quality of reconstructed shapes is sufficient. The quality of reconstructions will carry over to the quality of generations. Note that the dimension of the VAE latent vectors will be 3 times `"latent_dim"` in `"SdfModelSpecs"` listed in the config file.
+learning_rates accepts independent values for point_encoder, variational_block,
+latent_decoder, triplane_decoder, and sdf_network. sdf_loss.type supports l1,
+huber, and truncated_sdf. Loss coefficients are loss_weights.sdf,
+loss_weights.kl, and loss_weights.cod_aux.
 
-2. Training the diffusion model using the modulations extracted from the first stage 
+Extract native, unflattened modulations with the existing command:
 
-```
-# extract the modulations / latent vectors, which will be saved in a "modulations" folder in the config directory
-# the folder needs to correspond to "data_path" in the diffusion config files
+    python test.py -e config/cod/stage1_frozen_pretrained -r last
 
-python test.py -e config/stage1_sdf/ -r last
+Each modulation.npz stores object_id, posterior_mean [M,D], and
+posterior_logvar [M,D]. Extraction uses the posterior mean and writes
+per-channel training statistics to modulations/latent_stats.npz.
 
-# unconditional
-python train.py -e config/stage2_diff_uncond/ -b 32 -w 8 
+## Stage two: COD token diffusion
 
-# conditional
-python train.py -e config/stage2_diff_cond/ -b 32 -w 8 
-```
-Training notes: When extracting modulations, we recommend filtering based on the chamfer distance. See `test_modulations()` in `test.py` for details. Some notes on the conditional config file:  `"perturb_pc":"partial"`, `"crop_percent":0.5`, and `"sample_pc_size":128` refers to cropping 50% of a point cloud with 128 points to use as condition. `dim` in `diffusion_model_specs` needs to be the dimension of the latent vector, which is 3 times `"latent_dim"` in `"SdfModelSpecs"`. <br>
+    python train.py -e config/cod/stage2_transformer_diffusion -b 64 -w 8
 
+Stage two reads only cached modulation files and optional cached conditions.
+The denoiser is a non-causal token transformer over [B,M,D]. It uses the EDM
+log-normal noise distribution, EDM preconditioning, weighted denoising loss,
+and second-order Heun sampling referenced by COD-VAE through VecSet.
 
-3. End-to-end training using the saved models from above 
+    python test.py -e config/cod/stage2_transformer_diffusion -r last -n 5
 
-```
-# unconditional
-python train.py -e config/stage3_uncond/ -b 32 -w 8 -r finetune     # training from the saved models of first two stages
-python train.py -e config/stage3_uncond/ -b 32 -w 8 -r last     # resuming training if third stage has been trained 
+Sampling denormalizes tokens, loads the stage-one SDF/COD checkpoint, decodes
+tri-planes, queries the SDF head, and runs marching cubes.
 
-# conditional
-python train.py -e config/stage3_cond/ -b 32 -w 8 -r finetune    # training from the saved models of first two stages
-python train.py -e config/stage3_cond/ -b 32 -w 8 -r last     # resuming training if third stage has been trained 
-```
-Training notes: The config file needs to contain the saved checkpoints for the previous two stages of training. The sdf loss (not generated sdf loss) should approach $6 \sim 8 \times 10^{-4}$.
+## Stage three: joint fine-tuning
 
-## Testing
-1. Testing SDF reconstructions and saving modulations
+    python train.py -e config/cod/stage3_full_joint -b 8 -w 8 -r finetune
 
-After the first stage of training, visualize / test reconstructions and save modulations:
-```
-# extract the modulations / latent vectors, which will be saved in a "modulations" folder in the config directory
-# the folder needs to correspond to "data_path" in the diffusion config files
-python test.py -e config/stage1_sdf/ -r last
-```
-A `recon` folder in the config directory will contain the `.ply` reconstructions and a `cd.csv` file that logs Chamfer Distance (CD). A `modulation` folder will contain `latent.txt` files for each SDF. The `modulation` folder will be the data path to the second stage of training.
+Available stage3_mode values are diffusion_only, diffusion_and_sdf,
+diffusion_and_cod_decoder, and full_joint_finetune.
 
-2. Generations 
+The generated-SDF branch decodes the EDM model's estimated clean latent for the
+sampled noise level. It does not run a reverse trajectory inside a training
+batch. Coefficients are loss_weights.direct, loss_weights.diffusion,
+loss_weights.generated, and loss_weights.kl.
 
-Meshes can be generated after the second or third stage of training.
-```
-python test.py -e config/stage3_uncond/ -r finetune  # generation after second stage 
-python test.py -e config/stage3_uncond/ -r last      # after third stage 
-```
-A `recon` folder in the config directory will contain the `.ply` reconstructions. `max_batch` arguments in `test.py` are used for running marching cubes; change it to the max value your GPU memory can hold.
+## Configuration profiles
 
+The seven requested profiles live under config/cod/:
+
+    stage1_frozen_pretrained
+    stage1_decoder_finetune
+    stage1_full_finetune
+    stage1_from_scratch
+    stage2_transformer_diffusion
+    stage3_diffusion_only
+    stage3_full_joint
+
+Existing config/example and config/abo specs use the same COD fields. No second
+configuration system or representation backend selector is introduced.
+
+## Evaluation
+
+The existing marching-cubes and distribution metric implementations remain.
+Stage-one reports include SDF reconstruction error, near/uniform error, sign
+accuracy, Chamfer distance, F-score, normal consistency, mesh validity,
+encoding/decoding time, and peak CUDA memory. Diffusion training logs EDM loss,
+and conditional generation uses the same per-shape mesh metrics.
 
 ## References
-We adapt code from <br>
-GenSDF https://github.com/princeton-computational-imaging/gensdf <br>
-DALLE2-pytorch https://github.com/lucidrains/DALLE2-pytorch <br>
-Convolutional Occupancy Networks https://github.com/autonomousvision/convolutional_occupancy_networks (for PointNet encoder) <br>
-Multimodal Shape Completion via cGANs https://github.com/ChrisWu1997/Multimodal-Shape-Completion (for conditional metrics) <br>
-PointFlow https://github.com/stevenygd/PointFlow (for unconditional metrics)
+
+- Gene Chou, Yuval Bahat, and Felix Heide, “Diffusion-SDF,” ICCV 2023.
+- In Cho, Youngbeom Yoo, Subin Jeon, and Seon Joo Kim, “Representing 3D Shapes
+  with 64 Latent Vectors for 3D Diffusion Models,” ICCV 2025.
+- Biao Zhang et al., “3DShape2VecSet,” SIGGRAPH 2023.
+
+Please follow the upstream repositories' citation and licensing requirements.

@@ -47,7 +47,7 @@ class ModulationConditioningTests(unittest.TestCase):
                 )
 
                 item = dataset[0]
-                self.assertEqual(item["latent"].shape, torch.Size([4]))
+                self.assertEqual(item["latent"].shape, torch.Size([2, 3]))
                 self.assertEqual(item["conditioning"]["image"].shape, torch.Size([1, 512]))
                 self.assertEqual(clip_model.calls, 1)
 
@@ -111,8 +111,8 @@ class ModulationConditioningTests(unittest.TestCase):
                 )
 
     def test_clip_cache_key_differs_by_model_name(self):
-        source_a = ImageConditioning("/tmp/images", clip_model="ViT-B/32")
-        source_b = ImageConditioning("/tmp/images", clip_model="RN50")
+        source_a = ImageConditioning("tmp/images", clip_model="ViT-B/32")
+        source_b = ImageConditioning("tmp/images", clip_model="RN50")
 
         self.assertNotEqual(
             source_a.resolve_cache_path(self.record()),
@@ -125,9 +125,8 @@ class ModulationConditioningTests(unittest.TestCase):
             self.write_latent(root)
             pc_dir = root / "pc" / "abo" / "ABO" / "item0"
             pc_dir.mkdir(parents=True)
-            points = np.zeros((8, 4), dtype=np.float32)
-            points[:, :3] = np.random.randn(8, 3).astype(np.float32)
-            np.savetxt(pc_dir / "sdf_data.csv", points, delimiter=",")
+            points = np.random.randn(8, 3).astype(np.float32)
+            np.savez(pc_dir / "cod_sdf.npz", surface_points=points)
 
             dataset = ModulationLoader(
                 str(root / "mods"),
@@ -136,7 +135,6 @@ class ModulationConditioningTests(unittest.TestCase):
             )
 
             item = dataset[0]
-            self.assertEqual(item["point_cloud"].shape, torch.Size([4, 3]))
             self.assertEqual(item["conditioning"]["point_cloud"].shape, torch.Size([4, 3]))
 
     @staticmethod
@@ -155,7 +153,11 @@ class ModulationConditioningTests(unittest.TestCase):
     def write_latent(root):
         latent_dir = root / "mods" / "ABO" / "item0"
         latent_dir.mkdir(parents=True)
-        np.savetxt(latent_dir / "latent.txt", np.arange(4, dtype=np.float32))
+        np.savez(
+            latent_dir / "modulation.npz",
+            object_id=np.asarray("item0"),
+            posterior_mean=np.arange(6, dtype=np.float32).reshape(2, 3),
+        )
 
 
 if __name__ == "__main__":

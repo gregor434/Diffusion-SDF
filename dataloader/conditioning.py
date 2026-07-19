@@ -8,9 +8,6 @@ import numpy as np
 import torch
 from PIL import Image, ImageOps
 
-from diff_utils.helpers import sample_pc
-
-
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
 DEFAULT_IMAGE_SIZE = 224
 DEFAULT_CLIP_MODEL = "ViT-B/32"
@@ -98,12 +95,19 @@ class PointCloudConditioning(ConditioningSource):
             record["dataset"],
             record["class_name"],
             record["instance_name"],
-            "sdf_data.csv",
+            "cod_sdf.npz",
         )
         return path if os.path.isfile(path) else None
 
     def load_from_path(self, path):
-        return sample_pc(path, self.pc_size)
+        with np.load(path) as data:
+            surface = data["surface_points"]
+            indices = np.random.choice(
+                len(surface), self.pc_size, replace=len(surface) < self.pc_size
+            )
+            return torch.from_numpy(
+                np.asarray(surface[indices], dtype=np.float32)
+            )
 
 
 class ImageConditioning(ConditioningSource):

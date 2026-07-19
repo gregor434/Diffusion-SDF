@@ -100,9 +100,8 @@ class ConditioningPreparationTests(unittest.TestCase):
             self.write_latent(root)
             pc_dir = root / "pc" / "abo" / "ABO" / "item0"
             pc_dir.mkdir(parents=True)
-            points = np.zeros((8, 4), dtype=np.float32)
-            points[:, :3] = np.random.randn(8, 3).astype(np.float32)
-            np.savetxt(pc_dir / "sdf_data.csv", points, delimiter=",")
+            points = np.random.randn(8, 3).astype(np.float32)
+            np.savez(pc_dir / "cod_sdf.npz", surface_points=points)
 
             source = PointCloudConditioning(str(root / "pc"), pc_size=4)
             self.assertFalse(source.prepare([self.record()]))
@@ -114,7 +113,6 @@ class ConditioningPreparationTests(unittest.TestCase):
             )
             item = dataset[0]
 
-            self.assertEqual(item["point_cloud"].shape, torch.Size([4, 3]))
             self.assertEqual(item["conditioning"]["point_cloud"].shape, torch.Size([4, 3]))
 
     def test_train_dataloader_uses_spawn_only_after_cuda_preparation_with_workers(self):
@@ -171,7 +169,11 @@ class ConditioningPreparationTests(unittest.TestCase):
     def write_latent(root):
         latent_dir = root / "mods" / "ABO" / "item0"
         latent_dir.mkdir(parents=True)
-        np.savetxt(latent_dir / "latent.txt", np.arange(4, dtype=np.float32))
+        np.savez(
+            latent_dir / "modulation.npz",
+            object_id=np.asarray("item0"),
+            posterior_mean=np.arange(6, dtype=np.float32).reshape(2, 3),
+        )
 
 
 class StubClipModel:

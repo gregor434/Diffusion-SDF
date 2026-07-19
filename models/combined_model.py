@@ -1,297 +1,242 @@
-import torch
-import torch.utils.data 
-from torch.nn import functional as F
-import pytorch_lightning as pl
-from einops import reduce
-from torch.utils.tensorboard import SummaryWriter
-import os
+"""Three-stage Diffusion-SDF training harness using COD-VAE latents."""
 
-# add paths in model/__init__.py for new models
-from models import * 
+from pathlib import Path
+
+import numpy as np
+import pytorch_lightning as pl
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+from models.diffusion import EDMLatentDiffusion
+from models.sdf_model import SdfModel
+
+
+STAGE1_COMPONENTS = {
+    "sdf_head_only": {"sdf_network"},
+    "cod_decoder_finetune": {"latent_decoder", "triplane_decoder", "sdf_network"},
+    "full_cod_finetune": {
+        "point_encoder", "variational_block", "latent_decoder",
+        "triplane_decoder", "sdf_network",
+    },
+    "train_from_scratch": {
+        "point_encoder", "variational_block", "latent_decoder",
+        "triplane_decoder", "sdf_network",
+    },
+}
+STAGE3_COMPONENTS = {
+    "diffusion_only": set(),
+    "diffusion_and_sdf": {"sdf_network"},
+    "diffusion_and_cod_decoder": {"latent_decoder", "triplane_decoder"},
+    "full_joint_finetune": {
+        "point_encoder", "variational_block", "latent_decoder",
+        "triplane_decoder", "sdf_network",
+    },
+}
+
 
 class CombinedModel(pl.LightningModule):
     def __init__(self, specs):
         super().__init__()
         self.specs = specs
-        self.metric_writers = {}
-        self.log_every_n_steps = max(1, int(specs.get("log_every_n_steps", 1)))
+        self.task = specs["training_task"]
+        if self.task not in {"modulation", "diffusion", "combined"}:
+            raise ValueError(f"unknown training_task: {self.task}")
 
-        self.task = specs['training_task'] # 'combined' or 'modulation' or 'diffusion'
+        if self.task in {"modulation", "combined"}:
+            self.sdf_model = SdfModel(specs)
+        if self.task in {"diffusion", "combined"}:
+            self.diffusion_model = EDMLatentDiffusion(
+                specs["diffusion_model_specs"], specs["diffusion_specs"]
+            )
 
-        if self.task in ('combined', 'modulation'):
-            self.sdf_model = SdfModel(specs=specs) 
+        self._configure_trainability()
+        self._load_latent_statistics()
 
-            feature_dim = specs["SdfModelSpecs"]["latent_dim"] # latent dim of pointnet 
-            modulation_dim = feature_dim*3 # latent dim of modulation
-            latent_std = specs.get("latent_std", 0.25) # std of target gaussian distribution of latent space
-            hidden_dims = [modulation_dim, modulation_dim, modulation_dim, modulation_dim, modulation_dim]
-            self.vae_model = BetaVAE(in_channels=feature_dim*3, latent_dim=modulation_dim, hidden_dims=hidden_dims, kl_std=latent_std)
+    def _configure_trainability(self):
+        if self.task == "modulation":
+            mode = self.specs.get("stage1_mode", "sdf_head_only")
+            if mode not in STAGE1_COMPONENTS:
+                raise ValueError(f"unknown stage1_mode: {mode}")
+            checkpoint_path = self.specs.get("CODVaeSpecs", {}).get("checkpoint_path")
+            if mode == "train_from_scratch" and checkpoint_path:
+                raise ValueError("train_from_scratch must not specify a COD checkpoint")
+            if mode != "train_from_scratch" and not checkpoint_path:
+                raise ValueError(f"{mode} requires CODVaeSpecs.checkpoint_path")
+            self.sdf_model.set_trainable_components(STAGE1_COMPONENTS[mode])
+        elif self.task == "combined":
+            mode = self.specs.get("stage3_mode", "diffusion_only")
+            if mode not in STAGE3_COMPONENTS:
+                raise ValueError(f"unknown stage3_mode: {mode}")
+            self.sdf_model.set_trainable_components(STAGE3_COMPONENTS[mode])
+            self.diffusion_model.requires_grad_(True)
 
-        if self.task in ('combined', 'diffusion'):
-            self.diffusion_model = DiffusionModel(model=DiffusionNet(**specs["diffusion_model_specs"]), **specs["diffusion_specs"]) 
- 
+    def _load_latent_statistics(self):
+        dimension = int(
+            self.specs.get("diffusion_model_specs", {}).get(
+                "latent_dimension",
+                self.specs.get("CODVaeSpecs", {}).get("latent_dimension", 32),
+            )
+        )
+        mean = torch.zeros(1, 1, dimension)
+        std = torch.ones(1, 1, dimension)
+        stats_path = self.specs.get("latent_stats_path")
+        if stats_path and Path(stats_path).is_file():
+            with np.load(stats_path) as data:
+                mean = torch.from_numpy(np.asarray(data["mean"], dtype=np.float32))
+                std = torch.from_numpy(np.asarray(data["std"], dtype=np.float32))
+        self.register_buffer("latent_mean", mean, persistent=True)
+        self.register_buffer("latent_std", std.clamp_min(1e-6), persistent=True)
 
-    def training_step(self, x, idx):
+    def normalize_latent(self, latent):
+        return (latent - self.latent_mean) / self.latent_std
 
-        if self.task == 'combined':
-            return self.train_combined(x)
-        elif self.task == 'modulation':
-            return self.train_modulation(x)
-        elif self.task == 'diffusion':
-            return self.train_diffusion(x)
+    def denormalize_latent(self, latent):
+        return latent * self.latent_std + self.latent_mean
 
+    @staticmethod
+    def _conditioning(batch):
+        conditioning = batch.get("conditioning")
+        return conditioning if conditioning else None
 
-    def validation_step(self, x, idx):
+    def sdf_reconstruction_loss(self, prediction, target):
+        loss_specs = self.specs.get("sdf_loss", {})
+        loss_type = loss_specs.get("type", "l1")
+        if loss_type == "l1":
+            return F.l1_loss(prediction, target)
+        if loss_type == "huber":
+            return F.smooth_l1_loss(
+                prediction, target, beta=float(loss_specs.get("huber_delta", 0.01))
+            )
+        if loss_type == "truncated_sdf":
+            threshold = float(loss_specs.get("truncation", 0.1))
+            return F.l1_loss(
+                prediction.clamp(-threshold, threshold),
+                target.clamp(-threshold, threshold),
+            )
+        raise ValueError(f"unknown SDF reconstruction loss: {loss_type}")
 
-        if self.task == 'combined':
-            losses = self.combined_losses(x)
-        elif self.task == 'modulation':
-            losses = self.modulation_losses(x)
-        elif self.task == 'diffusion':
-            losses = self.diffusion_losses(x)
-        else:
-            return None
+    @staticmethod
+    def kl_loss(posterior):
+        if posterior is None:
+            return torch.zeros((), device="cpu")
+        return posterior.kl().mean()
 
-        if losses is None:
-            return None
+    @staticmethod
+    def cod_auxiliary_loss(encoded, decoded):
+        encoded = F.layer_norm(encoded, (encoded.shape[-1],))
+        decoded = F.layer_norm(decoded, (decoded.shape[-1],))
+        return F.mse_loss(decoded, encoded.detach())
 
+    def stage1_losses(self, batch):
+        output = self.sdf_model(
+            batch["surface_points"],
+            batch["query_points"],
+            sample_posterior=bool(self.specs.get("sample_posterior", True)),
+        )
+        sdf = self.sdf_reconstruction_loss(output["sdf"], batch["query_sdf"])
+        kl = self.kl_loss(output["posterior"]).to(sdf.device)
+        aux = self.cod_auxiliary_loss(
+            output["encoded_features"], output["decoded_latent"]
+        )
+        weights = self.specs.get("loss_weights", {})
+        total = (
+            float(weights.get("sdf", 1.0)) * sdf
+            + float(weights.get("kl", self.specs.get("kld_weight", 0.0))) * kl
+            + float(weights.get("cod_aux", 0.0)) * aux
+        )
+        return {"loss": total, "sdf": sdf, "kl": kl, "cod_aux": aux}
+
+    def stage2_losses(self, batch):
+        loss, clean_estimate, _, _ = self.diffusion_model.training_loss(
+            batch["latent"], self._conditioning(batch)
+        )
+        return {"loss": loss, "diffusion": loss, "clean_latent": clean_estimate}
+
+    def stage3_losses(self, batch):
+        direct = self.sdf_model(
+            batch["surface_points"],
+            batch["query_points"],
+            sample_posterior=True,
+        )
+        direct_sdf = self.sdf_reconstruction_loss(
+            direct["sdf"], batch["query_sdf"]
+        )
+        clean = self.normalize_latent(direct["latent"])
+        diffusion_loss, clean_estimate, _, _ = self.diffusion_model.training_loss(
+            clean, self._conditioning(batch)
+        )
+        denoised_latent = self.denormalize_latent(clean_estimate)
+        generated_planes = self.sdf_model.decode_latent(denoised_latent)["planes"]
+        generated_sdf = self.sdf_model.query_sdf(
+            generated_planes, batch["query_points"]
+        )
+        generated_loss = self.sdf_reconstruction_loss(
+            generated_sdf, batch["query_sdf"]
+        )
+        kl = self.kl_loss(direct["posterior"]).to(direct_sdf.device)
+        weights = self.specs.get("loss_weights", {})
+        total = (
+            float(weights.get("direct", 1.0)) * direct_sdf
+            + float(weights.get("diffusion", 1.0)) * diffusion_loss
+            + float(weights.get("generated", 1.0)) * generated_loss
+            + float(weights.get("kl", 0.0)) * kl
+        )
         return {
-            key: value.detach()
-            for key, value in losses.items()
-            if value is not None
+            "loss": total,
+            "sdf_direct": direct_sdf,
+            "diffusion": diffusion_loss,
+            "sdf_denoised": generated_loss,
+            "kl": kl,
         }
 
+    def _losses(self, batch):
+        if self.task == "modulation":
+            return self.stage1_losses(batch)
+        if self.task == "diffusion":
+            return self.stage2_losses(batch)
+        return self.stage3_losses(batch)
 
-    def validation_epoch_end(self, outputs):
-
-        outputs = [output for output in outputs if output is not None]
-        if len(outputs) == 0:
-            return None
-
-        losses = {}
-        for key in outputs[0]:
-            values = [output[key].float() for output in outputs if key in output]
-            if len(values) > 0:
-                losses[key] = torch.stack(values).mean()
-
-        self.write_losses("val", losses, self.global_step)
+    def training_step(self, batch, batch_idx):
+        losses = self._losses(batch)
+        for name, value in losses.items():
+            if name != "clean_latent":
+                self.log(f"train/{name}", value, on_step=True, on_epoch=False)
         return losses["loss"]
 
-
-    def on_train_end(self):
-
-        for writer in self.metric_writers.values():
-            writer.close()
-        self.metric_writers = {}
-        
+    def validation_step(self, batch, batch_idx):
+        losses = self._losses(batch)
+        for name, value in losses.items():
+            if name != "clean_latent":
+                self.log(f"val/{name}", value, on_step=False, on_epoch=True)
+        return losses["loss"]
 
     def configure_optimizers(self):
+        rates = self.specs.get("learning_rates", {})
+        groups = []
+        seen = set()
 
-        if self.task == 'combined':
-            params_list = [
-                    { 'params': list(self.sdf_model.parameters()) + list(self.vae_model.parameters()), 'lr':self.specs['sdf_lr'] },
-                    { 'params': self.diffusion_model.parameters(), 'lr':self.specs['diff_lr'] }
-                ]
-        elif self.task == 'modulation':
-            params_list = [
-                    { 'params': self.parameters(), 'lr':self.specs['sdf_lr'] }
-                ]
-        elif self.task == 'diffusion':
-            params_list = [
-                    { 'params': self.parameters(), 'lr':self.specs['diff_lr'] }
-                ]
+        def add_group(name, module, fallback):
+            parameters = [
+                parameter for parameter in module.parameters()
+                if parameter.requires_grad and id(parameter) not in seen
+            ]
+            if not parameters:
+                return
+            seen.update(map(id, parameters))
+            groups.append({
+                "params": parameters,
+                "lr": float(rates.get(name, fallback)),
+                "name": name,
+            })
 
-        optimizer = torch.optim.Adam(params_list)
-        return {
-                "optimizer": optimizer,
-                # "lr_scheduler": {
-                # "scheduler": torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=50000, threshold=0.0002, min_lr=1e-6, verbose=False),
-                # "monitor": "total"
-                # }
-        }
-
-
-    #-----------different training steps for sdf modulation, diffusion, combined----------
-
-    def modulation_losses(self, x):
-
-        xyz = x['xyz'] # (B, N, 3)
-        gt = x['gt_sdf'] # (B, N)
-        pc = x['point_cloud'] # (B, 1024, 3)
-
-        # STEP 1: obtain reconstructed plane feature and latent code 
-        plane_features = self.sdf_model.pointnet.get_plane_features(pc)
-        original_features = torch.cat(plane_features, dim=1)
-        out = self.vae_model(original_features) # out = [self.decode(z), input, mu, log_var, z]
-        reconstructed_plane_feature, latent = out[0], out[-1]
-
-        # STEP 2: pass recon back to GenSDF pipeline 
-        pred_sdf = self.sdf_model.forward_with_plane_features(reconstructed_plane_feature, xyz)
-        
-        # STEP 3: losses for VAE and SDF
-        # we only use the KL loss for the VAE; no reconstruction loss
-        try:
-            vae_loss = self.vae_model.loss_function(*out, M_N=self.specs["kld_weight"] )
-        except:
-            print("vae loss is nan at epoch {}...".format(self.current_epoch))
-            return None # skips this batch
-
-        sdf_loss = F.l1_loss(pred_sdf.squeeze(), gt.squeeze(), reduction='none')
-        sdf_loss = reduce(sdf_loss, 'b ... -> b (...)', 'mean').mean()
-
-        loss = sdf_loss + vae_loss
-
-        return {"loss": loss, "sdf": sdf_loss, "vae": vae_loss}
-
-
-    def get_metric_writer(self, split):
-
-        if split not in self.metric_writers:
-            logger = getattr(self, "logger", None)
-            trainer = getattr(self, "trainer", None)
-            log_dir = logger.log_dir if logger is not None else None
-            if log_dir is None and trainer is not None:
-                log_dir = trainer.default_root_dir
-            if log_dir is None:
-                return None
-            self.metric_writers[split] = SummaryWriter(os.path.join(log_dir, split))
-        return self.metric_writers[split]
-
-
-    def write_losses(self, split, losses, step):
-
-        trainer = getattr(self, "trainer", None)
-        if trainer is not None and not trainer.is_global_zero:
-            return
-        if not self.should_write_losses(split, step):
-            return
-
-        writer = self.get_metric_writer(split)
-        if writer is None:
-            return
-        for key, value in losses.items():
-            if value is None:
-                continue
-            writer.add_scalar(key, value.detach().float().mean().cpu().item(), step)
-        writer.flush()
-
-
-    def should_write_losses(self, split, step):
-
-        if self.log_every_n_steps <= 1:
-            return True
-        if split != "train":
-            return step % self.log_every_n_steps == 0
-        return (step + 1) % self.log_every_n_steps == 0
-
-
-    def train_modulation(self, x):
-
-        losses = self.modulation_losses(x)
-        if losses is None:
-            return None
-
-        self.write_losses("train", losses, self.global_step)
-
-        return losses["loss"]
-
-
-    def diffusion_losses(self, x):
-
-
-        latent = x['latent'] # (B, D)
-
-        # unconditional training if cond is None 
-        if self.specs['diffusion_model_specs']['cond']:
-            cond = x.get('conditioning', x.get('point_cloud'))
-        else:
-            cond = None
-
-        # diff_100 and 1000 loss refers to the losses when t<100 and 100<t<1000, respectively 
-        # typically diff_100 approaches 0 while diff_1000 can still be relatively high
-        # visualizing loss curves can help with debugging if training is unstable
-        diff_loss, diff_100_loss, diff_1000_loss, pred_latent, perturbed_cond = self.diffusion_model.diffusion_model_from_latent(latent, cond=cond)
-
-        return {
-                        "loss": diff_loss,
-                        "diff100": diff_100_loss, # note that this can appear as nan when the training batch does not have sampled timesteps < 100
-                        "diff1000": diff_1000_loss
-                    }
-
-
-    def train_diffusion(self, x):
-
-        losses = self.diffusion_losses(x)
-        self.write_losses("train", losses, self.global_step)
-
-        return losses["loss"]
-
-    # the first half is the same as "train_sdf_modulation"
-    # the reconstructed latent is used as input to the diffusion model, rather than loading latents from the dataloader as in "train_diffusion"
-    def combined_losses(self, x):
-        xyz = x['xyz'] # (B, N, 3)
-        gt = x['gt_sdf'] # (B, N)
-        pc = x['point_cloud'] # (B, 1024, 3)
-
-        # STEP 1: obtain reconstructed plane feature for SDF and latent code for diffusion
-        plane_features = self.sdf_model.pointnet.get_plane_features(pc)
-        original_features = torch.cat(plane_features, dim=1)
-        #print("plane feat shape: ", feat.shape)
-        out = self.vae_model(original_features) # out = [self.decode(z), input, mu, log_var, z]
-        reconstructed_plane_feature, latent = out[0], out[-1] # [B, D*3, resolution, resolution], [B, D*3]
-
-        # STEP 2: pass recon back to GenSDF pipeline 
-        pred_sdf = self.sdf_model.forward_with_plane_features(reconstructed_plane_feature, xyz)
-        
-        # STEP 3: losses for VAE and SDF 
-        try:
-            vae_loss = self.vae_model.loss_function(*out, M_N=self.specs["kld_weight"] )
-        except:
-            print("vae loss is nan at epoch {}...".format(self.current_epoch))
-            return None # skips this batch
-        sdf_loss = F.l1_loss(pred_sdf.squeeze(), gt.squeeze(), reduction='none')
-        sdf_loss = reduce(sdf_loss, 'b ... -> b (...)', 'mean').mean()
-
-        # STEP 4: use latent as input to diffusion model
-        if self.specs['diffusion_model_specs']['cond']:
-            cond = x.get('conditioning', pc)
-        else:
-            cond = None
-        diff_loss, diff_100_loss, diff_1000_loss, pred_latent, perturbed_cond = self.diffusion_model.diffusion_model_from_latent(latent, cond=cond)
-        
-        # STEP 5: use predicted / reconstructed latent to run SDF loss 
-        generated_plane_feature = self.vae_model.decode(pred_latent)
-        generated_sdf_pred = self.sdf_model.forward_with_plane_features(generated_plane_feature, xyz)
-        generated_sdf_loss = F.l1_loss(generated_sdf_pred.squeeze(), gt.squeeze())
-
-        # surface weight could prioritize points closer to surface but we did not notice better results when using it 
-        #surface_weight = torch.exp(-50 * torch.abs(gt))
-        #generated_sdf_loss = torch.mean( F.l1_loss(generated_sdf_pred, gt, reduction='none') * surface_weight )
-
-        # we did not experiment with using constants/weights for each loss (VAE loss is weighted using value in specs file)
-        # results could potentially improve with a grid search 
-        loss = sdf_loss + vae_loss + diff_loss + generated_sdf_loss
-
-        return {
-                        "loss": loss,
-                        "sdf": sdf_loss,
-                        "vae": vae_loss,
-                        "diff": diff_loss,
-                        # diff_100 and 1000 loss refers to the losses when t<100 and 100<t<1000, respectively 
-                        # typically diff_100 approaches 0 while diff_1000 can still be relatively high
-                        # visualizing loss curves can help with debugging if training is unstable
-                        #"diff100": diff_100_loss, # note that this can sometimes appear as nan when the training batch does not have sampled timesteps < 100
-                        #"diff1000": diff_1000_loss,
-                        "gensdf": generated_sdf_loss,
-                    }
-
-
-    def train_combined(self, x):
-
-        losses = self.combined_losses(x)
-        if losses is None:
-            return None
-
-        self.write_losses("train", losses, self.global_step)
-
-        return losses["loss"]
+        if self.task in {"modulation", "combined"}:
+            for name, module in self.sdf_model.component_modules().items():
+                add_group(name, module, self.specs.get("sdf_lr", 1e-4))
+        if self.task in {"diffusion", "combined"}:
+            add_group("diffusion", self.diffusion_model, self.specs.get("diff_lr", 1e-5))
+        if not groups:
+            raise ValueError("the selected training mode has no trainable parameters")
+        return torch.optim.AdamW(
+            groups, weight_decay=float(self.specs.get("weight_decay", 0.0))
+        )

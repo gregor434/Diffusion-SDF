@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 
-"""Prepare ABO meshes for Diffusion-SDF and emit split-aware metadata.
+"""Prepare ABO meshes for COD Diffusion-SDF and emit split-aware metadata.
 
 This generalizes the chair-specific ABO preparation flow:
 - consumes downloaded `.glb` files
-- converts each mesh into the repo's CSV layout
+- stores separate COD surface points and SDF supervision in NPZ records
 - writes split manifests for all products and per product type
 - writes a metadata JSON keyed directly by `3dmodel_id`
 """
-
-from __future__ import annotations
 
 import argparse
 import gc
@@ -23,7 +22,10 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import open3d as o3d
+try:
+    import open3d as o3d
+except (ImportError, OSError):
+    o3d = None
 import trimesh
 
 
@@ -34,6 +36,7 @@ DEFAULT_CLASS_NAME = "ABO"
 DEFAULT_SPLIT_PREFIX = "abo"
 DEFAULT_METADATA_IN = Path("datasets/ABO/abo_selected_subset.json")
 DEFAULT_TRAIN_RATIO = 0.8
+DEFAULT_REPAIRED_MESH_DIRNAME = "repaired_meshes_cod_0999"
 REPAIR_NONE = "none"
 REPAIR_MANIFOLDPLUS = "manifoldplus"
 
@@ -72,7 +75,7 @@ def parse_args() -> argparse.Namespace:
         "--surface-point-count",
         type=int,
         default=235000,
-        help="Number of exact surface samples; two perturbed queries are generated per sample.",
+        help="Number of area-weighted surface samples stored for COD encoding.",
     )
     parser.add_argument(
         "--near-surface-stds",
@@ -83,10 +86,10 @@ def parse_args() -> argparse.Namespace:
         help="Standard deviations of the two isotropic Gaussian surface perturbations.",
     )
     parser.add_argument(
-        "--grid-resolution",
+        "--uniform-point-count",
         type=int,
-        default=128,
-        help="Resolution per axis of the regular query grid spanning [-1, 1]^3.",
+        default=262144,
+        help="Number of uniformly sampled SDF supervision points in [-1, 1]^3.",
     )
     parser.add_argument("--batch-size", type=int, default=200000)
     parser.add_argument("--seed", type=int, default=0)
@@ -115,7 +118,11 @@ def parse_args() -> argparse.Namespace:
         "--repaired-mesh-dir",
         type=Path,
         default=None,
-        help="Directory for cached watertight proxy meshes. Defaults to <datasets-root>/repaired_meshes.",
+        help=(
+            "Directory for cached watertight proxy meshes. Defaults to "
+            "<datasets-root>/repaired_meshes_cod_0999; the COD-normalized cache "
+            "must not share proxies with the legacy diagonal-normalized pipeline."
+        ),
     )
     parser.add_argument(
         "--force-repair",
@@ -131,7 +138,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-existing",
         action="store_true",
-        help="Skip objects whose sdf_data.csv and grid_gt.csv already exist.",
+        help="Skip objects whose cod_sdf.npz record already exists.",
     )
     parser.add_argument(
         "--only-models-in",
@@ -142,13 +149,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--manifest-only",
         action="store_true",
-        help="Only write splits and metadata; do not generate CSV data.",
+        help="Only write splits and metadata; do not generate COD/SDF records.",
     )
     return parser.parse_args()
 
 
 def build_repair_config(args: argparse.Namespace) -> RepairConfig:
-    repaired_mesh_dir = args.repaired_mesh_dir or args.datasets_root / "repaired_meshes"
+    repaired_mesh_dir = (
+        args.repaired_mesh_dir
+        or args.datasets_root / DEFAULT_REPAIRED_MESH_DIRNAME
+    )
     manifoldplus_bin = args.manifoldplus_bin
     if manifoldplus_bin is None and args.repair_method == REPAIR_MANIFOLDPLUS:
         env_bin = os.environ.get("MANIFOLDPLUS_BIN")
@@ -238,20 +248,30 @@ def load_mesh(mesh_path: Path) -> trimesh.Trimesh:
     return mesh
 
 
-def normalize_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+def normalize_mesh_with_transform(
+    mesh: trimesh.Trimesh,
+) -> tuple[trimesh.Trimesh, np.ndarray, float]:
     mesh = mesh.copy()
     bounds = mesh.bounds.astype(np.float32)
     center = bounds.mean(axis=0)
-    extent = bounds[1] - bounds[0]
-    diagonal = float(np.linalg.norm(extent))
-    if diagonal <= 0:
+    radius = float(np.abs(np.asarray(mesh.vertices) - center).max())
+    if radius <= 0:
         raise ValueError("mesh has zero extent")
+    scale = 0.999 / radius
     mesh.apply_translation(-center)
-    mesh.apply_scale(1.0 / diagonal)
-    return mesh
+    mesh.apply_scale(scale)
+    return mesh, center.astype(np.float32), scale
+
+
+def normalize_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+    return normalize_mesh_with_transform(mesh)[0]
 
 
 def make_raycast_scene(mesh: trimesh.Trimesh) -> o3d.t.geometry.RaycastingScene:
+    if o3d is None:
+        raise RuntimeError(
+            "Open3D raycasting is unavailable; install Open3D and its libGL runtime"
+        )
     vertices = o3d.core.Tensor(np.asarray(mesh.vertices, dtype=np.float32))
     faces = o3d.core.Tensor(np.asarray(mesh.faces, dtype=np.uint32))
     tmesh = o3d.t.geometry.TriangleMesh(vertices, faces)
@@ -310,7 +330,8 @@ def sample_surface(
     mesh: trimesh.Trimesh,
     count: int,
     rng: np.random.Generator,
-) -> np.ndarray:
+    return_normals: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     if count <= 0:
         raise ValueError("surface point count must be positive")
 
@@ -322,11 +343,14 @@ def sample_surface(
     barycentric = rng.random((count, 2), dtype=np.float32)
     reflected = barycentric.sum(axis=1) > 1.0
     barycentric[reflected] = 1.0 - barycentric[reflected]
-    return (
+    points = (
         triangles[:, 0]
         + barycentric[:, :1] * (triangles[:, 1] - triangles[:, 0])
         + barycentric[:, 1:] * (triangles[:, 2] - triangles[:, 0])
     )
+    if return_normals:
+        return points, np.asarray(mesh.face_normals[face_indices], dtype=np.float32)
+    return points
 
 
 def compute_signed_distances(
@@ -361,62 +385,60 @@ def compute_signed_distances(
     return sdf
 
 
-def sample_near_surface(
+def sample_cod_supervision(
     mesh: trimesh.Trimesh,
     scene: o3d.t.geometry.RaycastingScene,
     surface_point_count: int,
     near_surface_stds: tuple[float, float],
+    uniform_point_count: int,
     batch_size: int,
     rng: np.random.Generator,
     sign_method: str = "normal",
-) -> np.ndarray:
+) -> dict[str, np.ndarray]:
     if any(std <= 0 for std in near_surface_stds):
         raise ValueError("near-surface standard deviations must be positive")
+    if uniform_point_count <= 0:
+        raise ValueError("uniform point count must be positive")
 
-    surface_points = sample_surface(mesh, surface_point_count, rng)
-    total_rows = surface_point_count * (1 + len(near_surface_stds))
-    rows = np.empty((total_rows, 4), dtype=np.float32)
-    rows[:surface_point_count, :3] = surface_points
-    rows[:surface_point_count, 3] = 0.0
-
-    write_start = surface_point_count
+    surface_points, surface_normals = sample_surface(
+        mesh, surface_point_count, rng, return_normals=True
+    )
+    near_points = []
+    near_sdf = []
     for std in near_surface_stds:
-        write_stop = write_start + surface_point_count
         query_points = surface_points + rng.normal(0.0, std, surface_points.shape).astype(np.float32)
+        # COD's tri-plane sampler clamps to this interval. Clamp before
+        # computing distances so every stored target corresponds to the exact
+        # coordinate later used for feature lookup.
+        query_points = np.clip(query_points, -1.0, 0.999).astype(np.float32)
         query_sdf = compute_signed_distances(scene, query_points, batch_size, sign_method=sign_method)
-        rows[write_start:write_stop, :3] = query_points
-        rows[write_start:write_stop, 3:] = query_sdf
-        del query_points, query_sdf
-        write_start = write_stop
+        near_points.append(query_points)
+        near_sdf.append(query_sdf)
 
-    del surface_points
-    rng.shuffle(rows, axis=0)
-    return rows
-
-
-def compute_grid_sdf(
-    scene: o3d.t.geometry.RaycastingScene,
-    resolution: int,
-    batch_size: int,
-    sign_method: str = "normal",
-) -> np.ndarray:
-    if resolution < 2:
-        raise ValueError("grid resolution must be at least 2")
-    axis = np.linspace(-1.0, 1.0, resolution, dtype=np.float32)
-    query_points = np.stack(np.meshgrid(axis, axis, axis, indexing="ij"), axis=-1).reshape(-1, 3)
-    sdf = compute_signed_distances(scene, query_points, batch_size, sign_method=sign_method)
-    rows = np.empty((len(query_points), 4), dtype=np.float32)
-    rows[:, :3] = query_points
-    rows[:, 3:] = sdf
-    del query_points, sdf
-    return rows
+    uniform_points = np.clip(
+        rng.uniform(-1.0, 1.0, size=(uniform_point_count, 3)),
+        -1.0,
+        0.999,
+    ).astype(np.float32)
+    uniform_sdf = compute_signed_distances(
+        scene, uniform_points, batch_size, sign_method=sign_method
+    )
+    return {
+        "surface_points": surface_points.astype(np.float32),
+        "surface_normals": surface_normals.astype(np.float32),
+        "near_surface_query_points": np.concatenate(near_points, axis=0),
+        "near_surface_sdf": np.concatenate(near_sdf, axis=0).reshape(-1),
+        "uniform_query_points": uniform_points,
+        "uniform_sdf": uniform_sdf.reshape(-1),
+    }
 
 
-def save_csv(csv_path: Path, rows: np.ndarray) -> None:
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = csv_path.with_suffix(csv_path.suffix + ".tmp")
-    np.savetxt(temporary_path, rows, delimiter=",", fmt="%.9g")
-    temporary_path.replace(csv_path)
+def save_cod_sdf(path: Path, arrays: dict[str, np.ndarray]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    with temporary_path.open("wb") as output:
+        np.savez_compressed(output, **arrays)
+    temporary_path.replace(path)
 
 
 def object_output_paths(
@@ -424,10 +446,8 @@ def object_output_paths(
     dataset_key: str,
     class_name: str,
     model_id: str,
-) -> tuple[Path, Path]:
-    sdf_path = datasets_root / dataset_key / class_name / model_id / "sdf_data.csv"
-    grid_path = datasets_root / "grid_data" / dataset_key / class_name / model_id / "grid_gt.csv"
-    return sdf_path, grid_path
+) -> Path:
+    return datasets_root / dataset_key / class_name / model_id / "cod_sdf.npz"
 
 
 def repaired_mesh_output_path(
@@ -456,23 +476,46 @@ def process_model(
     class_name: str,
     surface_point_count: int,
     near_surface_stds: tuple[float, float],
-    grid_resolution: int,
+    uniform_point_count: int,
     batch_size: int,
     rng: np.random.Generator,
     skip_existing: bool,
     repair_config: RepairConfig | None = None,
-) -> tuple[Path, Path, dict[str, Any]]:
+) -> tuple[Path, dict[str, Any]]:
     def log_phase(message: str) -> None:
         print(f"  phase: {message}")
 
     model_id = mesh_path.stem
-    sdf_path, grid_path = object_output_paths(datasets_root, dataset_key, class_name, model_id)
+    output_path = object_output_paths(datasets_root, dataset_key, class_name, model_id)
 
-    if skip_existing and sdf_path.is_file() and grid_path.is_file():
-        return sdf_path, grid_path, {"skipped_existing": True}
+    if skip_existing and output_path.is_file():
+        repair_info: dict[str, Any] = {"skipped_existing": True}
+        if repair_config is not None and repair_config.method == REPAIR_MANIFOLDPLUS:
+            if repair_config.repaired_mesh_dir is None:
+                raise ValueError("repaired mesh directory is required")
+            proxy_path = repaired_mesh_output_path(
+                repair_config.repaired_mesh_dir, dataset_key, class_name, model_id
+            )
+            if not proxy_path.is_file():
+                raise FileNotFoundError(
+                    "existing COD/SDF record has no matching repaired proxy: "
+                    f"{proxy_path}"
+                )
+            repair_info.update(
+                {
+                    "method": REPAIR_MANIFOLDPLUS,
+                    "sdf_sign_method": "occupancy",
+                    "manifoldplus_depth": repair_config.manifoldplus_depth,
+                    "repaired_mesh_path": str(proxy_path),
+                    "cache_hit": True,
+                }
+            )
+        return output_path, repair_info
 
     log_phase("mesh load/normalize")
-    mesh = normalize_mesh(load_mesh(mesh_path))
+    mesh, normalization_center, normalization_scale = normalize_mesh_with_transform(
+        load_mesh(mesh_path)
+    )
     sdf_mesh = mesh
     sign_method = "normal"
     repair_info: dict[str, Any] = {
@@ -508,33 +551,25 @@ def process_model(
     if sdf_mesh is not mesh:
         del sdf_mesh
 
-    log_phase("near-surface sampling")
-    near_surface_rows = sample_near_surface(
+    log_phase("COD surface and SDF supervision sampling")
+    arrays = sample_cod_supervision(
         mesh=mesh,
         scene=scene,
         surface_point_count=surface_point_count,
         near_surface_stds=near_surface_stds,
+        uniform_point_count=uniform_point_count,
         batch_size=batch_size,
         rng=rng,
         sign_method=sign_method,
     )
+    arrays["normalization_center"] = normalization_center
+    arrays["normalization_scale"] = np.asarray(normalization_scale, dtype=np.float32)
     del mesh
-
-    log_phase("grid SDF generation")
-    grid_rows = compute_grid_sdf(
-        scene=scene,
-        resolution=grid_resolution,
-        batch_size=batch_size,
-        sign_method=sign_method,
-    )
     del scene
 
-    log_phase("CSV writes")
-    save_csv(sdf_path, near_surface_rows)
-    del near_surface_rows
-    save_csv(grid_path, grid_rows)
-    del grid_rows
-    return sdf_path, grid_path, repair_info
+    log_phase("COD/SDF NPZ write")
+    save_cod_sdf(output_path, arrays)
+    return output_path, repair_info
 
 
 def load_input_metadata(metadata_path: Path | None) -> dict[str, Any]:
@@ -674,7 +709,7 @@ def write_split_manifests(
 
 
 def default_metadata_out(args: argparse.Namespace) -> Path:
-    return args.datasets_root / "splits" / f"{args.split_prefix}_metadata.json"
+    return args.datasets_root / args.dataset_key / "preprocessing_metadata.json"
 
 
 def main() -> None:
@@ -730,21 +765,20 @@ def main() -> None:
         for idx, model_id in enumerate(process_model_ids, start=1):
             mesh_path = args.source_dir / f"{model_id}.glb"
             print(f"[{idx}/{len(process_model_ids)}] processing {mesh_path.name}")
-            sdf_path, grid_path, repair_info = process_model(
+            data_path, repair_info = process_model(
                 mesh_path=mesh_path,
                 datasets_root=args.datasets_root,
                 dataset_key=args.dataset_key,
                 class_name=args.class_name,
                 surface_point_count=args.surface_point_count,
                 near_surface_stds=tuple(args.near_surface_stds),
-                grid_resolution=args.grid_resolution,
+                uniform_point_count=args.uniform_point_count,
                 batch_size=args.batch_size,
                 rng=rng,
                 skip_existing=args.skip_existing,
                 repair_config=repair_config,
             )
-            products[model_id]["sdf_data_path"] = str(sdf_path)
-            products[model_id]["grid_gt_path"] = str(grid_path)
+            products[model_id]["cod_sdf_path"] = str(data_path)
             products[model_id]["preprocessing_repair"] = repair_info
             products[model_id]["processed"] = True
             if repair_info.get("method") == REPAIR_MANIFOLDPLUS:
@@ -752,8 +786,7 @@ def main() -> None:
                 print(f"  repair: {repair_status}")
             elif repair_info.get("skipped_existing"):
                 print("  skipped existing outputs")
-            print(f"  wrote {sdf_path}")
-            print(f"  wrote {grid_path}")
+            print(f"  wrote {data_path}")
             gc.collect()
 
     for model_id in model_ids:
@@ -762,11 +795,10 @@ def main() -> None:
         products[model_id].setdefault("3dmodel_id", model_id)
         products[model_id].setdefault("local_glb_path", str(args.source_dir / f"{model_id}.glb"))
         products[model_id].setdefault("processed", False)
-        if "sdf_data_path" not in products[model_id]:
-            sdf_path, grid_path = object_output_paths(args.datasets_root, args.dataset_key, args.class_name, model_id)
-            if sdf_path.is_file() and grid_path.is_file():
-                products[model_id]["sdf_data_path"] = str(sdf_path)
-                products[model_id]["grid_gt_path"] = str(grid_path)
+        if "cod_sdf_path" not in products[model_id]:
+            data_path = object_output_paths(args.datasets_root, args.dataset_key, args.class_name, model_id)
+            if data_path.is_file():
+                products[model_id]["cod_sdf_path"] = str(data_path)
                 products[model_id]["processed"] = True
 
     metadata_out = args.metadata_out or default_metadata_out(args)
@@ -778,11 +810,11 @@ def main() -> None:
         "selection": metadata_payload.get("selection"),
         "source_summary": metadata_payload.get("summary"),
         "preprocessing": {
-            "normalization": "centered_tight_bounding_box_diagonal_1",
+            "normalization": "x_prime = scale * (x - center), isotropic max_abs_0.999",
             "surface_point_count": args.surface_point_count,
             "near_surface_stds": list(args.near_surface_stds),
-            "grid_resolution": args.grid_resolution,
-            "grid_bounds": [-1.0, 1.0],
+            "uniform_point_count": args.uniform_point_count,
+            "coordinate_bounds": [-1.0, 1.0],
             "repair": {
                 "method": repair_config.method,
                 "manifoldplus_bin": str(repair_config.manifoldplus_bin)

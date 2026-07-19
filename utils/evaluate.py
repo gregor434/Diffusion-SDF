@@ -1,112 +1,110 @@
 #!/usr/bin/env python3
 
-import argparse
-import logging
-import json
+"""Per-shape reconstruction metrics used by all three training stages."""
+
+import csv
+import os
+
 import numpy as np
-import pandas as pd 
-import os, sys
+import torch
 import trimesh
 from scipy.spatial import cKDTree as KDTree
 
-from utils import uhd, tmd
 
-import csv
+def mesh_validity(recon_mesh):
+    path = recon_mesh if str(recon_mesh).endswith(".ply") else str(recon_mesh) + ".ply"
+    try:
+        reconstructed = trimesh.load(path)
+        return float(
+            isinstance(reconstructed, trimesh.Trimesh)
+            and len(reconstructed.vertices) > 0
+            and len(reconstructed.faces) > 0
+            and np.isfinite(reconstructed.vertices).all()
+        )
+    except Exception:
+        return 0.0
 
-def main(gt_pc, recon_mesh, out_file, mesh_name, return_value=False, return_sampled_pc=False, prioritize_cov=False, pc_size=None):
 
-    gt_pc = gt_pc.cpu().detach().numpy().squeeze()
+def mesh_metrics(gt_points, recon_mesh, gt_normals=None, fscore_threshold=0.01):
+    if torch.is_tensor(gt_points):
+        gt_points = gt_points.detach().cpu().numpy()
+    gt_points = np.asarray(gt_points).reshape(-1, 3)
+    if torch.is_tensor(gt_normals):
+        gt_normals = gt_normals.detach().cpu().numpy()
+    if gt_normals is not None:
+        gt_normals = np.asarray(gt_normals).reshape(-1, 3)
 
-    recon_mesh = trimesh.load(os.path.join(os.getcwd(), recon_mesh)+".ply")
+    path = recon_mesh if str(recon_mesh).endswith(".ply") else str(recon_mesh) + ".ply"
+    try:
+        reconstructed = trimesh.load(path)
+        valid = bool(mesh_validity(path))
+        if not valid:
+            raise ValueError("invalid mesh")
+        recon_points, face_indices = trimesh.sample.sample_surface(
+            reconstructed, len(gt_points)
+        )
+        recon_normals = reconstructed.face_normals[face_indices]
+    except Exception:
+        return {
+            "chamfer_distance": float("nan"),
+            "f_score": 0.0,
+            "normal_consistency": float("nan"),
+            "mesh_validity": 0.0,
+        }
 
-    recon_pc, _ = trimesh.sample.sample_surface(recon_mesh, gt_pc.shape[0])
+    recon_tree = KDTree(recon_points)
+    gt_to_recon, gt_match = recon_tree.query(gt_points)
+    gt_tree = KDTree(gt_points)
+    recon_to_gt, recon_match = gt_tree.query(recon_points)
+    chamfer = np.square(gt_to_recon).mean() + np.square(recon_to_gt).mean()
+    recall = np.mean(gt_to_recon <= fscore_threshold)
+    precision = np.mean(recon_to_gt <= fscore_threshold)
+    f_score = 2 * precision * recall / max(precision + recall, 1e-12)
 
-    full_recon_pc = trimesh.sample.sample_surface(recon_mesh, pc_size)[0] if pc_size is not None else recon_pc
+    normal_consistency = float("nan")
+    if gt_normals is not None:
+        first = np.abs(np.sum(gt_normals * recon_normals[gt_match], axis=-1)).mean()
+        second = np.abs(np.sum(recon_normals * gt_normals[recon_match], axis=-1)).mean()
+        normal_consistency = float(0.5 * (first + second))
+    return {
+        "chamfer_distance": float(chamfer),
+        "f_score": float(f_score),
+        "normal_consistency": normal_consistency,
+        "mesh_validity": 1.0,
+    }
 
-    recon_kd_tree = KDTree(recon_pc)
-    one_distances, one_vertex_ids = recon_kd_tree.query(gt_pc)
-    gt_to_recon_chamfer = np.mean(np.square(one_distances))
 
-    # other direction
-    gt_kd_tree = KDTree(gt_pc)
-    two_distances, two_vertex_ids = gt_kd_tree.query(recon_pc)
-    recon_to_gt_chamfer = np.mean(np.square(two_distances))
-    
-    if prioritize_cov: # higher CD for gaps/holes
-        loss_chamfer = gt_to_recon_chamfer * 2.0 + recon_to_gt_chamfer * 0.5
-    else:
-        loss_chamfer = gt_to_recon_chamfer + recon_to_gt_chamfer
-
+def main(
+    gt_pc,
+    recon_mesh,
+    out_file,
+    mesh_name,
+    return_value=False,
+    return_sampled_pc=False,
+    prioritize_cov=False,
+    pc_size=None,
+):
+    metrics = mesh_metrics(gt_pc, recon_mesh)
+    chamfer = metrics["chamfer_distance"]
     if return_value:
-        return loss_chamfer
-
+        return chamfer
     out_file = os.path.join(os.getcwd(), out_file)
-
-    with open(out_file,"a",) as f:
-        writer = csv.writer(f)
-        writer.writerow([mesh_name,loss_chamfer])
-
+    with open(out_file, "a", newline="") as output:
+        csv.writer(output).writerow([mesh_name, chamfer])
     if return_sampled_pc:
-        return full_recon_pc, loss_chamfer
+        reconstructed = trimesh.load(str(recon_mesh) + ".ply")
+        if torch.is_tensor(gt_pc):
+            count = pc_size or gt_pc.shape[-2]
+        else:
+            count = pc_size or np.asarray(gt_pc).shape[-2]
+        return trimesh.sample.sample_surface(reconstructed, count)[0], chamfer
 
 
 def calc_cd(gt_pc, recon_pc):
-
-    gt_pc = gt_pc.cpu().detach().numpy().squeeze()
-
-    recon_kd_tree = KDTree(recon_pc)
-    one_distances, one_vertex_ids = recon_kd_tree.query(gt_pc)
-    gt_to_recon_chamfer = np.mean(np.square(one_distances))
-
-    # other direction
-    gt_kd_tree = KDTree(gt_pc)
-    two_distances, two_vertex_ids = gt_kd_tree.query(recon_pc)
-    recon_to_gt_chamfer = np.mean(np.square(two_distances))
-    
-    return gt_to_recon_chamfer + recon_to_gt_chamfer
-
-
-def single_eval(gt_csv, recon_mesh):
-    # f=pd.read_csv(gt_csv, sep=',',header=None).values
-    # f = f[f[:,-1]==0][:,:3]
-
-    recon_mesh = trimesh.load( recon_mesh )
-    recon_pc, _ = trimesh.sample.sample_surface(recon_mesh, 30000)
-    print("recon pc min max: ", recon_pc.max(), recon_pc.min())
-    # load from SIREN .xyz file 
-    f = np.genfromtxt(gt_csv)
-    pc = f[:,:3]
-    coord_max = np.amax(pc, axis=0, keepdims=True)
-    coord_min = np.amin(pc, axis=0, keepdims=True)
-    coords = (pc - coord_min) / (coord_max - coord_min)
-    coords -= 0.5
-    coords *= 2.
-    # pc -= np.mean(pc, axis=0, keepdims=True)
-    # bbox_length = np.sqrt( np.sum((np.max(pc, axis=0) - np.min(pc, axis=0))**2) )
-    # pc /= bbox_length
-    f = coords
-    print("f min max: ", f.max(), f.min())
-
-    pc_idx = np.random.choice(f.shape[0], 30000, replace=False)
-    gt_pc = f[pc_idx] 
-
-    recon_mesh = trimesh.load( recon_mesh )
-    recon_pc, _ = trimesh.sample.sample_surface(recon_mesh, 30000)
-
-    recon_kd_tree = KDTree(recon_pc)
-    one_distances, one_vertex_ids = recon_kd_tree.query(gt_pc)
-    gt_to_recon_chamfer = np.mean(np.square(one_distances))
-
-    # other direction
-    gt_kd_tree = KDTree(gt_pc)
-    two_distances, two_vertex_ids = gt_kd_tree.query(recon_pc)
-    recon_to_gt_chamfer = np.mean(np.square(two_distances))
-    
-    loss_chamfer = gt_to_recon_chamfer + recon_to_gt_chamfer
-
-    print("CD loss: ", loss_chamfer)
-
-
-
-if __name__ == "__main__":
-    single_eval(sys.argv[1], sys.argv[2])
+    if torch.is_tensor(gt_pc):
+        gt_pc = gt_pc.detach().cpu().numpy()
+    gt_pc = np.asarray(gt_pc).reshape(-1, 3)
+    recon_pc = np.asarray(recon_pc).reshape(-1, 3)
+    gt_to_recon = KDTree(recon_pc).query(gt_pc)[0]
+    recon_to_gt = KDTree(gt_pc).query(recon_pc)[0]
+    return np.square(gt_to_recon).mean() + np.square(recon_to_gt).mean()

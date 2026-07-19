@@ -1,47 +1,82 @@
 {
-  "Description" : "end-to-end training (unconditional) on couch dataset",
-  "DataSource" : "data",
-  "GridSource" : "grid_data",
-  "TrainSplit" : "data/splits/couch_all.json",
-  "TestSplit" : "data/splits/couch_all.json",
-  "modulation_path" : "config/stage1_sdf/modulations",
-
-  "modulation_ckpt_path" : "config/stage1_sdf/last.ckpt",
-  "diffusion_ckpt_path" : "config/stage2_uncond/last.ckpt",
-  
+  "Description": "COD stage-three joint fine-tuning (unconditional) on couch example",
+  "DataSource": "data",
+  "TrainSplit": "data/splits/couch_all.json",
+  "TestSplit": "data/splits/couch_all.json",
+  "modulation_path": "config/example/stage1_sdf/modulations",
+  "modulation_ckpt_path": "config/example/stage1_sdf/last.ckpt",
+  "diffusion_ckpt_path": "config/example/stage2_diff_uncond/last.ckpt",
+  "num_epochs": 100001,
+  "log_freq": 5000,
   "training_task": "combined",
-
-  "num_epochs" : 100001,
-  "log_freq" : 5000,
-
-  "kld_weight" : 1e-5,
-  "latent_std" : 0.25,
-  
-  "sdf_lr" : 1e-4,
-  "diff_lr" : 1e-5,
-
-  "SdfModelSpecs" : {
-    "hidden_dim" : 512,
-    "latent_dim" : 256,
-    "pn_hidden_dim" : 128,
-    "num_layers" : 9
+  "stage3_mode": "full_joint_finetune",
+  "latent_stats_path": "config/example/stage1_sdf/modulations/latent_stats.npz",
+  "CODVaeSpecs": {
+    "strict_checkpoint_loading": true,
+    "latent_tokens": 32,
+    "latent_dimension": 32,
+    "embed_dimension": 512,
+    "triplane_dimension": 32,
+    "latent_decoder_layers": 12,
+    "disable_uncertainty_pruning": true,
+    "encoder_params": {
+      "num_patches": 512,
+      "num_blocks": 4,
+      "num_layers_per_block": 3
+    },
+    "decoder_params": {
+      "output_resolution": 128,
+      "output_patch_size": 8,
+      "num_layers": 12,
+      "num_init_layers": 1,
+      "mlp_ratio": 2,
+      "keep_ratio": 1,
+      "num_merged_tokens": 8,
+      "use_conv_refine": false
+    },
+    "checkpoint_path": "tmp/cod_vae_m32_weights.pt"
   },
-
-  "SampPerMesh" : 16000,
-  "PCsize" : 1024,
-
-  "diffusion_specs" : {
-    "timesteps" : 1000,
-    "objective" : "pred_x0",
-    "loss_type" : "l2"
+  "SdfModelSpecs": {
+    "hidden_dim": 512,
+    "feature_dim": 32
+  },
+  "SurfacePointCount": 2048,
+  "SampPerMesh": 16000,
+  "NearSurfaceRatio": 0.7,
+  "sdf_loss": {
+    "type": "l1"
+  },
+  "diffusion_specs": {
+    "sigma_data": 1,
+    "P_mean": -1.2,
+    "P_std": 1.2,
+    "sigma_min": 0.002,
+    "sigma_max": 80,
+    "rho": 7,
+    "sampling_steps": 18
   },
   "diffusion_model_specs": {
-    "dim" : 768,
-    "dim_in_out" : 768,
-    "depth" : 4,
-    "ff_dropout" : 0.3,
-    "cond" : false
+    "latent_tokens": 32,
+    "latent_dimension": 32,
+    "width": 512,
+    "depth": 12,
+    "heads": 8,
+    "mlp_ratio": 4,
+    "dropout": 0,
+    "cond": false
+  },
+  "loss_weights": {
+    "direct": 1,
+    "diffusion": 1,
+    "generated": 1,
+    "kl": 0.001
+  },
+  "learning_rates": {
+    "point_encoder": 0.00001,
+    "variational_block": 0.00001,
+    "latent_decoder": 0.00001,
+    "triplane_decoder": 0.00001,
+    "sdf_network": 0.0001,
+    "diffusion": 0.00001
   }
 }
-
-

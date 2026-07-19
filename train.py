@@ -19,15 +19,14 @@ import warnings
 # add paths in model/__init__.py for new models
 from models import * 
 from utils import mesh, evaluate
-from utils.reconstruct import *
-from diff_utils.helpers import * 
+from diff_utils.helpers import save_code_to_conf
 #from metrics.evaluation_metrics import *#compute_all_metrics
 #from metrics import evaluation_metrics
 
-from dataloader.pc_loader import PCloader
 from dataloader.sdf_loader import SdfLoader
 from dataloader.modulation_loader import ModulationLoader
 from dataloader.conditioning import build_conditioning_sources
+from dataloader.virtual_dataset import VirtualDataset
 
 
 def train():
@@ -67,6 +66,9 @@ def train():
         train_dataset = build_dataset(split)
         val_dataset = build_dataset(val_split) if val_split is not None else None
 
+    if args.virtual_train_size is not None:
+        train_dataset = VirtualDataset(train_dataset, args.virtual_train_size)
+
     train_dataloader = build_dataloader(
         train_dataset,
         drop_last=True,
@@ -99,14 +101,20 @@ def train():
     if args.resume == 'finetune':
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            model = model.load_from_checkpoint(specs["modulation_ckpt_path"], specs=specs, strict=False)
-            # loads the diffusion model; directly calling diffusion_model.load_state_dict to prevent overwriting sdf and vae params
-            ckpt = torch.load(specs["diffusion_ckpt_path"])
-            new_state_dict = {}
-            for k,v in ckpt['state_dict'].items():
-                new_key = k.replace("diffusion_model.", "") # remove "diffusion_model." from keys since directly loading into diffusion model
-                new_state_dict[new_key] = v
-            model.diffusion_model.load_state_dict(new_state_dict)
+            modulation = torch.load(specs["modulation_ckpt_path"], map_location="cpu")
+            sdf_state = {
+                key[len("sdf_model."):]: value
+                for key, value in modulation["state_dict"].items()
+                if key.startswith("sdf_model.")
+            }
+            model.sdf_model.load_state_dict(sdf_state)
+            diffusion = torch.load(specs["diffusion_ckpt_path"], map_location="cpu")
+            diffusion_state = {
+                key[len("diffusion_model."):]: value
+                for key, value in diffusion["state_dict"].items()
+                if key.startswith("diffusion_model.")
+            }
+            model.diffusion_model.load_state_dict(diffusion_state)
         resume = None
     elif args.resume is not None:
         ckpt = "{}.ckpt".format(args.resume) if args.resume=='last' else "epoch={}.ckpt".format(args.resume)
@@ -147,15 +155,19 @@ def build_dataset(split, conditioning_sources=None, records=None):
             conditioning=get_conditioning_specs(specs),
             conditioning_sources=conditioning_sources,
             records=records,
+            latent_stats_path=specs.get("latent_stats_path"),
         )
 
     return SdfLoader(
         specs["DataSource"],
         split,
         samples_per_mesh=specs.get("SampPerMesh", 16000),
-        pc_size=specs.get("PCsize",1024),
-        grid_source=specs.get("GridSource", None),
+        surface_point_count=specs.get("SurfacePointCount", 2048),
+        near_surface_ratio=specs.get("NearSurfaceRatio", 0.7),
         modulation_path=specs.get("modulation_path", None),
+        condition_surface=bool(
+            specs.get("diffusion_model_specs", {}).get("cond", False)
+        ),
     )
 
 
@@ -206,6 +218,15 @@ if __name__ == "__main__":
 
     arg_parser.add_argument("--batch_size", "-b", default=32, type=int)
     arg_parser.add_argument( "--workers", "-w", default=8, type=int)
+    arg_parser.add_argument(
+        "--virtual_train_size",
+        default=None,
+        type=int,
+        help=(
+            "Expose the training dataset at this virtual size by cycling through "
+            "its records; each access still runs the dataset's sampling logic."
+        ),
+    )
 
     args = arg_parser.parse_args()
     specs_path = os.path.join(args.exp_dir, "specs.json")

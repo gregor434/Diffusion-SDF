@@ -1,0 +1,42 @@
+{
+  "Description": "Stage one full COD-VAE and SDF fine-tuning",
+  "DataSource": "datasets",
+  "TrainSplit": "datasets/splits/abo_CHAIR_train.json",
+  "ValSplit": "datasets/splits/abo_CHAIR_val.json",
+  "TestSplit": "datasets/splits/abo_CHAIR_val.json",
+  "ModulationSplit": "datasets/splits/abo_CHAIR_all.json",
+  "training_task": "modulation",
+  "stage1_mode": "full_cod_finetune",
+  "CODVaeSpecs": {
+    "checkpoint_path": "tmp/cod_vae_m32_weights.pt",
+    "strict_checkpoint_loading": true,
+    "latent_tokens": 32,
+    "latent_dimension": 32,
+    "embed_dimension": 512,
+    "triplane_dimension": 32,
+    "latent_decoder_layers": 12,
+    "disable_uncertainty_pruning": true,
+    "encoder_params": {"num_patches": 512, "num_blocks": 4, "num_layers_per_block": 3},
+    "decoder_params": {
+      "output_resolution": 128, "output_patch_size": 8, "num_layers": 12,
+      "num_init_layers": 1, "mlp_ratio": 2, "keep_ratio": 1.0,
+      "num_merged_tokens": 8, "use_conv_refine": false
+    }
+  },
+  "SdfModelSpecs": {"hidden_dim": 512, "feature_dim": 32},
+  "SurfacePointCount": 2048,
+  "SampPerMesh": 8192,
+  "NearSurfaceRatio": 0.5,
+  "sdf_loss": {"type": "huber", "huber_delta": 0.01},
+  "loss_weights": {"sdf": 1.0, "kl": 0.001, "cod_aux": 0.0},
+  "learning_rates": {
+    "point_encoder": 0.00001,
+    "variational_block": 0.00001,
+    "latent_decoder": 0.00001,
+    "triplane_decoder": 0.00001,
+    "sdf_network": 0.0001
+  },
+  "num_epochs": 1000,
+  "log_freq": 25,
+  "log_every_n_steps": 10
+}

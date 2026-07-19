@@ -1,246 +1,304 @@
 #!/usr/bin/env python3
 
-import torch
-import torch.utils.data 
-from torch.nn import functional as F
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, Callback, LearningRateMonitor
-from pytorch_lightning import loggers as pl_loggers
+"""Extraction, reconstruction, and generation entry point for COD Diffusion-SDF."""
 
+import argparse
+import csv
+import json
 import os
-import json, csv
 import time
-from tqdm.auto import tqdm
-from einops import rearrange, reduce
-import numpy as np
-import trimesh
 import warnings
+from pathlib import Path
 
-# add paths in model/__init__.py for new models
-from models import * 
-from utils import mesh, evaluate
-from utils.reconstruct import *
-from diff_utils.helpers import * 
-#from metrics.evaluation_metrics import *#compute_all_metrics
-#from metrics import evaluation_metrics
+import numpy as np
+import torch
+from torch.nn import functional as F
+from tqdm.auto import tqdm
 
-from dataloader.pc_loader import PCloader
+from dataloader.modulation_loader import (
+    ModulationLoader,
+    compute_latent_statistics,
+    save_latent_statistics,
+)
+from dataloader.sdf_loader import SdfLoader
+from models import CombinedModel, SdfModel
+from utils import evaluate, mesh
+from utils.reconstruct import filter_threshold
+
+
+def checkpoint_path(exp_dir, resume):
+    name = f"{resume}.ckpt" if resume == "last" else f"epoch={resume}.ckpt"
+    return str(Path(exp_dir) / name)
+
+
+def load_prefixed(module, path, prefix):
+    checkpoint = torch.load(path, map_location="cpu")
+    state = {
+        key[len(prefix):]: value
+        for key, value in checkpoint["state_dict"].items()
+        if key.startswith(prefix)
+    }
+    if not state:
+        raise RuntimeError(f"no parameters with prefix '{prefix}' in {path}")
+    module.load_state_dict(state)
+
+
+def make_sdf_dataset(specs, split_name="TestSplit", condition_surface=False):
+    split = json.loads(Path(specs[split_name]).read_text())
+    return SdfLoader(
+        specs["DataSource"],
+        split,
+        samples_per_mesh=specs.get("ValidationSamplesPerMesh", specs.get("SampPerMesh", 16000)),
+        surface_point_count=specs.get("SurfacePointCount", 2048),
+        near_surface_ratio=specs.get("NearSurfaceRatio", 0.7),
+        condition_surface=condition_surface,
+    )
+
+
+def save_modulation(path, object_id, posterior, conditioning=None):
+    arrays = {
+        "object_id": np.asarray(object_id),
+        "posterior_mean": posterior.mean[0].detach().cpu().numpy(),
+        "posterior_logvar": posterior.logvar[0].detach().cpu().numpy(),
+    }
+    for name, value in (conditioning or {}).items():
+        if torch.is_tensor(value):
+            arrays[f"condition_{name}"] = value[0].detach().cpu().numpy()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("wb") as output:
+        np.savez_compressed(output, **arrays)
+    temporary.replace(path)
+
 
 @torch.no_grad()
-def test_modulations():
-    
-    # load dataset, dataloader, model checkpoint
-    test_split = json.load(open(specs["TestSplit"]))
-    test_dataset = PCloader(specs["DataSource"], test_split, pc_size=specs.get("PCsize",1024), return_filename=True)
-    test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=1, num_workers=0)
+def extract_modulations(specs, args, recon_dir, latent_dir, device):
+    split_name = "ModulationSplit" if specs.get("ModulationSplit") else "TestSplit"
+    dataset = make_sdf_dataset(specs, split_name=split_name)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=1, num_workers=0)
+    model = CombinedModel.load_from_checkpoint(
+        checkpoint_path(args.exp_dir, args.resume), specs=specs
+    ).to(device).eval()
+    records = []
+    metrics_path = recon_dir / "sdf_metrics.csv"
+    with metrics_path.open("w", newline="") as metric_file:
+        writer = csv.DictWriter(
+            metric_file,
+            fieldnames=[
+                "object_id", "sdf_reconstruction_error", "near_surface_error",
+                "uniform_error", "sign_accuracy", "encoding_time",
+                "decoding_time", "peak_memory", "chamfer_distance",
+                "f_score", "normal_consistency", "mesh_validity",
+            ],
+        )
+        writer.writeheader()
+        for batch in tqdm(loader, desc="extracting COD modulations"):
+            surface = batch["surface_points"].to(device)
+            queries = batch["query_points"].to(device)
+            target = batch["query_sdf"].to(device)
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(device)
+                torch.cuda.synchronize(device)
+            start = time.perf_counter()
+            latent, posterior, _ = model.sdf_model.encode_surface(
+                surface, sample_posterior=False
+            )
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            encoding_time = time.perf_counter() - start
+            start = time.perf_counter()
+            decoded = model.sdf_model.decode_latent(latent)
+            prediction = model.sdf_model.query_sdf(decoded["planes"], queries)
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            decoding_time = time.perf_counter() - start
 
-    ckpt = "{}.ckpt".format(args.resume) if args.resume=='last' else "epoch={}.ckpt".format(args.resume)
-    resume = os.path.join(args.exp_dir, ckpt)
-    model = CombinedModel.load_from_checkpoint(resume, specs=specs).cuda().eval()
-
-    # filename for logging chamfer distances of reconstructed meshes
-    cd_file = os.path.join(recon_dir, "cd.csv") 
-
-    with tqdm(test_dataloader) as pbar:
-        for idx, data in enumerate(pbar):
-            pbar.set_description("Files evaluated: {}/{}".format(idx, len(test_dataloader)))
-
-            point_cloud, filename = data # filename = path to the csv file of sdf data
-            filename = filename[0] # filename is a tuple
-
-            cls_name = filename.split("/")[-3]
-            mesh_name = filename.split("/")[-2]
-            outdir = os.path.join(recon_dir, "{}/{}".format(cls_name, mesh_name))
-            os.makedirs(outdir, exist_ok=True)
-            mesh_filename = os.path.join(outdir, "reconstruct")
-            
-            # given point cloud, create modulations (e.g. 1D latent vectors)
-            plane_features = model.sdf_model.pointnet.get_plane_features(point_cloud.cuda())  # tuple, 3 items with ([1, D, resolution, resolution])
-            plane_features = torch.cat(plane_features, dim=1) # ([1, D*3, resolution, resolution])
-            recon = model.vae_model.generate(plane_features) # ([1, D*3, resolution, resolution])
-            #print("mesh filename: ", mesh_filename)
-            # N is the grid resolution for marching cubes; set max_batch to largest number gpu can hold
+            object_id = batch["object_id"][0]
+            class_name = batch["class_name"][0]
+            output_dir = recon_dir / class_name / object_id
+            output_dir.mkdir(parents=True, exist_ok=True)
+            mesh_path = output_dir / "reconstruct"
             mesh.create_mesh(
                 model.sdf_model,
-                recon,
-                mesh_filename,
+                decoded["planes"],
+                str(mesh_path),
                 N=args.recon_resolution,
                 max_batch=args.max_batch,
                 from_plane_features=True,
             )
-
-            # load the created mesh (mesh_filename), and compare with input point cloud
-            # to calculate and log chamfer distance 
-            mesh_log_name = cls_name+"/"+mesh_name
             try:
-                evaluate.main(point_cloud, mesh_filename, cd_file, mesh_log_name)
-            except Exception as e:
-                print(e)
+                evaluate.main(surface, str(mesh_path), str(recon_dir / "cd.csv"), f"{class_name}/{object_id}")
+            except Exception as error:
+                warnings.warn(f"mesh metric failed for {object_id}: {error}")
+            mesh_metrics = evaluate.mesh_metrics(
+                surface,
+                str(mesh_path),
+                batch.get("surface_normals"),
+                fscore_threshold=float(specs.get("FScoreThreshold", 0.01)),
+            )
+
+            if (
+                args.modulation_filter_threshold is not None
+                and not filter_threshold(
+                    str(mesh_path), surface, args.modulation_filter_threshold
+                )
+            ):
+                continue
+            modulation_path = latent_dir / class_name / object_id / "modulation.npz"
+            save_modulation(
+                modulation_path, object_id, posterior, batch.get("conditioning")
+            )
+            records.append({"latent_path": str(modulation_path)})
+
+            absolute = (prediction - target).abs()
+            near = batch["query_is_near"].to(device)
+            writer.writerow({
+                "object_id": object_id,
+                "sdf_reconstruction_error": absolute.mean().item(),
+                "near_surface_error": absolute[near].mean().item(),
+                "uniform_error": absolute[~near].mean().item(),
+                "sign_accuracy": (
+                    (prediction >= 0) == (target >= 0)
+                ).float().mean().item(),
+                "encoding_time": encoding_time,
+                "decoding_time": decoding_time,
+                "peak_memory": (
+                    torch.cuda.max_memory_allocated(device)
+                    if device.type == "cuda" else 0
+                ),
+                **mesh_metrics,
+            })
+            metric_file.flush()
+
+    if not records:
+        raise RuntimeError("no modulations were saved")
+    train_split = json.loads(Path(specs["TrainSplit"]).read_text())
+    train_records = ModulationLoader.build_records(latent_dir, train_split)
+    if not train_records:
+        raise RuntimeError(
+            "no training-set modulations were saved; ensure ModulationSplit "
+            "contains every object from TrainSplit"
+        )
+    mean, std = compute_latent_statistics(train_records)
+    save_latent_statistics(latent_dir / "latent_stats.npz", mean, std)
 
 
-            # save modulation vectors for training diffusion model for next stage
-            # optionally filter based on chamfer distance so that diffusion training data is clean
-            try:
-                if args.modulation_filter_threshold is not None:
-                    # the filter also weighs gaps / empty space higher
-                    if not filter_threshold(mesh_filename, point_cloud, args.modulation_filter_threshold):
-                        print(
-                            "Skipping modulation for {} because CD is above threshold {}".format(
-                                mesh_log_name, args.modulation_filter_threshold
-                            )
-                        )
-                        continue
-                outdir = os.path.join(latent_dir, "{}/{}".format(cls_name, mesh_name))
-                os.makedirs(outdir, exist_ok=True)
-                latent = model.vae_model.get_latent(plane_features) # (1, D*3)
-                np.savetxt(os.path.join(outdir, "latent.txt"), latent.cpu().numpy())
-            except Exception as e:
-                print("Failed to save modulation for {}: {}".format(mesh_log_name, e))
+def load_generation_models(specs, args, device):
+    if specs["training_task"] == "combined" and args.resume != "finetune":
+        model = CombinedModel.load_from_checkpoint(
+            checkpoint_path(args.exp_dir, args.resume), specs=specs
+        )
+        return model.to(device).eval(), model.sdf_model
+
+    model = CombinedModel(specs)
+    diffusion_path = (
+        specs["diffusion_ckpt_path"]
+        if args.resume == "finetune"
+        else checkpoint_path(args.exp_dir, args.resume)
+    )
+    load_prefixed(model.diffusion_model, diffusion_path, "diffusion_model.")
+    modulation_checkpoint = torch.load(
+        specs["modulation_ckpt_path"], map_location="cpu"
+    )
+    stage1_specs = modulation_checkpoint.get("hyper_parameters", {}).get(
+        "specs", specs
+    )
+    sdf_model = SdfModel(stage1_specs)
+    load_prefixed(sdf_model, specs["modulation_ckpt_path"], "sdf_model.")
+    return model.to(device).eval(), sdf_model.to(device).eval()
 
 
-           
 @torch.no_grad()
-def test_generation():
+def generate(specs, args, recon_dir, device):
+    model, sdf_model = load_generation_models(specs, args, device)
+    conditional = bool(specs["diffusion_model_specs"].get("cond", False))
+    batches = [(None, None, None)]
+    if conditional:
+        dataset = make_sdf_dataset(specs, condition_surface=True)
+        batches = torch.utils.data.DataLoader(dataset, batch_size=1, num_workers=0)
 
-    # load model 
-    if args.resume == 'finetune': # after second stage of training 
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-
-            # loads the sdf and vae models
-            model = CombinedModel.load_from_checkpoint(specs["modulation_ckpt_path"], specs=specs, strict=False) 
-
-            # loads the diffusion model; directly calling diffusion_model.load_state_dict to prevent overwriting sdf and vae params
-            ckpt = torch.load(specs["diffusion_ckpt_path"])
-            new_state_dict = {}
-            for k,v in ckpt['state_dict'].items():
-                new_key = k.replace("diffusion_model.", "") # remove "diffusion_model." from keys since directly loading into diffusion model
-                new_state_dict[new_key] = v
-            model.diffusion_model.load_state_dict(new_state_dict)
-
-            model = model.cuda().eval()
-    else:
-        ckpt = "{}.ckpt".format(args.resume) if args.resume=='last' else "epoch={}.ckpt".format(args.resume)
-        resume = os.path.join(args.exp_dir, ckpt)
-        model = CombinedModel.load_from_checkpoint(resume, specs=specs).cuda().eval()
-
-    conditional = specs["diffusion_model_specs"]["cond"] 
-
-    if not conditional:
-        samples = model.diffusion_model.generate_unconditional(args.num_samples)
-        plane_features = model.vae_model.decode(samples)
-        for i in range(len(plane_features)):
-            plane_feature = plane_features[i].unsqueeze(0)
+    metrics_file = (recon_dir / "generated_metrics.csv").open("w", newline="")
+    metrics_writer = csv.DictWriter(
+        metrics_file,
+        fieldnames=[
+            "object_id", "sample", "chamfer_distance", "f_score",
+            "normal_consistency", "mesh_validity",
+        ],
+    )
+    metrics_writer.writeheader()
+    for batch_index, batch in enumerate(tqdm(batches, desc="generating COD latents")):
+        conditioning = None
+        output_dir = recon_dir
+        surface = None
+        if batch is not None:
+            surface = batch["surface_points"].to(device)
+            conditioning = {"point_cloud": surface}
+            output_dir = recon_dir / batch["class_name"][0] / batch["object_id"][0]
+            output_dir.mkdir(parents=True, exist_ok=True)
+        normalized = model.diffusion_model.sample(
+            args.num_samples, conditioning=conditioning
+        )
+        latent = model.denormalize_latent(normalized)
+        planes = sdf_model.decode_latent(latent)["planes"]
+        for sample_index in range(len(planes)):
+            path = output_dir / f"{sample_index}_recon"
             mesh.create_mesh(
-                model.sdf_model,
-                plane_feature,
-                recon_dir+"/{}_recon".format(i),
+                sdf_model,
+                planes[sample_index:sample_index + 1],
+                str(path),
                 N=args.recon_resolution,
                 max_batch=args.max_batch,
                 from_plane_features=True,
             )
-            
-    else:
-        # load dataset, dataloader, model checkpoint
-        test_split = json.load(open(specs["TestSplit"]))
-        test_dataset = PCloader(specs["DataSource"], test_split, pc_size=specs.get("PCsize",1024), return_filename=True)
-        test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=1, num_workers=0)
-
-        with tqdm(test_dataloader) as pbar:
-            for idx, data in enumerate(pbar):
-                pbar.set_description("Files generated: {}/{}".format(idx, len(test_dataloader)))
-
-                point_cloud, filename = data # filename = path to the csv file of sdf data
-                filename = filename[0] # filename is a tuple
-
-                cls_name = filename.split("/")[-3]
-                mesh_name = filename.split("/")[-2]
-                outdir = os.path.join(recon_dir, "{}/{}".format(cls_name, mesh_name))
-                os.makedirs(outdir, exist_ok=True)
-
-                # filter, set threshold manually after a few visualizations
-                if args.filter:
-                    threshold = 0.08
-                    tmp_lst = []
-                    count = 0
-                    while len(tmp_lst)<args.num_samples:
-                        count+=1
-                        samples, perturbed_pc = model.diffusion_model.generate_from_pc(point_cloud.cuda(), batch=args.num_samples, save_pc=outdir, return_pc=True) # batch should be set to max number GPU can hold
-                        plane_features = model.vae_model.decode(samples)
-                        # predicting the sdf values of the point cloud
-                        perturbed_pc_pred = model.sdf_model.forward_with_plane_features(plane_features, perturbed_pc.repeat(args.num_samples, 1, 1))
-                        consistency = F.l1_loss(perturbed_pc_pred, torch.zeros_like(perturbed_pc_pred), reduction='none')
-                        loss = reduce(consistency, 'b ... -> b', 'mean', b = consistency.shape[0]) # one value per generated sample 
-                        #print("consistency shape: ", consistency.shape, loss.shape, consistency[0].mean(), consistency[1].mean(), loss) # cons: [B,N]; loss: [B]
-                        thresh_idx = loss<=threshold
-                        tmp_lst.extend(plane_features[thresh_idx])
-
-                        if count > 5: # repeat this filtering process as needed 
-                            break
-                    # skip the point cloud if cannot produce consistent samples or 
-                    # just use the samples that are produced if comparing to other methods
-                    if len(tmp_lst)<1: 
-                        continue
-                    plane_features = tmp_lst[0:min(10,len(tmp_lst))]
-
-                else:
-                    # for each point cloud, the partial pc and its conditional generations are all saved in the same directory 
-                    samples, perturbed_pc = model.diffusion_model.generate_from_pc(point_cloud.cuda(), batch=args.num_samples, save_pc=outdir, return_pc=True)
-                    plane_features = model.vae_model.decode(samples)
-                
-                for i in range(len(plane_features)):
-                    plane_feature = plane_features[i].unsqueeze(0)
-                    mesh.create_mesh(
-                        model.sdf_model,
-                        plane_feature,
-                        outdir+"/{}_recon".format(i),
-                        N=args.recon_resolution,
-                        max_batch=args.max_batch,
-                        from_plane_features=True,
-                    )
-            
+            if surface is not None:
+                result = evaluate.mesh_metrics(
+                    surface,
+                    str(path),
+                    batch.get("surface_normals"),
+                    fscore_threshold=float(specs.get("FScoreThreshold", 0.01)),
+                )
+                metrics_writer.writerow({
+                    "object_id": batch["object_id"][0],
+                    "sample": sample_index,
+                    **result,
+                })
+                metrics_file.flush()
+            else:
+                metrics_writer.writerow({
+                    "object_id": f"unconditional_{batch_index}",
+                    "sample": sample_index,
+                    "chamfer_distance": float("nan"),
+                    "f_score": float("nan"),
+                    "normal_consistency": float("nan"),
+                    "mesh_validity": evaluate.mesh_validity(str(path)),
+                })
+                metrics_file.flush()
+        if not conditional:
+            break
+    metrics_file.close()
 
 
-    
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--exp_dir", "-e", required=True)
+    parser.add_argument("--resume", "-r", default="last")
+    parser.add_argument("--num_samples", "-n", default=5, type=int)
+    parser.add_argument("--recon_resolution", default=256, type=int)
+    parser.add_argument("--max_batch", default=2**18, type=int)
+    parser.add_argument("--modulation_filter_threshold", default=None, type=float)
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-
-    import argparse
-
-    arg_parser = argparse.ArgumentParser()
-    arg_parser.add_argument(
-        "--exp_dir", "-e", required=True,
-        help="This directory should include experiment specifications in 'specs.json,' and logging will be done in this directory as well.",
-    )
-    arg_parser.add_argument(
-        "--resume", "-r", default=None,
-        help="continue from previous saved logs, integer value, 'last', or 'finetune'",
-    )
-
-    arg_parser.add_argument("--num_samples", "-n", default=5, type=int, help='number of samples to generate and reconstruct')
-
-    arg_parser.add_argument("--filter", default=False, help='whether to filter when sampling conditionally')
-    arg_parser.add_argument("--recon_resolution", default=256, type=int, help="marching-cubes grid resolution")
-    arg_parser.add_argument("--max_batch", default=2**18, type=int, help="maximum SDF query points per reconstruction batch")
-    arg_parser.add_argument(
-        "--modulation_filter_threshold",
-        default=None,
-        type=float,
-        help="optional Chamfer Distance threshold for saving stage-1 modulation latents; omit to save all latents",
-    )
-
-    args = arg_parser.parse_args()
-    specs = json.load(open(os.path.join(args.exp_dir, "specs.json")))
+    args = parse_args()
+    specs = json.loads((Path(args.exp_dir) / "specs.json").read_text())
     print(specs["Description"])
-
-
-    recon_dir = os.path.join(args.exp_dir, "recon")
-    os.makedirs(recon_dir, exist_ok=True)
-    
-    if specs['training_task'] == 'modulation':
-        latent_dir = os.path.join(args.exp_dir, "modulations")
-        os.makedirs(latent_dir, exist_ok=True)
-        test_modulations()
-    elif specs['training_task'] == 'combined':
-        test_generation()
-
-  
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    recon_dir = Path(args.exp_dir) / "recon"
+    recon_dir.mkdir(parents=True, exist_ok=True)
+    if specs["training_task"] == "modulation":
+        latent_dir = Path(args.exp_dir) / "modulations"
+        latent_dir.mkdir(parents=True, exist_ok=True)
+        extract_modulations(specs, args, recon_dir, latent_dir, device)
+    elif specs["training_task"] in {"diffusion", "combined"}:
+        generate(specs, args, recon_dir, device)

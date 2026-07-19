@@ -1,21 +1,26 @@
 import torch
 from torch import nn
 
-from diff_utils.pointnet.conv_pointnet import ConvPointnet
-
-
 class ConditionEncoder(nn.Module):
     def forward(self, condition):
         raise NotImplementedError
 
 
 class PointCloudConditionEncoder(ConditionEncoder):
-    def __init__(self, condition_dim, **kwargs):
+    def __init__(self, condition_dim, hidden_dim=128, **kwargs):
         super().__init__()
-        self.pointnet = ConvPointnet(c_dim=condition_dim, **kwargs)
+        self.encoder = nn.Sequential(
+            nn.Linear(3, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, condition_dim),
+        )
 
     def forward(self, point_cloud):
-        return self.pointnet(point_cloud, point_cloud)
+        if point_cloud.ndim != 3 or point_cloud.shape[-1] != 3:
+            raise ValueError(
+                f"point-cloud condition must be [B,N,3], got {tuple(point_cloud.shape)}"
+            )
+        return self.encoder(point_cloud)
 
 
 class ImageConditionEncoder(ConditionEncoder):

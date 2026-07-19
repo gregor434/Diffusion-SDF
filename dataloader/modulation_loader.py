@@ -1,81 +1,127 @@
 #!/usr/bin/env python3
 
-import os
-import torch
-import torch.utils.data
+"""Lazy loader and normalization utilities for native COD latent tensors."""
+
+from pathlib import Path
 
 import numpy as np
+import torch
+from torch.utils.data import Dataset
 
 from dataloader.conditioning import build_conditioning_sources
 
-class ModulationLoader(torch.utils.data.Dataset):
-    def __init__(self, data_path, split_file=None, conditioning=None, conditioning_sources=None, records=None):
-        super().__init__()
 
+def compute_latent_statistics(records):
+    count = 0
+    total = None
+    total_square = None
+    for record in records:
+        with np.load(record["latent_path"]) as data:
+            latent = np.asarray(data["posterior_mean"], dtype=np.float64)
+        flattened = latent.reshape(-1, latent.shape[-1])
+        count += flattened.shape[0]
+        value_sum = flattened.sum(axis=0)
+        square_sum = np.square(flattened).sum(axis=0)
+        total = value_sum if total is None else total + value_sum
+        total_square = square_sum if total_square is None else total_square + square_sum
+    if count == 0:
+        raise ValueError("cannot compute latent statistics from an empty dataset")
+    mean = total / count
+    variance = np.maximum(total_square / count - np.square(mean), 1e-12)
+    return mean.astype(np.float32).reshape(1, 1, -1), np.sqrt(variance).astype(np.float32).reshape(1, 1, -1)
+
+
+def save_latent_statistics(path, mean, std):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as output:
+        np.savez(output, mean=mean, std=std)
+
+
+class ModulationLoader(Dataset):
+    def __init__(
+        self,
+        data_path,
+        split_file=None,
+        conditioning=None,
+        conditioning_sources=None,
+        records=None,
+        latent_stats_path=None,
+        normalize=True,
+    ):
+        super().__init__()
         self.conditioning_sources = (
             conditioning_sources
             if conditioning_sources is not None
             else build_conditioning_sources(conditioning)
         )
-        self.conditional = len(self.conditioning_sources) > 0
-
-        self.records = (
-            records
-            if records is not None
-            else self.load_records(data_path, split_file)
+        self.records = records or self.build_records(
+            data_path, split_file, self.conditioning_sources
         )
         self.validate_required_conditioning_cache()
-        self.modulations = [
-            torch.from_numpy(np.loadtxt(record["latent_path"])).float()
-            for record in self.records
-        ]
-        #self.modulations = self.modulations[0:8]
-        #pc_paths = pc_paths[0:8]
+        self.normalize = bool(normalize)
 
-        print("data shape, dataset len: ", self.modulations[0].shape, len(self.modulations))
-        #assert args.batch_size <= len(self.modulations)
+        stats_path = Path(latent_stats_path or Path(data_path) / "latent_stats.npz")
+        if stats_path.is_file():
+            with np.load(stats_path) as data:
+                mean, std = data["mean"], data["std"]
+        else:
+            mean, std = compute_latent_statistics(self.records)
+            save_latent_statistics(stats_path, mean, std)
+        self.mean = torch.from_numpy(np.asarray(mean, dtype=np.float32))
+        self.std = torch.from_numpy(np.asarray(std, dtype=np.float32)).clamp_min(1e-6)
+
+        if self.records:
+            with np.load(self.records[0]["latent_path"]) as data:
+                shape = data["posterior_mean"].shape
+            print("COD modulation shape, dataset len:", shape, len(self.records))
 
     def __len__(self):
-        return len(self.modulations)
+        return len(self.records)
 
     def __getitem__(self, index):
-
         record = self.records[index]
+        with np.load(record["latent_path"]) as data:
+            latent = torch.from_numpy(
+                np.asarray(data["posterior_mean"], dtype=np.float32)
+            )
+            logvar = (
+                torch.from_numpy(np.asarray(data["posterior_logvar"], dtype=np.float32))
+                if "posterior_logvar" in data
+                else None
+            )
+        if self.normalize:
+            latent = (latent - self.mean.squeeze(0)) / self.std.squeeze(0)
         conditioning = {
-            source.name: source.load(record)
-            for source in self.conditioning_sources
+            source.name: source.load(record) for source in self.conditioning_sources
         }
-        pc = conditioning.get("point_cloud", False)
-
-        return {
-            "point_cloud" : pc,
+        item = {
+            "latent": latent,
+            "object_id": record["instance_name"],
             "conditioning": conditioning,
-            "latent" : self.modulations[index]         
         }
-
-    def load_records(self, data_source, split, f_name="latent.txt"):
-        return self.build_records(data_source, split, self.conditioning_sources, f_name=f_name)
+        if logvar is not None:
+            item["posterior_logvar"] = logvar
+        return item
 
     @staticmethod
-    def build_records(data_source, split, conditioning_sources=None, f_name="latent.txt"):
+    def build_records(data_source, split, conditioning_sources=None, f_name="modulation.npz"):
         conditioning_sources = conditioning_sources or []
         records = []
-        for dataset in split: # dataset = "acronym"
-            for class_name in split[dataset]:
-                for instance_name in split[dataset][class_name]:
-                    instance_filename = os.path.join(data_source, class_name, instance_name, f_name)
-                    if not os.path.isfile(instance_filename):
+        for dataset, classes in split.items():
+            for class_name, instance_names in classes.items():
+                for instance_name in instance_names:
+                    path = Path(data_source) / class_name / instance_name / f_name
+                    if not path.is_file():
                         continue
-
                     record = {
                         "dataset": dataset,
                         "class_name": class_name,
                         "instance_name": instance_name,
-                        "latent_path": instance_filename,
+                        "latent_path": str(path),
                     }
-                    if not all(source.exists(record) for source in conditioning_sources):
-                        continue
-                    records.append(record)
+                    if all(source.exists(record) for source in conditioning_sources):
+                        records.append(record)
         return records
 
     def validate_required_conditioning_cache(self):
@@ -84,14 +130,11 @@ class ModulationLoader(torch.utils.data.Dataset):
             if not getattr(source, "require_cached", False):
                 continue
             for record in self.records:
-                cache_path = source.resolve_cache_path(record)
-                if not os.path.isfile(cache_path):
-                    missing_paths.append(cache_path)
-
+                path = source.resolve_cache_path(record)
+                if not Path(path).is_file():
+                    missing_paths.append(path)
         if missing_paths:
-            preview = ", ".join(missing_paths[:5])
             raise FileNotFoundError(
-                "Missing cached conditioning features for {} records; first paths: {}. "
-                "Run conditioning preparation before training."
-                .format(len(missing_paths), preview)
+                "Missing cached conditioning features; run conditioning preparation. First paths: "
+                + ", ".join(map(str, missing_paths[:5]))
             )

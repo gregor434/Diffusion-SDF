@@ -8,6 +8,7 @@ outputs/
 runs/
 reports/generated/
 tensorboard_logs/
+tmp/
 config/*/*/code/
 config/*/*/recon/
 config/*/*/modulations/
