@@ -29,8 +29,8 @@
     "sigma_min": 0.002, "sigma_max": 80.0, "rho": 7.0, "sampling_steps": 18
   },
   "diffusion_model_specs": {
-    "latent_tokens": 32, "latent_dimension": 32, "width": 512,
-    "depth": 12, "heads": 8, "mlp_ratio": 4, "dropout": 0.0, "cond": false
+    "latent_tokens": 32, "latent_dimension": 32, "width": 256,
+    "depth": 6, "heads": 4, "mlp_ratio": 2, "dropout": 0.1, "cond": false
   },
   "learning_rates": {"diffusion": 0.00001},
   "weight_decay": 0.0,
