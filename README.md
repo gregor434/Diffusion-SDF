@@ -16,10 +16,10 @@ The representation path is:
       -> signed distances [B,Q]
 
 The official COD plane order, axis projection, bilinear interpolation, and sum
-fusion are unchanged. COD's occupancy head remains instantiated so official
-weights load strictly, but it is never used for SDF prediction. Uncertainty
-pruning defaults to an effective keep ratio of 1 because its published head was
-trained for occupancy.
+fusion are unchanged. COD's occupancy and uncertainty heads remain instantiated
+so official weights load strictly, but the recommended SDF profile does not use
+them. It refines every spatial token and adds the residual planes directly to
+the decoder's initial planes.
 
 ## Installation
 
@@ -83,6 +83,14 @@ split manifests.
 
     python train.py -e config/cod/stage1_frozen_pretrained -b 8 -w 8
 
+Adapt the COD latent and tri-plane decoders from the further-trained
+head-refinement checkpoint while keeping the point encoder and posterior fixed:
+
+    python train.py \
+      -e config/cod/stage1_decoder_finetune \
+      --init_from config/cod/stage1_head_refine/last.ckpt \
+      -b 8 -w 8
+
 For the single-object overfit profile, a virtual training size keeps batches
 full while each repeated access independently resamples surface and SDF query
 points:
@@ -93,13 +101,15 @@ Available stage1_mode values are sdf_head_only, cod_decoder_finetune,
 full_cod_finetune, and train_from_scratch.
 
 learning_rates accepts independent values for point_encoder, variational_block,
-latent_decoder, triplane_decoder, and sdf_network. sdf_loss.type supports l1,
-huber, and truncated_sdf. Loss coefficients are loss_weights.sdf,
-loss_weights.kl, and loss_weights.cod_aux.
+latent_decoder, triplane_decoder, and sdf_network, and rejects entries for
+components frozen by the selected mode. sdf_loss.type supports l1, huber, and
+truncated_sdf. The recommended decoder adaptation uses truncated SDF and
+decoded-token reconstruction losses; its initial-SDF, uncertainty, geometry,
+normal, and KL losses are disabled.
 
 Extract native, unflattened modulations with the existing command:
 
-    python test.py -e config/cod/stage1_frozen_pretrained -r last
+    python test.py -e config/cod/stage1_decoder_finetune -r last
 
 Each modulation.npz stores object_id, posterior_mean [M,D], and
 posterior_logvar [M,D]. Extraction uses the posterior mean and writes
@@ -133,7 +143,7 @@ loss_weights.generated, and loss_weights.kl.
 
 ## Configuration profiles
 
-The seven requested profiles live under config/cod/:
+The primary and ablation profiles live under config/cod/:
 
     stage1_frozen_pretrained
     stage1_decoder_finetune

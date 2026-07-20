@@ -23,10 +23,12 @@ DEFAULT_COD_DECODER = {
     "num_layers": 12,
     "num_init_layers": 1,
     "mlp_ratio": 2,
-    # Occupancy-trained uncertainty pruning is intentionally ineffective.
+    # SDF adaptation refines all spatial tokens by default.
     "keep_ratio": 1.0,
+    # Retained for strict official-checkpoint keys; full_sdf/disabled bypass it.
     "num_merged_tokens": 8,
     "use_conv_refine": False,
+    "uncertainty_mode": "full_sdf",
 }
 
 
@@ -41,7 +43,15 @@ class SdfModel(nn.Module):
 
         encoder_params = {**DEFAULT_COD_ENCODER, **cod_specs.get("encoder_params", {})}
         decoder_params = {**DEFAULT_COD_DECODER, **cod_specs.get("decoder_params", {})}
-        if cod_specs.get("disable_uncertainty_pruning", True):
+        uncertainty_mode = cod_specs.get("uncertainty_mode")
+        if uncertainty_mode is None:
+            uncertainty_mode = (
+                "full_sdf"
+                if cod_specs.get("disable_uncertainty_pruning", True)
+                else "occupancy_pruning"
+            )
+        decoder_params["uncertainty_mode"] = uncertainty_mode
+        if uncertainty_mode in {"full_sdf", "disabled"}:
             decoder_params["keep_ratio"] = 1.0
 
         self.latent_tokens = int(cod_specs.get("latent_tokens", 32))
@@ -112,7 +122,20 @@ class SdfModel(nn.Module):
         query_features = self.feature_adapter(query_features)
         return self.sdf_decoder(torch.cat((query_points, query_features), dim=-1)).squeeze(-1)
 
-    def forward(self, surface_points, query_points, sample_posterior=True):
+    def query_uncertainty(self, uncertainty_planes, query_points):
+        value = self.cod_vae.autoencoder.decoder.decode_uncertainty(
+            uncertainty_planes, query_points.clone()
+        )
+        return value.squeeze(-1)
+
+    def forward(
+        self,
+        surface_points,
+        query_points,
+        sample_posterior=True,
+        return_initial_sdf=False,
+        return_query_uncertainty=False,
+    ):
         latent, posterior, encoded = self.encode_surface(surface_points, sample_posterior)
         decoded = self.decode_latent(latent)
         decoded.update(
@@ -121,6 +144,16 @@ class SdfModel(nn.Module):
             encoded_features=encoded,
             sdf=self.query_sdf(decoded["planes"], query_points),
         )
+        if return_initial_sdf:
+            decoded["initial_sdf"] = self.query_sdf(
+                decoded["initial_planes"], query_points
+            )
+        if return_query_uncertainty:
+            if decoded["uncertainty"] is None:
+                raise ValueError("uncertainty queries are unavailable in disabled mode")
+            decoded["query_uncertainty"] = self.query_uncertainty(
+                decoded["uncertainty"], query_points
+            )
         return decoded
 
     def component_modules(self):
@@ -144,6 +177,11 @@ class SdfModel(nn.Module):
         self.requires_grad_(False)
         for name, module in components.items():
             module.requires_grad_(name in names)
+        decoder = self.cod_vae.autoencoder.decoder
+        if decoder.uncertainty_mode == "disabled":
+            decoder.uncertainty_out.requires_grad_(False)
+            if decoder.merging_module is not None:
+                decoder.merging_module.requires_grad_(False)
         self._frozen_component_names = set(components).difference(names)
 
     def train(self, mode=True):
@@ -152,6 +190,11 @@ class SdfModel(nn.Module):
             for name, module in self.component_modules().items():
                 if name in getattr(self, "_frozen_component_names", set()):
                     module.eval()
+            decoder = self.cod_vae.autoencoder.decoder
+            if decoder.uncertainty_mode == "disabled":
+                decoder.uncertainty_out.eval()
+                if decoder.merging_module is not None:
+                    decoder.merging_module.eval()
         return self
 
     # Compatibility with reconstruction helpers, now operating on tri-planes.

@@ -89,9 +89,24 @@ def train():
     save_code_to_conf(args.exp_dir) 
     
     # pytorch lightning callbacks 
-    callback = ModelCheckpoint(dirpath=args.exp_dir, filename='{epoch}', save_top_k=-1, save_last=True, every_n_epochs=specs["log_freq"])
+    periodic_callback = ModelCheckpoint(
+        dirpath=args.exp_dir,
+        filename='{epoch}',
+        save_top_k=-1,
+        save_last=True,
+        every_n_epochs=specs["log_freq"],
+    )
+    best_callback = ModelCheckpoint(
+        dirpath=args.exp_dir,
+        filename='best',
+        monitor='val/loss',
+        mode='min',
+        save_top_k=1,
+    ) if val_dataloader is not None else None
     lr_monitor = LearningRateMonitor(logging_interval='step')
-    callbacks = [callback, lr_monitor]
+    callbacks = [periodic_callback, lr_monitor]
+    if best_callback is not None:
+        callbacks.append(best_callback)
 
     model = CombinedModel(specs)
 
@@ -129,6 +144,7 @@ def train():
 
     # precision 16 can be unstable (nan loss); recommend using 32
     trainer = pl.Trainer(accelerator='gpu', devices=-1, precision=32, max_epochs=specs["num_epochs"], callbacks=callbacks, log_every_n_steps=log_every_n_steps,
+                        gradient_clip_val=float(specs.get("gradient_clip_val", 0.0)),
                         default_root_dir=os.path.join("tensorboard_logs", args.exp_dir))
     if val_dataloader is not None:
         trainer.fit(model=model, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader, ckpt_path=resume)

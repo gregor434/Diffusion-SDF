@@ -23,6 +23,7 @@ class CompactTriplaneDecoder(nn.Module):
                  keep_ratio: float = 0.5,
                  num_merged_tokens: int = -1,
                  use_conv_refine: bool = False,
+                 uncertainty_mode: str = 'occupancy_pruning',
 
                  ## transformer params
                  num_heads: int = 8,
@@ -40,6 +41,9 @@ class CompactTriplaneDecoder(nn.Module):
         self.plane_resolution = output_resolution // output_patch_size
         self.num_output_patches = 3 * (self.plane_resolution ** 2)
         self.keep_ratio = keep_ratio
+        if uncertainty_mode not in {'occupancy_pruning', 'full_sdf', 'disabled'}:
+            raise ValueError(f'unknown uncertainty mode: {uncertainty_mode}')
+        self.uncertainty_mode = uncertainty_mode
 
         self.init_transformer = CrossTransformerBlock(embed_dim=embed_dim, num_layers=num_init_layers,
                                                       num_heads=num_heads, mlp_ratio=mlp_ratio, dropout=prune_dropout)
@@ -89,12 +93,19 @@ class CompactTriplaneDecoder(nn.Module):
         tokens = self.mask_pos.unsqueeze(0).expand(B, -1, -1)
 
         init_tokens, tokens, uncertainty = self.decode_tokens(tokens, z)
-        patches = self.decoder_out(tokens)
+        residual_patches = self.decoder_out(tokens)
         init_patches = self.init_out(init_tokens)
-        patches = init_patches + uncertainty * patches
+        if self.uncertainty_mode == 'disabled':
+            patches = init_patches + residual_patches
+        else:
+            patches = init_patches + uncertainty * residual_patches
 
         planes = self.patches_to_planes(patches)
-        uncertainty = uncertainty.view(uncertainty.size(0), 3, 1, self.plane_resolution, self.plane_resolution)
+        if uncertainty is not None:
+            uncertainty = uncertainty.view(
+                uncertainty.size(0), 3, 1,
+                self.plane_resolution, self.plane_resolution,
+            )
         init_planes = self.patches_to_planes(init_patches)
 
         if self.conv_refine is not None:
@@ -116,11 +127,33 @@ class CompactTriplaneDecoder(nn.Module):
         return planes
 
     def decode_tokens(self, tokens, z):
-        ## prune decoder
+        ## Shallow prediction.
         init_tokens = self.init_transformer(tokens, z)
+
+        if self.uncertainty_mode == 'disabled':
+            # Keep the pretrained uncertainty and merging modules instantiated
+            # for strict checkpoint compatibility, but do not execute them.
+            tokens = init_tokens
+            if self.mask_token is not None:
+                tokens = tokens + self.mask_token.unsqueeze(0)
+            tokens = self.transformer(torch.cat([tokens, z], dim=1))
+            return init_tokens, tokens[:, :init_tokens.size(1)], None
+
+        ## Learned residual gate.
         uncertainty = self.uncertainty_out(init_tokens)
         uncertainty = self.apply_uncertainty_activation(uncertainty)
 
+        if self.uncertainty_mode == 'full_sdf':
+            # Occupancy-error ranking is not a reliable proxy for SDF surface
+            # quality.  Refine every spatial token while retaining COD's
+            # uncertainty-gated residual and checkpoint-compatible head.
+            tokens = init_tokens
+            if self.mask_token is not None:
+                tokens = tokens + self.mask_token.unsqueeze(0)
+            tokens = self.transformer(torch.cat([tokens, z], dim=1))
+            return init_tokens, tokens[:, :init_tokens.size(1)], uncertainty
+
+        ## Original occupancy uncertainty pruning path.
         L_full = tokens.size(1)
         tokens, indices, prune_indices = self._select_by_uncertainty(init_tokens, uncertainty, self.keep_ratio)
         if self.mask_token is not None:

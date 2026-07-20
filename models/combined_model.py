@@ -35,9 +35,48 @@ STAGE3_COMPONENTS = {
 }
 
 
+def validate_training_specs(specs):
+    """Reject component and uncertainty combinations that silently do nothing."""
+    task = specs.get("training_task")
+    if task == "modulation":
+        mode = specs.get("stage1_mode", "sdf_head_only")
+        active = set(STAGE1_COMPONENTS.get(mode, ()))
+    elif task == "diffusion":
+        active = {"diffusion"}
+    elif task == "combined":
+        mode = specs.get("stage3_mode", "diffusion_only")
+        active = set(STAGE3_COMPONENTS.get(mode, ())) | {"diffusion"}
+    else:
+        return
+    unused_rates = set(specs.get("learning_rates", {})).difference(active)
+    if unused_rates:
+        raise ValueError(
+            "learning rates configured for frozen components: "
+            f"{sorted(unused_rates)}"
+        )
+
+    cod_specs = specs.get("CODVaeSpecs", {})
+    uncertainty_mode = cod_specs.get("uncertainty_mode")
+    if uncertainty_mode is None and cod_specs.get("disable_uncertainty_pruning", True):
+        uncertainty_mode = "full_sdf"
+    if uncertainty_mode not in {
+        None, "full_sdf", "occupancy_pruning", "disabled",
+    }:
+        raise ValueError(f"unknown uncertainty mode: {uncertainty_mode}")
+    uncertainty_weight = float(
+        specs.get("loss_weights", {}).get("uncertainty", 0.0)
+    )
+    if uncertainty_mode == "disabled" and uncertainty_weight > 0:
+        raise ValueError(
+            "uncertainty_mode='disabled' requires a zero uncertainty loss weight"
+        )
+
+
 class CombinedModel(pl.LightningModule):
     def __init__(self, specs):
         super().__init__()
+        validate_training_specs(specs)
+        self.save_hyperparameters({"specs": specs})
         self.specs = specs
         self.task = specs["training_task"]
         if self.task not in {"modulation", "diffusion", "combined"}:
@@ -128,24 +167,130 @@ class CombinedModel(pl.LightningModule):
         decoded = F.layer_norm(decoded, (decoded.shape[-1],))
         return F.mse_loss(decoded, encoded.detach())
 
+    def stage1_geometry_losses(
+        self, planes, batch, *, compute_surface_zero, compute_eikonal,
+        compute_normal,
+    ):
+        """SDF-specific surface constraints evaluated on a small point subset."""
+        count = min(
+            int(self.specs.get("GeometryRegularizationSamples", 512)),
+            batch["surface_points"].shape[1],
+        )
+        difference_step = float(
+            self.specs.get("GeometryFiniteDifferenceStep", 0.01)
+        )
+        surface = batch["surface_points"][:, :count].detach().clone()
+        surface = surface.clamp(-1.0 + difference_step, 0.999 - difference_step)
+        zero = planes.new_zeros(())
+        surface_zero = zero
+        if compute_surface_zero:
+            surface_zero = self.sdf_model.query_sdf(planes, surface).abs().mean()
+
+        gradient = None
+        if compute_eikonal or compute_normal:
+            derivatives = []
+            for axis in range(3):
+                offset = torch.zeros_like(surface)
+                offset[..., axis] = difference_step
+                positive = self.sdf_model.query_sdf(planes, surface + offset)
+                negative = self.sdf_model.query_sdf(planes, surface - offset)
+                derivatives.append(
+                    (positive - negative) / (2.0 * difference_step)
+                )
+            gradient = torch.stack(derivatives, dim=-1)
+
+        eikonal = zero
+        if compute_eikonal:
+            eikonal = (gradient.norm(dim=-1) - 1.0).square().mean()
+        normal = zero
+        if compute_normal and batch.get("surface_normals") is not None:
+            target_normals = batch["surface_normals"][:, :count].to(gradient)
+            cosine = F.cosine_similarity(gradient, target_normals, dim=-1)
+            normal = (1.0 - cosine.abs()).mean()
+        return surface_zero, eikonal, normal
+
     def stage1_losses(self, batch):
+        weights = self.specs.get("loss_weights", {})
+        needs_initial_sdf = float(weights.get("sdf_initial", 0.0)) > 0
+        needs_uncertainty = float(weights.get("uncertainty", 0.0)) > 0
         output = self.sdf_model(
             batch["surface_points"],
             batch["query_points"],
             sample_posterior=bool(self.specs.get("sample_posterior", True)),
+            return_initial_sdf=needs_initial_sdf or needs_uncertainty,
+            return_query_uncertainty=needs_uncertainty,
         )
         sdf = self.sdf_reconstruction_loss(output["sdf"], batch["query_sdf"])
-        kl = self.kl_loss(output["posterior"]).to(sdf.device)
-        aux = self.cod_auxiliary_loss(
-            output["encoded_features"], output["decoded_latent"]
-        )
-        weights = self.specs.get("loss_weights", {})
+        initial_sdf = sdf.new_zeros(())
+        uncertainty = sdf.new_zeros(())
+        if needs_initial_sdf:
+            initial_sdf = self.sdf_reconstruction_loss(
+                output["initial_sdf"], batch["query_sdf"]
+            )
+        if needs_uncertainty:
+            uncertainty_scale = float(
+                self.specs.get("uncertainty_target_scale", 0.1)
+            )
+            uncertainty_target = (
+                (output["initial_sdf"] - batch["query_sdf"]).abs()
+                / uncertainty_scale
+            ).clamp(0.0, 1.0).detach()
+            uncertainty = F.mse_loss(
+                output["query_uncertainty"], uncertainty_target
+            )
+        kl = sdf.new_zeros(())
+        if float(weights.get("kl", self.specs.get("kld_weight", 0.0))) > 0:
+            kl = self.kl_loss(output["posterior"]).to(sdf.device)
+        aux = sdf.new_zeros(())
+        if float(weights.get("cod_aux", 0.0)) > 0:
+            aux = self.cod_auxiliary_loss(
+                output["encoded_features"], output["decoded_latent"]
+            )
+        surface_zero = sdf.new_zeros(())
+        eikonal = sdf.new_zeros(())
+        normal = sdf.new_zeros(())
+        geometry_enabled = {
+            name: float(weights.get(name, 0.0)) > 0
+            for name in ("surface_zero", "eikonal", "normal")
+        }
+        needs_geometry = any(geometry_enabled.values())
+        if self.training and torch.is_grad_enabled() and needs_geometry:
+            surface_zero, eikonal, normal = self.stage1_geometry_losses(
+                output["planes"], batch,
+                compute_surface_zero=geometry_enabled["surface_zero"],
+                compute_eikonal=geometry_enabled["eikonal"],
+                compute_normal=geometry_enabled["normal"],
+            )
         total = (
             float(weights.get("sdf", 1.0)) * sdf
+            + float(weights.get("sdf_initial", 0.0)) * initial_sdf
+            + float(weights.get("uncertainty", 0.0)) * uncertainty
             + float(weights.get("kl", self.specs.get("kld_weight", 0.0))) * kl
             + float(weights.get("cod_aux", 0.0)) * aux
+            + float(weights.get("surface_zero", 0.0)) * surface_zero
+            + float(weights.get("eikonal", 0.0)) * eikonal
+            + float(weights.get("normal", 0.0)) * normal
         )
-        return {"loss": total, "sdf": sdf, "kl": kl, "cod_aux": aux}
+        posterior = output["posterior"]
+        posterior_std = posterior.std.detach().mean() if posterior is not None else sdf.new_zeros(())
+        active_dimensions = (
+            (posterior.mean.detach().std(dim=(0, 1)) > 0.01).float().sum()
+            if posterior is not None
+            else sdf.new_zeros(())
+        )
+        return {
+            "loss": total,
+            "sdf": sdf,
+            "sdf_initial": initial_sdf,
+            "uncertainty": uncertainty,
+            "surface_zero": surface_zero,
+            "eikonal": eikonal,
+            "normal": normal,
+            "kl": kl,
+            "cod_aux": aux,
+            "posterior_std": posterior_std,
+            "active_dimensions": active_dimensions,
+        }
 
     def stage2_losses(self, batch):
         loss, clean_estimate, _, _ = self.diffusion_model.training_loss(
@@ -210,6 +355,16 @@ class CombinedModel(pl.LightningModule):
             if name != "clean_latent":
                 self.log(f"val/{name}", value, on_step=False, on_epoch=True)
         return losses["loss"]
+
+    def on_after_backward(self):
+        squared_norm = None
+        for parameter in self.parameters():
+            if parameter.grad is None:
+                continue
+            value = parameter.grad.detach().float().square().sum()
+            squared_norm = value if squared_norm is None else squared_norm + value
+        if squared_norm is not None:
+            self.log("train/gradient_norm", squared_norm.sqrt(), on_step=True)
 
     def configure_optimizers(self):
         rates = self.specs.get("learning_rates", {})

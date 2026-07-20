@@ -16,7 +16,7 @@
     "embed_dimension": 512,
     "triplane_dimension": 32,
     "latent_decoder_layers": 12,
-    "disable_uncertainty_pruning": false,
+    "uncertainty_mode": "occupancy_pruning",
     "encoder_params": {
       "num_patches": 512,
       "num_blocks": 4,
