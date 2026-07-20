@@ -98,7 +98,10 @@ def train():
     # note on loading from checkpoint:
     # if resuming from training modulation, diffusion, or end-to-end, just load saved checkpoint 
     # however, if fine-tuning end-to-end after training modulation and diffusion separately, will need to load sdf and diffusion checkpoints separately
-    if args.resume == 'finetune':
+    if args.init_from is not None:
+        load_weights_only(model, args.init_from)
+        resume = None
+    elif args.resume == 'finetune':
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             modulation = torch.load(specs["modulation_ckpt_path"], map_location="cpu")
@@ -131,6 +134,17 @@ def train():
         trainer.fit(model=model, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader, ckpt_path=resume)
     else:
         trainer.fit(model=model, train_dataloaders=train_dataloader, ckpt_path=resume)
+
+
+def load_weights_only(model, checkpoint_path):
+    """Load model parameters without restoring trainer or optimizer state."""
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint:
+        raise ValueError(
+            f"weights-only initialization requires a Lightning checkpoint "
+            f"with a state_dict: {checkpoint_path}"
+        )
+    model.load_state_dict(checkpoint["state_dict"], strict=True)
 
 
 def build_dataloader(dataset, drop_last, shuffle, use_spawn_workers=False):
@@ -211,9 +225,18 @@ if __name__ == "__main__":
         "--exp_dir", "-e", required=True,
         help="This directory should include experiment specifications in 'specs.json,' and logging will be done in this directory as well.",
     )
-    arg_parser.add_argument(
+    checkpoint_group = arg_parser.add_mutually_exclusive_group()
+    checkpoint_group.add_argument(
         "--resume", "-r", default=None,
         help="continue from previous saved logs, integer value, 'last', or 'finetune'",
+    )
+    checkpoint_group.add_argument(
+        "--init_from",
+        default=None,
+        help=(
+            "initialize model weights from a Lightning checkpoint while "
+            "starting a fresh optimizer, learning rate, epoch, and global step"
+        ),
     )
 
     arg_parser.add_argument("--batch_size", "-b", default=32, type=int)
