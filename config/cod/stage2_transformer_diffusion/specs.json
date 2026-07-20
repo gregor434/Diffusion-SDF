@@ -3,9 +3,9 @@
   "TrainSplit": "datasets/splits/abo_CHAIR_train.json",
   "ValSplit": "datasets/splits/abo_CHAIR_val.json",
   "TestSplit": "datasets/splits/abo_CHAIR_val.json",
-  "data_path": "config/cod/stage1_frozen_pretrained/modulations",
-  "latent_stats_path": "config/cod/stage1_frozen_pretrained/modulations/latent_stats.npz",
-  "modulation_ckpt_path": "config/cod/stage1_frozen_pretrained/last.ckpt",
+  "data_path": "config/cod/stage1_head_refine/modulations",
+  "latent_stats_path": "config/cod/stage1_head_refine/modulations/latent_stats.npz",
+  "modulation_ckpt_path": "config/cod/stage1_head_refine/last.ckpt",
   "training_task": "diffusion",
   "CODVaeSpecs": {
     "checkpoint_path": "tmp/cod_vae_m32_weights.pt",
@@ -15,11 +15,11 @@
     "embed_dimension": 512,
     "triplane_dimension": 32,
     "latent_decoder_layers": 12,
-    "disable_uncertainty_pruning": true,
+    "disable_uncertainty_pruning": false,
     "encoder_params": {"num_patches": 512, "num_blocks": 4, "num_layers_per_block": 3},
     "decoder_params": {
       "output_resolution": 128, "output_patch_size": 8, "num_layers": 12,
-      "num_init_layers": 1, "mlp_ratio": 2, "keep_ratio": 1.0,
+      "num_init_layers": 1, "mlp_ratio": 2, "keep_ratio": 0.25,
       "num_merged_tokens": 8, "use_conv_refine": false
     }
   },
@@ -35,5 +35,5 @@
   "learning_rates": {"diffusion": 0.00001},
   "weight_decay": 0.0,
   "num_epochs": 1000,
-  "log_freq": 25
+  "log_freq": 250
 }
