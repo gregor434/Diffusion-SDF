@@ -39,13 +39,53 @@ and set CODVaeSpecs.checkpoint_path. The matching latent_tokens value must be
 
 ## Data preprocessing
 
+Download the complete filtered ABO chair set and its main catalog images:
+
+    python scripts/download_abo_chairs.py \
+      --target-root datasets/ABO/models_chair_full \
+      --metadata-out datasets/ABO/abo_chairs_full.json \
+      --skip-existing \
+      --max-workers 16
+
+    python datasets/ABO/scripts/download_abo_images.py \
+      --subset-json datasets/ABO/abo_chairs_full.json \
+      --models-dir datasets/ABO/models_chair_full \
+      --target-root datasets/ABO/images_filtered \
+      --main-image-only \
+      --skip-existing \
+      --max-workers 16
+
+Preprocess the full chair set under a separate split prefix. This writes
+`abo_fullchairs_CHAIR_{all,train,val}.json` and leaves the original
+`abo_CHAIR_{all,train,val}.json` manifests unchanged:
+
+    MALLOC_ARENA_MAX=2 OMP_NUM_THREADS=1 python scripts/prepare_abo_dataset.py \
+      --source-dir datasets/ABO/models_chair_full \
+      --metadata-in datasets/ABO/abo_chairs_full.json \
+      --metadata-out datasets/abo/fullchairs_preprocessing_metadata.json \
+      --split-prefix abo_fullchairs \
+      --per-type-splits-only \
+      --skip-existing \
+      --batch-size 50000 \
+      --continue-on-error \
+      --repair-method manifoldplus \
+      --manifoldplus-bin tmp/ManifoldPlus/build/manifold \
+      --repaired-mesh-dir datasets/repaired_meshes_cod_0999 \
+      --manifoldplus-depth 8 \
+      --repair-fidelity-samples 20000 \
+      --repair-fidelity-max-p95 0.02 \
+      --repair-fidelity-distance-threshold 0.02 \
+      --repair-fidelity-max-outlier-fraction 0.05
+
 ABO preprocessing writes one record per object:
 
     datasets/<dataset>/<class>/<object>/cod_sdf.npz
 
-Each record contains surface_points, surface_normals,
+Each accepted record contains surface_points, surface_normals,
 near_surface_query_points, near_surface_sdf, uniform_query_points, uniform_sdf,
-normalization_center, and normalization_scale.
+normalization_center, normalization_scale, repaired-surface provenance, and
+repair-fidelity measurements. With ManifoldPlus enabled, all surface samples,
+normals, query points, and SDF targets come from the repaired watertight mesh.
 
 All coordinates use one isotropic transform:
 
@@ -73,9 +113,18 @@ For non-watertight ABO meshes, the existing ManifoldPlus path remains:
 COD-normalized repaired proxies are cached separately under
 datasets/repaired_meshes_cod_0999. Do not reuse datasets/repaired_meshes: that
 legacy cache was generated after diagonal normalization and is in a different
-coordinate system. The proxies are used for SDF signing; COD surface samples
-still come from the normalized source mesh. SurfacePointCount, SampPerMesh, and
-NearSurfaceRatio remain JSON spec fields. Preprocessing metadata is written to
+coordinate system. A bidirectional sampled-surface comparison rejects repaired
+meshes that differ too much from the normalized source mesh. Rejected objects
+are recorded in preprocessing metadata and omitted before train/validation
+splits are created; rejection is not treated as a processing crash. Per-proxy
+fidelity sidecars make interrupted runs resumable.
+
+`--skip-existing` only reuses records whose `surface_source` is
+`repaired_mesh` and whose stored fidelity passes the current thresholds. Legacy
+records whose COD points came from the original mesh are regenerated. The
+dataloader contains no repair policy: it reads only IDs admitted to the emitted
+manifests. SurfacePointCount, SampPerMesh, and NearSurfaceRatio remain JSON spec
+fields. Preprocessing metadata is written to
 datasets/abo/preprocessing_metadata.json; datasets/splits remains reserved for
 split manifests.
 

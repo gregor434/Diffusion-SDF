@@ -97,6 +97,8 @@ class ModulationLoader(Dataset):
         }
         item = {
             "latent": latent,
+            "dataset": record["dataset"],
+            "class_name": record["class_name"],
             "object_id": record["instance_name"],
             "conditioning": conditioning,
         }

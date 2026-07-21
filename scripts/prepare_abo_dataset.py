@@ -12,11 +12,15 @@ This generalizes the chair-specific ABO preparation flow:
 
 import argparse
 import gc
+import hashlib
 import json
+import multiprocessing
 import os
 import shutil
 import subprocess
 import tempfile
+import traceback
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -56,6 +60,14 @@ class RepairResult:
     used_cache: bool
 
 
+@dataclass(frozen=True)
+class RepairFidelityConfig:
+    sample_count: int = 20000
+    distance_threshold: float = 0.02
+    max_p95_distance: float = 0.02
+    max_outlier_fraction: float = 0.05
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-dir", type=Path, default=DEFAULT_SOURCE_DIR)
@@ -91,7 +103,12 @@ def parse_args() -> argparse.Namespace:
         default=262144,
         help="Number of uniformly sampled SDF supervision points in [-1, 1]^3.",
     )
-    parser.add_argument("--batch-size", type=int, default=200000)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=50000,
+        help="Maximum raycast query batch; lower values reduce peak native memory.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--repair-method",
@@ -130,6 +147,30 @@ def parse_args() -> argparse.Namespace:
         help="Regenerate repaired proxy meshes even when cached outputs exist.",
     )
     parser.add_argument(
+        "--repair-fidelity-samples",
+        type=int,
+        default=20000,
+        help="Surface samples in each direction used to compare repaired and original meshes.",
+    )
+    parser.add_argument(
+        "--repair-fidelity-distance-threshold",
+        type=float,
+        default=0.02,
+        help="Normalized surface distance counted as a repair-fidelity outlier.",
+    )
+    parser.add_argument(
+        "--repair-fidelity-max-p95",
+        type=float,
+        default=0.02,
+        help="Maximum allowed p95 surface distance in either comparison direction.",
+    )
+    parser.add_argument(
+        "--repair-fidelity-max-outlier-fraction",
+        type=float,
+        default=0.05,
+        help="Maximum fraction above the fidelity distance threshold in either direction.",
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -150,6 +191,24 @@ def parse_args() -> argparse.Namespace:
         "--manifest-only",
         action="store_true",
         help="Only write splits and metadata; do not generate COD/SDF records.",
+    )
+    parser.add_argument(
+        "--per-type-splits-only",
+        action="store_true",
+        help="Write per-product-type manifests without duplicate aggregate manifests.",
+    )
+    parser.add_argument(
+        "--no-model-isolation",
+        action="store_true",
+        help=(
+            "Process all models in the parent process. By default every model "
+            "uses a fresh child process so native memory is returned to the OS."
+        ),
+    )
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Finish other models, record failures in metadata, then exit nonzero.",
     )
     return parser.parse_args()
 
@@ -195,6 +254,22 @@ def validate_repair_config(config: RepairConfig) -> None:
         raise ValueError("--manifoldplus-depth must be positive")
     if config.repaired_mesh_dir is None:
         raise ValueError("repaired mesh directory is required for ManifoldPlus repair")
+
+
+def build_repair_fidelity_config(args: argparse.Namespace) -> RepairFidelityConfig:
+    config = RepairFidelityConfig(
+        sample_count=args.repair_fidelity_samples,
+        distance_threshold=args.repair_fidelity_distance_threshold,
+        max_p95_distance=args.repair_fidelity_max_p95,
+        max_outlier_fraction=args.repair_fidelity_max_outlier_fraction,
+    )
+    if config.sample_count <= 0:
+        raise ValueError("--repair-fidelity-samples must be positive")
+    if config.distance_threshold <= 0 or config.max_p95_distance <= 0:
+        raise ValueError("repair fidelity distance thresholds must be positive")
+    if not 0.0 <= config.max_outlier_fraction <= 1.0:
+        raise ValueError("--repair-fidelity-max-outlier-fraction must be in [0, 1]")
+    return config
 
 
 def list_model_ids(source_dir: Path) -> list[str]:
@@ -250,8 +325,11 @@ def load_mesh(mesh_path: Path) -> trimesh.Trimesh:
 
 def normalize_mesh_with_transform(
     mesh: trimesh.Trimesh,
+    *,
+    copy: bool = True,
 ) -> tuple[trimesh.Trimesh, np.ndarray, float]:
-    mesh = mesh.copy()
+    if copy:
+        mesh = mesh.copy()
     bounds = mesh.bounds.astype(np.float32)
     center = bounds.mean(axis=0)
     radius = float(np.abs(np.asarray(mesh.vertices) - center).max())
@@ -301,9 +379,20 @@ def repair_mesh_with_manifoldplus(
         raise ValueError("ManifoldPlus executable is required")
 
     if output_path.is_file() and not config.force_repair:
-        return RepairResult(mesh=load_repaired_mesh(output_path), used_cache=True)
+        try:
+            return RepairResult(
+                mesh=load_repaired_mesh(output_path), used_cache=True
+            )
+        except Exception as error:
+            warnings.warn(
+                f"discarding invalid repaired-mesh cache {output_path}: {error}"
+            )
+            output_path.unlink()
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_output = output_path.with_name(
+        f".{output_path.stem}.tmp.{os.getpid()}{output_path.suffix}"
+    )
     with tempfile.TemporaryDirectory() as tmpdir:
         input_path = Path(tmpdir) / "input.obj"
         mesh.export(input_path)
@@ -312,18 +401,24 @@ def repair_mesh_with_manifoldplus(
             "--input",
             str(input_path),
             "--output",
-            str(output_path),
+            str(temporary_output),
             "--depth",
             str(config.manifoldplus_depth),
         ]
         result = subprocess.run(command, capture_output=True, text=True)
         if result.returncode != 0:
+            temporary_output.unlink(missing_ok=True)
             raise RuntimeError(
                 "ManifoldPlus repair failed for "
                 f"{output_path}: {result.stderr.strip() or result.stdout.strip()}"
             )
 
-    return RepairResult(mesh=load_repaired_mesh(output_path), used_cache=False)
+    try:
+        repaired_mesh = load_repaired_mesh(temporary_output)
+        temporary_output.replace(output_path)
+    finally:
+        temporary_output.unlink(missing_ok=True)
+    return RepairResult(mesh=repaired_mesh, used_cache=False)
 
 
 def sample_surface(
@@ -339,7 +434,9 @@ def sample_surface(
     if not np.isfinite(areas).all() or areas.sum() <= 0:
         raise ValueError("mesh has no sampleable surface area")
     face_indices = rng.choice(len(mesh.faces), size=count, p=areas / areas.sum())
-    triangles = np.asarray(mesh.triangles[face_indices], dtype=np.float32)
+    triangles = np.asarray(
+        mesh.vertices[mesh.faces[face_indices]], dtype=np.float32
+    )
     barycentric = rng.random((count, 2), dtype=np.float32)
     reflected = barycentric.sum(axis=1) > 1.0
     barycentric[reflected] = 1.0 - barycentric[reflected]
@@ -383,6 +480,80 @@ def compute_signed_distances(
             del out, closest_points, normals, delta, unsigned, sign
         del batch, tensor
     return sdf
+
+
+def compute_unsigned_distances(
+    scene: o3d.t.geometry.RaycastingScene,
+    query_points: np.ndarray,
+    batch_size: int,
+) -> np.ndarray:
+    if batch_size <= 0:
+        raise ValueError("batch size must be positive")
+    distances = np.empty(len(query_points), dtype=np.float32)
+    for start in range(0, len(query_points), batch_size):
+        stop = min(start + batch_size, len(query_points))
+        tensor = o3d.core.Tensor(query_points[start:stop])
+        distances[start:stop] = scene.compute_distance(tensor).numpy()
+        del tensor
+    return distances
+
+
+def repaired_mesh_fidelity(
+    original_mesh: trimesh.Trimesh,
+    repaired_mesh: trimesh.Trimesh,
+    original_scene: o3d.t.geometry.RaycastingScene,
+    repaired_scene: o3d.t.geometry.RaycastingScene,
+    config: RepairFidelityConfig,
+    batch_size: int,
+    rng: np.random.Generator,
+) -> dict[str, Any]:
+    original_points = sample_surface(original_mesh, config.sample_count, rng)
+    repaired_points = sample_surface(repaired_mesh, config.sample_count, rng)
+    original_to_repaired = compute_unsigned_distances(
+        repaired_scene, original_points, batch_size
+    )
+    repaired_to_original = compute_unsigned_distances(
+        original_scene, repaired_points, batch_size
+    )
+
+    def summarize(distances: np.ndarray) -> dict[str, float]:
+        return {
+            "mean": float(distances.mean()),
+            "p95": float(np.quantile(distances, 0.95)),
+            "p99": float(np.quantile(distances, 0.99)),
+            "max": float(distances.max()),
+            "outlier_fraction": float(
+                np.mean(distances > config.distance_threshold)
+            ),
+        }
+
+    original_summary = summarize(original_to_repaired)
+    repaired_summary = summarize(repaired_to_original)
+    accepted = all(
+        summary["p95"] <= config.max_p95_distance
+        and summary["outlier_fraction"] <= config.max_outlier_fraction
+        for summary in (original_summary, repaired_summary)
+    )
+    return {
+        "accepted": accepted,
+        "sample_count": config.sample_count,
+        "distance_threshold": config.distance_threshold,
+        "max_p95_distance": config.max_p95_distance,
+        "max_outlier_fraction": config.max_outlier_fraction,
+        "original_to_repaired": original_summary,
+        "repaired_to_original": repaired_summary,
+    }
+
+
+def repair_fidelity_passes(
+    fidelity: dict[str, Any], config: RepairFidelityConfig
+) -> bool:
+    return all(
+        float(fidelity[direction]["p95"]) <= config.max_p95_distance
+        and float(fidelity[direction]["outlier_fraction"])
+        <= config.max_outlier_fraction
+        for direction in ("original_to_repaired", "repaired_to_original")
+    )
 
 
 def sample_cod_supervision(
@@ -441,6 +612,47 @@ def save_cod_sdf(path: Path, arrays: dict[str, np.ndarray]) -> None:
     temporary_path.replace(path)
 
 
+def fidelity_arrays(fidelity: dict[str, Any]) -> dict[str, np.ndarray]:
+    arrays: dict[str, np.ndarray] = {
+        "repair_fidelity_accepted": np.asarray(
+            fidelity["accepted"], dtype=np.bool_
+        ),
+    }
+    for direction in ("original_to_repaired", "repaired_to_original"):
+        for statistic in ("mean", "p95", "p99", "max", "outlier_fraction"):
+            arrays[f"repair_{direction}_{statistic}"] = np.asarray(
+                fidelity[direction][statistic], dtype=np.float32
+            )
+    return arrays
+
+
+def read_repaired_record_fidelity(
+    path: Path,
+) -> tuple[str | None, dict[str, Any] | None]:
+    try:
+        with np.load(path) as data:
+            if "surface_source" not in data:
+                return None, None
+            source = str(np.asarray(data["surface_source"]).item())
+            fidelity: dict[str, Any] = {}
+            for direction in ("original_to_repaired", "repaired_to_original"):
+                values = {}
+                for statistic in (
+                    "mean", "p95", "p99", "max", "outlier_fraction"
+                ):
+                    key = f"repair_{direction}_{statistic}"
+                    if key not in data:
+                        return source, None
+                    values[statistic] = float(np.asarray(data[key]).item())
+                fidelity[direction] = values
+            fidelity["accepted"] = bool(
+                np.asarray(data["repair_fidelity_accepted"]).item()
+            )
+            return source, fidelity
+    except (OSError, ValueError, KeyError):
+        return None, None
+
+
 def object_output_paths(
     datasets_root: Path,
     dataset_key: str,
@@ -459,13 +671,33 @@ def repaired_mesh_output_path(
     return repaired_mesh_dir / dataset_key / class_name / f"{model_id}.obj"
 
 
+def repair_fidelity_output_path(repaired_mesh_path: Path) -> Path:
+    return repaired_mesh_path.with_suffix(repaired_mesh_path.suffix + ".fidelity.json")
+
+
+def save_repair_fidelity(path: Path, fidelity: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    temporary_path.write_text(
+        json.dumps(fidelity, indent=2) + "\n", encoding="utf-8"
+    )
+    temporary_path.replace(path)
+
+
+def load_repair_fidelity(path: Path) -> dict[str, Any] | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+
+
 def mesh_summary(mesh: trimesh.Trimesh) -> dict[str, Any]:
     return {
         "vertices": int(len(mesh.vertices)),
         "faces": int(len(mesh.faces)),
         "watertight": bool(mesh.is_watertight),
         "winding_consistent": bool(mesh.is_winding_consistent),
-        "components": int(len(mesh.split(only_watertight=False))),
+        "components": int(mesh.body_count),
     }
 
 
@@ -481,7 +713,9 @@ def process_model(
     rng: np.random.Generator,
     skip_existing: bool,
     repair_config: RepairConfig | None = None,
-) -> tuple[Path, dict[str, Any]]:
+    use_repaired_surface: bool = False,
+    fidelity_config: RepairFidelityConfig | None = None,
+) -> tuple[Path | None, dict[str, Any]]:
     def log_phase(message: str) -> None:
         print(f"  phase: {message}")
 
@@ -501,28 +735,83 @@ def process_model(
                     "existing COD/SDF record has no matching repaired proxy: "
                     f"{proxy_path}"
                 )
-            repair_info.update(
-                {
-                    "method": REPAIR_MANIFOLDPLUS,
-                    "sdf_sign_method": "occupancy",
-                    "manifoldplus_depth": repair_config.manifoldplus_depth,
-                    "repaired_mesh_path": str(proxy_path),
-                    "cache_hit": True,
-                }
-            )
-        return output_path, repair_info
+            if use_repaired_surface:
+                source, fidelity = read_repaired_record_fidelity(output_path)
+                cached_fidelity = load_repair_fidelity(
+                    repair_fidelity_output_path(proxy_path)
+                )
+                if fidelity is None:
+                    fidelity = cached_fidelity
+                if (
+                    source != "repaired_mesh"
+                    and fidelity is not None
+                    and fidelity_config is not None
+                    and not repair_fidelity_passes(fidelity, fidelity_config)
+                ):
+                    repair_info.update(
+                        {
+                            "method": REPAIR_MANIFOLDPLUS,
+                            "surface_source": "repaired_mesh",
+                            "sdf_sign_method": "occupancy",
+                            "manifoldplus_depth": repair_config.manifoldplus_depth,
+                            "repaired_mesh_path": str(proxy_path),
+                            "cache_hit": True,
+                            "fidelity": fidelity,
+                        }
+                    )
+                    return None, repair_info
+                if (
+                    source != "repaired_mesh"
+                    or fidelity is None
+                    or fidelity_config is None
+                    or not repair_fidelity_passes(fidelity, fidelity_config)
+                ):
+                    print(
+                        "  existing record uses legacy or rejected surface "
+                        "supervision; regenerating"
+                    )
+                else:
+                    load_repaired_mesh(proxy_path)
+                    repair_info.update(
+                        {
+                            "method": REPAIR_MANIFOLDPLUS,
+                            "surface_source": source,
+                            "sdf_sign_method": "occupancy",
+                            "manifoldplus_depth": repair_config.manifoldplus_depth,
+                            "repaired_mesh_path": str(proxy_path),
+                            "cache_hit": True,
+                            "fidelity": fidelity,
+                        }
+                    )
+                    return output_path, repair_info
+            else:
+                repair_info.update(
+                    {
+                        "method": REPAIR_MANIFOLDPLUS,
+                        "surface_source": "original_mesh",
+                        "sdf_sign_method": "occupancy",
+                        "manifoldplus_depth": repair_config.manifoldplus_depth,
+                        "repaired_mesh_path": str(proxy_path),
+                        "cache_hit": True,
+                    }
+                )
+                return output_path, repair_info
+        else:
+            return output_path, repair_info
 
     log_phase("mesh load/normalize")
     mesh, normalization_center, normalization_scale = normalize_mesh_with_transform(
-        load_mesh(mesh_path)
+        load_mesh(mesh_path), copy=False
     )
     sdf_mesh = mesh
     sign_method = "normal"
     repair_info: dict[str, Any] = {
         "method": REPAIR_NONE,
+        "surface_source": "original_mesh",
         "sdf_sign_method": sign_method,
         "original_mesh": mesh_summary(mesh),
     }
+    scene = None
 
     if repair_config is not None and repair_config.method == REPAIR_MANIFOLDPLUS:
         if repair_config.repaired_mesh_dir is None:
@@ -540,20 +829,48 @@ def process_model(
             "manifoldplus_depth": repair_config.manifoldplus_depth,
             "repaired_mesh_path": str(proxy_path),
             "cache_hit": repair_result.used_cache,
+            "surface_source": (
+                "repaired_mesh" if use_repaired_surface else "original_mesh"
+            ),
             "original_mesh": mesh_summary(mesh),
             "repaired_mesh": mesh_summary(sdf_mesh),
         }
+        if fidelity_config is not None:
+            log_phase("repaired-mesh fidelity validation")
+            original_scene = make_raycast_scene(mesh)
+            scene = make_raycast_scene(sdf_mesh)
+            fidelity = repaired_mesh_fidelity(
+                original_mesh=mesh,
+                repaired_mesh=sdf_mesh,
+                original_scene=original_scene,
+                repaired_scene=scene,
+                config=fidelity_config,
+                batch_size=batch_size,
+                rng=rng,
+            )
+            del original_scene
+            repair_info["fidelity"] = fidelity
+            save_repair_fidelity(
+                repair_fidelity_output_path(proxy_path), fidelity
+            )
+            if not fidelity["accepted"]:
+                print(
+                    "  filter: rejected repaired mesh "
+                    f"(original->repaired p95={fidelity['original_to_repaired']['p95']:.6f}, "
+                    f"repaired->original p95={fidelity['repaired_to_original']['p95']:.6f})"
+                )
+                return None, repair_info
     else:
         log_phase("manifold repair skipped")
 
     log_phase("raycast scene creation")
-    scene = make_raycast_scene(sdf_mesh)
-    if sdf_mesh is not mesh:
-        del sdf_mesh
+    if scene is None:
+        scene = make_raycast_scene(sdf_mesh)
+    sampling_mesh = sdf_mesh if use_repaired_surface else mesh
 
     log_phase("COD surface and SDF supervision sampling")
     arrays = sample_cod_supervision(
-        mesh=mesh,
+        mesh=sampling_mesh,
         scene=scene,
         surface_point_count=surface_point_count,
         near_surface_stds=near_surface_stds,
@@ -564,12 +881,68 @@ def process_model(
     )
     arrays["normalization_center"] = normalization_center
     arrays["normalization_scale"] = np.asarray(normalization_scale, dtype=np.float32)
+    arrays["surface_source"] = np.asarray(
+        "repaired_mesh" if use_repaired_surface else "original_mesh"
+    )
+    if "fidelity" in repair_info:
+        arrays.update(fidelity_arrays(repair_info["fidelity"]))
+    if sdf_mesh is not mesh:
+        del sdf_mesh
     del mesh
     del scene
 
     log_phase("COD/SDF NPZ write")
     save_cod_sdf(output_path, arrays)
     return output_path, repair_info
+
+
+def model_seed(seed: int, model_id: str) -> int:
+    digest = hashlib.sha256(f"{seed}:{model_id}".encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "little", signed=False)
+
+
+def _isolated_model_worker(connection, kwargs: dict[str, Any]) -> None:
+    try:
+        seed = kwargs.pop("seed")
+        data_path, repair_info = process_model(
+            **kwargs, rng=np.random.default_rng(seed)
+        )
+        connection.send({
+            "ok": True,
+            "data_path": str(data_path) if data_path is not None else None,
+            "repair_info": repair_info,
+        })
+    except BaseException:
+        connection.send({"ok": False, "traceback": traceback.format_exc()})
+    finally:
+        connection.close()
+
+
+def process_model_isolated(**kwargs) -> tuple[Path | None, dict[str, Any]]:
+    context = multiprocessing.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_isolated_model_worker,
+        args=(sender, kwargs),
+    )
+    process.start()
+    sender.close()
+    process.join()
+
+    result = receiver.recv() if receiver.poll() else None
+    receiver.close()
+    if process.exitcode != 0:
+        model_id = Path(kwargs["mesh_path"]).stem
+        raise RuntimeError(
+            f"isolated worker for {model_id} exited with code {process.exitcode}; "
+            "the OS may have killed it for exceeding memory"
+        )
+    if result is None:
+        raise RuntimeError("isolated preprocessing worker returned no result")
+    if not result["ok"]:
+        raise RuntimeError(result["traceback"])
+    data_path = result["data_path"]
+    return (Path(data_path) if data_path is not None else None), result["repair_info"]
 
 
 def load_input_metadata(metadata_path: Path | None) -> dict[str, Any]:
@@ -688,14 +1061,16 @@ def write_split_manifests(
     class_name: str,
     all_splits: dict[str, list[str]],
     per_type_splits: dict[str, dict[str, list[str]]],
+    write_aggregate: bool = True,
 ) -> dict[str, Any]:
     split_paths: dict[str, Any] = {"all": {}, "by_product_type": {}}
 
-    for split_name, split_ids in all_splits.items():
-        manifest_path = splits_dir / f"{split_prefix}_all_{split_name}.json"
-        write_manifest(manifest_path, dataset_key, class_name, split_ids)
-        split_paths["all"][split_name] = str(manifest_path)
-        print(f"wrote split: {manifest_path}")
+    if write_aggregate:
+        for split_name, split_ids in all_splits.items():
+            manifest_path = splits_dir / f"{split_prefix}_all_{split_name}.json"
+            write_manifest(manifest_path, dataset_key, class_name, split_ids)
+            split_paths["all"][split_name] = str(manifest_path)
+            print(f"wrote split: {manifest_path}")
 
     for product_type_key, type_splits in sorted(per_type_splits.items()):
         split_paths["by_product_type"][product_type_key] = {}
@@ -716,6 +1091,10 @@ def main() -> None:
     args = parse_args()
     rng = np.random.default_rng(args.seed)
     repair_config = build_repair_config(args)
+    use_repaired_surface = repair_config.method == REPAIR_MANIFOLDPLUS
+    fidelity_config = (
+        build_repair_fidelity_config(args) if use_repaired_surface else None
+    )
 
     metadata_payload = load_input_metadata(args.metadata_in)
     source_products = metadata_payload.get("products", {})
@@ -739,33 +1118,25 @@ def main() -> None:
         process_model_ids = [model_id for model_id in model_ids if model_id in requested_ids]
 
     products: dict[str, dict[str, Any]] = {}
-    type_to_ids: dict[str, list[str]] = {}
-
     for model_id in model_ids:
         source_entry = source_products.get(model_id, {})
         product_type_key = stable_product_type_key(source_entry, args.class_name.upper())
-        type_to_ids.setdefault(product_type_key, []).append(model_id)
         products[model_id] = dict(source_entry)
         products[model_id]["instance_id"] = model_id
         products[model_id]["3dmodel_id"] = model_id
         products[model_id]["product_type_key"] = product_type_key
 
-    splits_dir = args.datasets_root / "splits"
-    all_splits, per_type_splits = build_split_sets(type_to_ids, args.train_ratio, args.seed)
-    split_paths = write_split_manifests(
-        splits_dir=splits_dir,
-        split_prefix=args.split_prefix,
-        dataset_key=args.dataset_key,
-        class_name=args.class_name,
-        all_splits=all_splits,
-        per_type_splits=per_type_splits,
-    )
-
+    failures: dict[str, str] = {}
+    rejected_repairs: dict[str, dict[str, Any]] = {}
+    accepted_ids: set[str] = set()
     if not args.manifest_only:
         for idx, model_id in enumerate(process_model_ids, start=1):
             mesh_path = args.source_dir / f"{model_id}.glb"
-            print(f"[{idx}/{len(process_model_ids)}] processing {mesh_path.name}")
-            data_path, repair_info = process_model(
+            print(
+                f"[{idx}/{len(process_model_ids)}] processing {mesh_path.name}",
+                flush=True,
+            )
+            model_kwargs = dict(
                 mesh_path=mesh_path,
                 datasets_root=args.datasets_root,
                 dataset_key=args.dataset_key,
@@ -774,13 +1145,50 @@ def main() -> None:
                 near_surface_stds=tuple(args.near_surface_stds),
                 uniform_point_count=args.uniform_point_count,
                 batch_size=args.batch_size,
-                rng=rng,
                 skip_existing=args.skip_existing,
                 repair_config=repair_config,
+                use_repaired_surface=use_repaired_surface,
+                fidelity_config=fidelity_config,
             )
-            products[model_id]["cod_sdf_path"] = str(data_path)
+            try:
+                output_path = object_output_paths(
+                    args.datasets_root, args.dataset_key, args.class_name, model_id
+                )
+                if args.skip_existing and output_path.is_file():
+                    data_path, repair_info = process_model(
+                        **model_kwargs, rng=rng
+                    )
+                elif args.no_model_isolation:
+                    data_path, repair_info = process_model(
+                        **model_kwargs, rng=rng
+                    )
+                else:
+                    data_path, repair_info = process_model_isolated(
+                        **model_kwargs,
+                        seed=model_seed(args.seed, model_id),
+                    )
+            except Exception as error:
+                failures[model_id] = str(error)
+                products[model_id]["processed"] = False
+                products[model_id]["training_eligible"] = False
+                products[model_id]["filter_reason"] = "processing_failure"
+                print(f"  failed {model_id}: {error}", flush=True)
+                if args.continue_on_error:
+                    continue
+                raise
             products[model_id]["preprocessing_repair"] = repair_info
+            if data_path is None:
+                products[model_id].pop("cod_sdf_path", None)
+                products[model_id]["processed"] = False
+                products[model_id]["training_eligible"] = False
+                products[model_id]["filter_reason"] = "repair_fidelity"
+                rejected_repairs[model_id] = repair_info["fidelity"]
+                gc.collect()
+                continue
+            products[model_id]["cod_sdf_path"] = str(data_path)
             products[model_id]["processed"] = True
+            products[model_id]["training_eligible"] = True
+            accepted_ids.add(model_id)
             if repair_info.get("method") == REPAIR_MANIFOLDPLUS:
                 repair_status = "reused cached proxy" if repair_info.get("cache_hit") else "generated repaired proxy"
                 print(f"  repair: {repair_status}")
@@ -795,11 +1203,67 @@ def main() -> None:
         products[model_id].setdefault("3dmodel_id", model_id)
         products[model_id].setdefault("local_glb_path", str(args.source_dir / f"{model_id}.glb"))
         products[model_id].setdefault("processed", False)
-        if "cod_sdf_path" not in products[model_id]:
-            data_path = object_output_paths(args.datasets_root, args.dataset_key, args.class_name, model_id)
-            if data_path.is_file():
+        if model_id in failures:
+            products[model_id].pop("cod_sdf_path", None)
+            continue
+        if products[model_id].get("filter_reason") == "repair_fidelity":
+            continue
+        data_path = object_output_paths(
+            args.datasets_root, args.dataset_key, args.class_name, model_id
+        )
+        if data_path.is_file() and model_id not in accepted_ids:
+            if use_repaired_surface:
+                source, fidelity = read_repaired_record_fidelity(data_path)
+                eligible = (
+                    source == "repaired_mesh"
+                    and fidelity is not None
+                    and fidelity_config is not None
+                    and repair_fidelity_passes(fidelity, fidelity_config)
+                )
+            else:
+                fidelity = None
+                eligible = True
+            if eligible:
+                accepted_ids.add(model_id)
                 products[model_id]["cod_sdf_path"] = str(data_path)
                 products[model_id]["processed"] = True
+                products[model_id]["training_eligible"] = True
+                if fidelity is not None:
+                    products[model_id].setdefault(
+                        "preprocessing_repair", {"fidelity": fidelity}
+                    )
+            elif use_repaired_surface:
+                products[model_id].pop("cod_sdf_path", None)
+                products[model_id]["training_eligible"] = False
+                products[model_id].setdefault(
+                    "filter_reason", "legacy_or_rejected_record"
+                )
+
+    if args.manifest_only and not use_repaired_surface:
+        accepted_ids.update(model_ids)
+
+    type_to_ids: dict[str, list[str]] = {}
+    for model_id in sorted(accepted_ids):
+        product_type_key = products[model_id]["product_type_key"]
+        type_to_ids.setdefault(product_type_key, []).append(model_id)
+    if not type_to_ids:
+        raise RuntimeError(
+            "no training-eligible records remain after repaired-mesh fidelity filtering"
+        )
+
+    splits_dir = args.datasets_root / "splits"
+    all_splits, per_type_splits = build_split_sets(
+        type_to_ids, args.train_ratio, args.seed
+    )
+    split_paths = write_split_manifests(
+        splits_dir=splits_dir,
+        split_prefix=args.split_prefix,
+        dataset_key=args.dataset_key,
+        class_name=args.class_name,
+        all_splits=all_splits,
+        per_type_splits=per_type_splits,
+        write_aggregate=not args.per_type_splits_only,
+    )
 
     metadata_out = args.metadata_out or default_metadata_out(args)
     metadata_out.parent.mkdir(parents=True, exist_ok=True)
@@ -824,13 +1288,34 @@ def main() -> None:
                 "repaired_mesh_dir": str(repair_config.repaired_mesh_dir)
                 if repair_config.repaired_mesh_dir is not None
                 else None,
+                "surface_source": (
+                    "repaired_mesh" if use_repaired_surface else "original_mesh"
+                ),
+                "fidelity_filter": (
+                    {
+                        "sample_count": fidelity_config.sample_count,
+                        "distance_threshold": fidelity_config.distance_threshold,
+                        "max_p95_distance": fidelity_config.max_p95_distance,
+                        "max_outlier_fraction": fidelity_config.max_outlier_fraction,
+                    }
+                    if fidelity_config is not None
+                    else None
+                ),
             },
         },
         "splits": split_paths,
+        "failures": failures,
+        "rejected_repairs": rejected_repairs,
+        "training_eligible_count": len(accepted_ids),
         "products": products,
     }
     metadata_out.write_text(json.dumps(output_payload, indent=2) + "\n", encoding="utf-8")
     print(f"wrote metadata: {metadata_out}")
+    if failures:
+        raise RuntimeError(
+            f"preprocessing failed for {len(failures)} models; "
+            f"details were written to {metadata_out}"
+        )
 
 
 if __name__ == "__main__":

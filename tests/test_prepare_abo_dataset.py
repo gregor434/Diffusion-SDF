@@ -11,18 +11,43 @@ import scripts.prepare_abo_dataset as preprocessing
 from scripts.prepare_abo_dataset import (
     REPAIR_MANIFOLDPLUS,
     RepairConfig,
+    RepairFidelityConfig,
+    RepairResult,
     build_repair_config,
     build_split_sets,
     compute_split_counts,
     default_metadata_out,
     load_repaired_mesh,
+    mesh_summary,
     normalize_mesh_with_transform,
+    repaired_mesh_fidelity,
+    process_model_isolated,
     repair_mesh_with_manifoldplus,
     save_cod_sdf,
+    write_split_manifests,
 )
 
 
 class CODPreprocessingTests(unittest.TestCase):
+    @staticmethod
+    def accepted_fidelity():
+        direction = {
+            "mean": 0.001,
+            "p95": 0.002,
+            "p99": 0.003,
+            "max": 0.004,
+            "outlier_fraction": 0.0,
+        }
+        return {
+            "accepted": True,
+            "sample_count": 32,
+            "distance_threshold": 0.02,
+            "max_p95_distance": 0.02,
+            "max_outlier_fraction": 0.05,
+            "original_to_repaired": dict(direction),
+            "repaired_to_original": dict(direction),
+        }
+
     def test_preprocessing_metadata_is_stored_with_dataset(self):
         args = SimpleNamespace(
             datasets_root=Path("datasets"),
@@ -63,6 +88,36 @@ class CODPreprocessingTests(unittest.TestCase):
                 for name, expected in arrays.items():
                     np.testing.assert_array_equal(restored[name], expected)
             self.assertFalse(path.with_suffix(".npz.tmp").exists())
+
+    def test_mesh_summary_does_not_split_and_copy_components(self):
+        mesh = trimesh.util.concatenate([
+            trimesh.creation.box(),
+            trimesh.creation.box(transform=trimesh.transformations.translation_matrix([3, 0, 0])),
+        ])
+        with mock.patch.object(
+            trimesh.Trimesh,
+            "split",
+            side_effect=AssertionError("mesh.split must not be called"),
+        ):
+            self.assertEqual(mesh_summary(mesh)["components"], 2)
+
+    def test_isolated_worker_reports_failure_without_killing_parent(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with self.assertRaisesRegex(RuntimeError, "missing.glb"):
+                process_model_isolated(
+                    mesh_path=root / "missing.glb",
+                    datasets_root=root,
+                    dataset_key="abo",
+                    class_name="ABO",
+                    surface_point_count=8,
+                    near_surface_stds=(0.005, 0.0005),
+                    uniform_point_count=8,
+                    batch_size=4,
+                    seed=0,
+                    skip_existing=False,
+                    repair_config=RepairConfig(),
+                )
 
     def test_supervision_queries_stay_in_cod_sampling_range(self):
         surface = np.full((16, 3), 0.999, dtype=np.float32)
@@ -105,6 +160,31 @@ class CODPreprocessingTests(unittest.TestCase):
         self.assertEqual(len(all_splits["all"]), 6)
         self.assertEqual(set(per_type), {"CHAIR", "TABLE"})
 
+    def test_can_write_only_per_type_splits(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = write_split_manifests(
+                splits_dir=root,
+                split_prefix="abo_fullchairs",
+                dataset_key="abo",
+                class_name="ABO",
+                all_splits={"all": ["a", "b"], "train": ["a"], "val": ["b"]},
+                per_type_splits={
+                    "CHAIR": {"all": ["a", "b"], "train": ["a"], "val": ["b"]}
+                },
+                write_aggregate=False,
+            )
+
+            self.assertEqual(paths["all"], {})
+            self.assertEqual(
+                {path.name for path in root.glob("*.json")},
+                {
+                    "abo_fullchairs_CHAIR_all.json",
+                    "abo_fullchairs_CHAIR_train.json",
+                    "abo_fullchairs_CHAIR_val.json",
+                },
+            )
+
     def test_build_repair_config_resolves_workspace_binary(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             binary = Path(tmpdir) / "ManifoldPlus"
@@ -143,7 +223,8 @@ class CODPreprocessingTests(unittest.TestCase):
             )
 
             def fake_run(command, capture_output, text):
-                mesh.export(output)
+                generated = Path(command[command.index("--output") + 1])
+                mesh.export(generated)
                 return mock.Mock(returncode=0, stdout="", stderr="")
 
             with mock.patch(
@@ -155,6 +236,161 @@ class CODPreprocessingTests(unittest.TestCase):
             self.assertTrue(second.used_cache)
             self.assertEqual(run.call_count, 1)
             self.assertTrue(load_repaired_mesh(output).is_watertight)
+
+    @unittest.skipIf(preprocessing.o3d is None, "Open3D runtime unavailable")
+    def test_repaired_mesh_fidelity_accepts_matching_mesh_and_rejects_drift(self):
+        original = trimesh.creation.box(extents=(1.0, 1.0, 1.0))
+        matching = original.copy()
+        drifted = original.copy()
+        drifted.apply_translation((0.2, 0.0, 0.0))
+        config = RepairFidelityConfig(sample_count=4000)
+        rng = np.random.default_rng(0)
+        original_scene = preprocessing.make_raycast_scene(original)
+
+        matching_result = repaired_mesh_fidelity(
+            original,
+            matching,
+            original_scene,
+            preprocessing.make_raycast_scene(matching),
+            config,
+            batch_size=1000,
+            rng=rng,
+        )
+        drifted_result = repaired_mesh_fidelity(
+            original,
+            drifted,
+            original_scene,
+            preprocessing.make_raycast_scene(drifted),
+            config,
+            batch_size=1000,
+            rng=rng,
+        )
+
+        self.assertTrue(matching_result["accepted"])
+        self.assertFalse(drifted_result["accepted"])
+        self.assertGreater(
+            drifted_result["original_to_repaired"]["p95"], 0.02
+        )
+
+    def test_repaired_mesh_is_used_for_surface_and_sdf_supervision(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / "sample.glb"
+            trimesh.creation.box().export(source)
+            repaired = trimesh.creation.icosphere(radius=0.4)
+            repaired_root = root / "repaired"
+            config = RepairConfig(
+                method=REPAIR_MANIFOLDPLUS,
+                manifoldplus_bin=root / "ManifoldPlus",
+                repaired_mesh_dir=repaired_root,
+            )
+            arrays = {
+                "surface_points": np.zeros((8, 3), np.float32),
+                "surface_normals": np.zeros((8, 3), np.float32),
+                "near_surface_query_points": np.zeros((16, 3), np.float32),
+                "near_surface_sdf": np.zeros(16, np.float32),
+                "uniform_query_points": np.zeros((8, 3), np.float32),
+                "uniform_sdf": np.zeros(8, np.float32),
+            }
+            sampled_meshes = []
+
+            def fake_repair(mesh, output_path, repair_config):
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                repaired.export(output_path)
+                return RepairResult(repaired, used_cache=False)
+
+            def fake_sample(mesh, **kwargs):
+                sampled_meshes.append(mesh)
+                return dict(arrays)
+
+            with mock.patch(
+                "scripts.prepare_abo_dataset.repair_mesh_with_manifoldplus",
+                side_effect=fake_repair,
+            ), mock.patch(
+                "scripts.prepare_abo_dataset.repaired_mesh_fidelity",
+                return_value=self.accepted_fidelity(),
+            ), mock.patch(
+                "scripts.prepare_abo_dataset.make_raycast_scene",
+                return_value=mock.Mock(),
+            ), mock.patch(
+                "scripts.prepare_abo_dataset.sample_cod_supervision",
+                side_effect=fake_sample,
+            ):
+                output, info = preprocessing.process_model(
+                    mesh_path=source,
+                    datasets_root=root,
+                    dataset_key="abo",
+                    class_name="ABO",
+                    surface_point_count=8,
+                    near_surface_stds=(0.005, 0.0005),
+                    uniform_point_count=8,
+                    batch_size=8,
+                    rng=np.random.default_rng(0),
+                    skip_existing=False,
+                    repair_config=config,
+                    use_repaired_surface=True,
+                    fidelity_config=RepairFidelityConfig(sample_count=32),
+                )
+
+            self.assertIsNotNone(output)
+            self.assertIs(sampled_meshes[0], repaired)
+            self.assertEqual(info["surface_source"], "repaired_mesh")
+            with np.load(output) as data:
+                self.assertEqual(str(data["surface_source"].item()), "repaired_mesh")
+                self.assertTrue(bool(data["repair_fidelity_accepted"].item()))
+
+    def test_rejected_repair_does_not_write_training_record(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / "sample.glb"
+            trimesh.creation.box().export(source)
+            repaired = trimesh.creation.icosphere(radius=0.4)
+            rejected = self.accepted_fidelity()
+            rejected["accepted"] = False
+            rejected["original_to_repaired"]["p95"] = 0.2
+            rejected["original_to_repaired"]["outlier_fraction"] = 0.4
+            config = RepairConfig(
+                method=REPAIR_MANIFOLDPLUS,
+                manifoldplus_bin=root / "ManifoldPlus",
+                repaired_mesh_dir=root / "repaired",
+            )
+
+            def fake_repair(mesh, output_path, repair_config):
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                repaired.export(output_path)
+                return RepairResult(repaired, used_cache=False)
+
+            with mock.patch(
+                "scripts.prepare_abo_dataset.repair_mesh_with_manifoldplus",
+                side_effect=fake_repair,
+            ), mock.patch(
+                "scripts.prepare_abo_dataset.repaired_mesh_fidelity",
+                return_value=rejected,
+            ), mock.patch(
+                "scripts.prepare_abo_dataset.make_raycast_scene",
+                return_value=mock.Mock(),
+            ):
+                output, info = preprocessing.process_model(
+                    mesh_path=source,
+                    datasets_root=root,
+                    dataset_key="abo",
+                    class_name="ABO",
+                    surface_point_count=8,
+                    near_surface_stds=(0.005, 0.0005),
+                    uniform_point_count=8,
+                    batch_size=8,
+                    rng=np.random.default_rng(0),
+                    skip_existing=False,
+                    repair_config=config,
+                    use_repaired_surface=True,
+                    fidelity_config=RepairFidelityConfig(sample_count=32),
+                )
+
+            self.assertIsNone(output)
+            self.assertFalse(info["fidelity"]["accepted"])
+            self.assertFalse(
+                preprocessing.object_output_paths(root, "abo", "ABO", "sample").exists()
+            )
 
     def test_skip_existing_keeps_repair_cache_provenance(self):
         with tempfile.TemporaryDirectory() as tmpdir:

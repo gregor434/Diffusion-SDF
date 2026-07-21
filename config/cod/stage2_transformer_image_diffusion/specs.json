@@ -1,11 +1,16 @@
 {
-  "Description": "Stage two COD token transformer diffusion with EDM preconditioning",
+  "Description": "Stage two compact COD token transformer diffusion with CLIP image conditioning",
   "TrainSplit": "datasets/splits/abo_CHAIR_train.json",
   "ValSplit": "datasets/splits/abo_CHAIR_val.json",
   "TestSplit": "datasets/splits/abo_CHAIR_val.json",
   "data_path": "config/cod/stage1_decoder_finetune/modulations",
   "latent_stats_path": "config/cod/stage1_decoder_finetune/modulations/latent_stats.npz",
   "modulation_ckpt_path": "config/cod/stage1_decoder_finetune/last.ckpt",
+  "conditioning": {
+    "type": "image",
+    "path": "datasets/ABO/images_filtered",
+    "clip_model": "ViT-B/32"
+  },
   "training_task": "diffusion",
   "CODVaeSpecs": {
     "checkpoint_path": "tmp/cod_vae_m32_weights.pt",
@@ -30,7 +35,9 @@
   },
   "diffusion_model_specs": {
     "latent_tokens": 32, "latent_dimension": 32, "width": 256,
-    "depth": 6, "heads": 4, "mlp_ratio": 2, "dropout": 0.1, "cond": false
+    "depth": 6, "heads": 4, "mlp_ratio": 2, "dropout": 0.1,
+    "cond": true, "condition_dim": 128,
+    "condition_encoders": [{"type": "image", "clip_feature_dim": 512}]
   },
   "learning_rates": {"diffusion": 0.0001},
   "weight_decay": 0.01,

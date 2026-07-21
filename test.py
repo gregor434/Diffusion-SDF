@@ -27,7 +27,11 @@ from utils.reconstruct import filter_threshold
 
 
 def checkpoint_path(exp_dir, resume):
-    name = f"{resume}.ckpt" if resume == "last" else f"epoch={resume}.ckpt"
+    name = (
+        f"{resume}.ckpt"
+        if resume in {"last", "best"}
+        else f"epoch={resume}.ckpt"
+    )
     return str(Path(exp_dir) / name)
 
 
@@ -52,6 +56,16 @@ def make_sdf_dataset(specs, split_name="TestSplit", condition_surface=False):
         surface_point_count=specs.get("SurfacePointCount", 2048),
         near_surface_ratio=specs.get("NearSurfaceRatio", 0.7),
         condition_surface=condition_surface,
+    )
+
+
+def make_generation_dataset(specs):
+    split = json.loads(Path(specs["TestSplit"]).read_text())
+    return ModulationLoader(
+        specs["data_path"],
+        split_file=split,
+        conditioning=specs.get("conditioning"),
+        latent_stats_path=specs.get("latent_stats_path"),
     )
 
 
@@ -212,9 +226,9 @@ def load_generation_models(specs, args, device):
 def generate(specs, args, recon_dir, device):
     model, sdf_model = load_generation_models(specs, args, device)
     conditional = bool(specs["diffusion_model_specs"].get("cond", False))
-    batches = [(None, None, None)]
+    batches = [None]
     if conditional:
-        dataset = make_sdf_dataset(specs, condition_surface=True)
+        dataset = make_generation_dataset(specs)
         batches = torch.utils.data.DataLoader(dataset, batch_size=1, num_workers=0)
 
     metrics_file = (recon_dir / "generated_metrics.csv").open("w", newline="")
@@ -231,9 +245,14 @@ def generate(specs, args, recon_dir, device):
         output_dir = recon_dir
         surface = None
         if batch is not None:
-            surface = batch["surface_points"].to(device)
-            conditioning = {"point_cloud": surface}
-            output_dir = recon_dir / batch["class_name"][0] / batch["object_id"][0]
+            conditioning = {
+                name: value.to(device)
+                for name, value in batch["conditioning"].items()
+            }
+            surface = conditioning.get("point_cloud")
+            output_dir = (
+                recon_dir / batch["class_name"][0] / batch["object_id"][0]
+            )
             output_dir.mkdir(parents=True, exist_ok=True)
         normalized = model.diffusion_model.sample(
             args.num_samples, conditioning=conditioning
