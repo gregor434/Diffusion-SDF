@@ -548,6 +548,13 @@ def repaired_mesh_fidelity(
 def repair_fidelity_passes(
     fidelity: dict[str, Any], config: RepairFidelityConfig
 ) -> bool:
+    if int(fidelity.get("sample_count", -1)) != config.sample_count:
+        return False
+    if not np.isclose(
+        float(fidelity.get("distance_threshold", np.nan)),
+        config.distance_threshold,
+    ):
+        return False
     return all(
         float(fidelity[direction]["p95"]) <= config.max_p95_distance
         and float(fidelity[direction]["outlier_fraction"])
@@ -617,6 +624,18 @@ def fidelity_arrays(fidelity: dict[str, Any]) -> dict[str, np.ndarray]:
         "repair_fidelity_accepted": np.asarray(
             fidelity["accepted"], dtype=np.bool_
         ),
+        "repair_fidelity_sample_count": np.asarray(
+            fidelity["sample_count"], dtype=np.int32
+        ),
+        "repair_fidelity_distance_threshold": np.asarray(
+            fidelity["distance_threshold"], dtype=np.float32
+        ),
+        "repair_fidelity_max_p95_distance": np.asarray(
+            fidelity["max_p95_distance"], dtype=np.float32
+        ),
+        "repair_fidelity_max_outlier_fraction": np.asarray(
+            fidelity["max_outlier_fraction"], dtype=np.float32
+        ),
     }
     for direction in ("original_to_repaired", "repaired_to_original"):
         for statistic in ("mean", "p95", "p99", "max", "outlier_fraction"):
@@ -635,6 +654,17 @@ def read_repaired_record_fidelity(
                 return None, None
             source = str(np.asarray(data["surface_source"]).item())
             fidelity: dict[str, Any] = {}
+            scalar_fields = {
+                "sample_count": "repair_fidelity_sample_count",
+                "distance_threshold": "repair_fidelity_distance_threshold",
+                "max_p95_distance": "repair_fidelity_max_p95_distance",
+                "max_outlier_fraction": "repair_fidelity_max_outlier_fraction",
+            }
+            for field, key in scalar_fields.items():
+                if key not in data:
+                    return source, None
+                value = np.asarray(data[key]).item()
+                fidelity[field] = int(value) if field == "sample_count" else float(value)
             for direction in ("original_to_repaired", "repaired_to_original"):
                 values = {}
                 for statistic in (

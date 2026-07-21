@@ -68,6 +68,25 @@ class CODDiffusionSmokeTests(unittest.TestCase):
         self.assertEqual(estimate.shape, torch.Size([2, 4, 3]))
         self.assertEqual(diffusion.sample(2).shape, torch.Size([2, 4, 3]))
 
+    def test_conditional_sampler_broadcasts_one_image_to_all_samples(self):
+        diffusion = EDMLatentDiffusion(
+            {
+                "latent_tokens": 4,
+                "latent_dimension": 3,
+                "width": 16,
+                "depth": 1,
+                "heads": 4,
+                "cond": True,
+                "condition_dim": 8,
+                "condition_encoders": [{"type": "image"}],
+            },
+            {"sampling_steps": 2, "sigma_max": 1.0},
+        )
+        samples = diffusion.sample(
+            5, conditioning={"image": torch.randn(1, 1, 512)}
+        )
+        self.assertEqual(samples.shape, torch.Size([5, 4, 3]))
+
     def test_combined_stage_two_uses_cached_cod_tokens(self):
         specs = {
             "training_task": "diffusion",

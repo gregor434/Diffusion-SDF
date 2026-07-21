@@ -6,6 +6,7 @@ import argparse
 import csv
 import json
 import os
+import shutil
 import time
 import warnings
 from pathlib import Path
@@ -254,6 +255,13 @@ def generate(specs, args, recon_dir, device):
                 recon_dir / batch["class_name"][0] / batch["object_id"][0]
             )
             output_dir.mkdir(parents=True, exist_ok=True)
+            image_paths = batch.get("conditioning_paths", {}).get("image")
+            if image_paths:
+                source_image = Path(image_paths[0])
+                shutil.copy2(
+                    source_image,
+                    output_dir / f"input_image{source_image.suffix}",
+                )
         normalized = model.diffusion_model.sample(
             args.num_samples, conditioning=conditioning
         )

@@ -95,12 +95,16 @@ class ModulationLoader(Dataset):
         conditioning = {
             source.name: source.load(record) for source in self.conditioning_sources
         }
+        conditioning_paths = {
+            source.name: source.resolve(record) for source in self.conditioning_sources
+        }
         item = {
             "latent": latent,
             "dataset": record["dataset"],
             "class_name": record["class_name"],
             "object_id": record["instance_name"],
             "conditioning": conditioning,
+            "conditioning_paths": conditioning_paths,
         }
         if logvar is not None:
             item["posterior_logvar"] = logvar

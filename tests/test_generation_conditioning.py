@@ -4,11 +4,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 import torch
+from PIL import Image
 
 import test
 
 
 class _GenerationDataset(torch.utils.data.Dataset):
+    image_path = None
+
     def __len__(self):
         return 1
 
@@ -19,6 +22,7 @@ class _GenerationDataset(torch.utils.data.Dataset):
             "class_name": "ABO",
             "object_id": "item0",
             "conditioning": {"image": torch.ones(1, 512)},
+            "conditioning_paths": {"image": str(self.image_path)},
         }
 
 
@@ -62,6 +66,10 @@ class ImageConditionedGenerationTests(unittest.TestCase):
         })()
 
         with tempfile.TemporaryDirectory() as tmpdir:
+            _GenerationDataset.image_path = Path(tmpdir) / "source.jpg"
+            Image.new("RGB", (8, 8), color=(10, 20, 30)).save(
+                _GenerationDataset.image_path
+            )
             with patch("test.load_generation_models", return_value=(model, _SdfModel())):
                 with patch("test.make_generation_dataset", return_value=_GenerationDataset()):
                     with patch("test.mesh.create_mesh") as create_mesh:
@@ -69,6 +77,13 @@ class ImageConditionedGenerationTests(unittest.TestCase):
                             test.generate(
                                 specs, args, Path(tmpdir), torch.device("cpu")
                             )
+
+            copied_image = Path(tmpdir) / "ABO" / "item0" / "input_image.jpg"
+            self.assertTrue(copied_image.is_file())
+            self.assertEqual(
+                copied_image.read_bytes(),
+                _GenerationDataset.image_path.read_bytes(),
+            )
 
         self.assertEqual(
             model.diffusion_model.conditioning["image"].shape,

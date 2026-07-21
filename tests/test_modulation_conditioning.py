@@ -49,6 +49,9 @@ class ModulationConditioningTests(unittest.TestCase):
                 item = dataset[0]
                 self.assertEqual(item["latent"].shape, torch.Size([2, 3]))
                 self.assertEqual(item["conditioning"]["image"].shape, torch.Size([1, 512]))
+                self.assertEqual(
+                    item["conditioning_paths"]["image"], str(image_dir / "main.jpg")
+                )
                 self.assertEqual(clip_model.calls, 1)
 
                 cached_item = dataset[0]

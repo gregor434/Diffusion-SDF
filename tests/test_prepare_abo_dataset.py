@@ -237,6 +237,22 @@ class CODPreprocessingTests(unittest.TestCase):
             self.assertEqual(run.call_count, 1)
             self.assertTrue(load_repaired_mesh(output).is_watertight)
 
+    def test_fidelity_cache_is_invalidated_when_sampling_threshold_changes(self):
+        fidelity = self.accepted_fidelity()
+        matching = RepairFidelityConfig(
+            sample_count=32, distance_threshold=0.02
+        )
+        changed = RepairFidelityConfig(
+            sample_count=32, distance_threshold=0.04,
+            max_p95_distance=0.04,
+        )
+        self.assertTrue(
+            preprocessing.repair_fidelity_passes(fidelity, matching)
+        )
+        self.assertFalse(
+            preprocessing.repair_fidelity_passes(fidelity, changed)
+        )
+
     @unittest.skipIf(preprocessing.o3d is None, "Open3D runtime unavailable")
     def test_repaired_mesh_fidelity_accepts_matching_mesh_and_rejects_drift(self):
         original = trimesh.creation.box(extents=(1.0, 1.0, 1.0))

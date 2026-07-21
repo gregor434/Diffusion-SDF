@@ -234,9 +234,34 @@ class EDMLatentDiffusion(nn.Module):
         per_element = weight.reshape(-1, 1, 1) * (denoised - clean).square()
         return per_element.mean(), denoised, noisy, sigma
 
+    @staticmethod
+    def _expand_conditioning(conditioning, batch_size):
+        if conditioning is None:
+            return None
+
+        is_mapping = isinstance(conditioning, dict)
+        values = conditioning if is_mapping else {"conditioning": conditioning}
+        expanded = {}
+        for name, value in values.items():
+            if not torch.is_tensor(value) or value.ndim == 0:
+                raise TypeError(
+                    f"condition '{name}' must be a tensor with a batch dimension"
+                )
+            if value.shape[0] == batch_size:
+                expanded[name] = value
+            elif value.shape[0] == 1:
+                expanded[name] = value.expand(batch_size, *value.shape[1:])
+            else:
+                raise ValueError(
+                    f"condition '{name}' has batch size {value.shape[0]}, "
+                    f"but sampling requested {batch_size} samples"
+                )
+        return expanded if is_mapping else expanded["conditioning"]
+
     @torch.no_grad()
     def sample(self, batch_size, conditioning=None, noise=None, num_steps=None):
         device = next(self.parameters()).device
+        conditioning = self._expand_conditioning(conditioning, batch_size)
         steps = int(num_steps or self.sampling_steps)
         if steps < 2:
             raise ValueError("EDM sampling requires at least two steps")
