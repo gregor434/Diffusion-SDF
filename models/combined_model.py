@@ -344,16 +344,32 @@ class CombinedModel(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         losses = self._losses(batch)
+        batch_size = (
+            batch["latent"].shape[0]
+            if self.task == "diffusion"
+            else batch["surface_points"].shape[0]
+        )
         for name, value in losses.items():
             if name != "clean_latent":
-                self.log(f"train/{name}", value, on_step=True, on_epoch=False)
+                self.log(
+                    f"train/{name}", value, on_step=True, on_epoch=False,
+                    batch_size=batch_size,
+                )
         return losses["loss"]
 
     def validation_step(self, batch, batch_idx):
         losses = self._losses(batch)
+        batch_size = (
+            batch["latent"].shape[0]
+            if self.task == "diffusion"
+            else batch["surface_points"].shape[0]
+        )
         for name, value in losses.items():
             if name != "clean_latent":
-                self.log(f"val/{name}", value, on_step=False, on_epoch=True)
+                self.log(
+                    f"val/{name}", value, on_step=False, on_epoch=True,
+                    batch_size=batch_size,
+                )
         return losses["loss"]
 
     def on_after_backward(self):
