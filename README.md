@@ -130,10 +130,13 @@ split manifests.
 
 To regenerate `cod_sdf.npz` records while reusing both the cached repaired
 meshes and their compatible fidelity validation sidecars, omit
-`--skip-existing` and pass `--reuse-repair-fidelity`. A missing sidecar or one
-created with a different fidelity sample count or distance threshold is
-validated again automatically. `--force-repair` still regenerates the proxy and
-therefore always performs a fresh fidelity validation.
+`--skip-existing` and pass `--reuse-repair-fidelity`. Add `--model-workers 2`
+to process two chairs concurrently; 2-4 is the recommended starting range
+because every worker constructs an Open3D raycasting scene and holds its own
+sampling arrays. A missing sidecar or one created with a different fidelity
+sample count or distance threshold is validated again automatically.
+`--force-repair` still regenerates the proxy and therefore always performs a
+fresh fidelity validation.
 
 ## Stage one: COD-VAE SDF reconstruction
 

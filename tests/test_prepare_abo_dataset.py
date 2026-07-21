@@ -1,4 +1,5 @@
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -118,6 +119,39 @@ class CODPreprocessingTests(unittest.TestCase):
                     skip_existing=False,
                     repair_config=RepairConfig(),
                 )
+
+    def test_model_jobs_can_run_concurrently_and_keep_results_attributed(self):
+        barrier = threading.Barrier(2)
+
+        def process(model_id):
+            barrier.wait(timeout=2)
+            return f"processed-{model_id}"
+
+        results = list(
+            preprocessing.iter_model_results(["first", "second"], 2, process)
+        )
+
+        self.assertEqual(
+            {model_id: result for model_id, result, error in results},
+            {"first": "processed-first", "second": "processed-second"},
+        )
+        self.assertTrue(all(error is None for _, _, error in results))
+
+    def test_model_job_errors_are_returned_with_the_model_id(self):
+        def process(model_id):
+            if model_id == "broken":
+                raise RuntimeError("expected failure")
+            return model_id
+
+        results = {
+            model_id: (result, error)
+            for model_id, result, error in preprocessing.iter_model_results(
+                ["working", "broken"], 2, process
+            )
+        }
+
+        self.assertEqual(results["working"], ("working", None))
+        self.assertIsInstance(results["broken"][1], RuntimeError)
 
     def test_supervision_queries_stay_in_cod_sampling_range(self):
         surface = np.full((16, 3), 0.999, dtype=np.float32)

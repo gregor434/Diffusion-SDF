@@ -11,6 +11,7 @@ This generalizes the chair-specific ABO preparation flow:
 """
 
 import argparse
+import concurrent.futures
 import gc
 import hashlib
 import json
@@ -212,6 +213,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Process all models in the parent process. By default every model "
             "uses a fresh child process so native memory is returned to the OS."
+        ),
+    )
+    parser.add_argument(
+        "--model-workers",
+        type=int,
+        default=1,
+        help=(
+            "Number of chair models to preprocess concurrently. Each model still "
+            "runs in a fresh isolated process; start with 2-4 because Open3D "
+            "raycasting can use substantial memory."
         ),
     )
     parser.add_argument(
@@ -1033,6 +1044,31 @@ def process_model_isolated(**kwargs) -> tuple[Path | None, dict[str, Any]]:
     return (Path(data_path) if data_path is not None else None), result["repair_info"]
 
 
+def iter_model_results(model_ids, model_workers: int, process_model_fn):
+    def capture(model_id):
+        try:
+            return model_id, process_model_fn(model_id), None
+        except Exception as error:
+            return model_id, None, error
+
+    if model_workers <= 0:
+        raise ValueError("--model-workers must be positive")
+    if model_workers == 1:
+        for model_id in model_ids:
+            yield capture(model_id)
+        return
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=model_workers,
+        thread_name_prefix="abo-model",
+    ) as executor:
+        futures = {
+            executor.submit(capture, model_id): model_id for model_id in model_ids
+        }
+        for future in concurrent.futures.as_completed(futures):
+            yield future.result()
+
+
 def load_input_metadata(metadata_path: Path | None) -> dict[str, Any]:
     if metadata_path is None or not metadata_path.is_file():
         return {"products": {}}
@@ -1177,6 +1213,12 @@ def default_metadata_out(args: argparse.Namespace) -> Path:
 
 def main() -> None:
     args = parse_args()
+    if args.model_workers <= 0:
+        raise ValueError("--model-workers must be positive")
+    if args.no_model_isolation and args.model_workers != 1:
+        raise ValueError(
+            "--no-model-isolation cannot be combined with --model-workers greater than 1"
+        )
     rng = np.random.default_rng(args.seed)
     repair_config = build_repair_config(args)
     use_repaired_surface = repair_config.method == REPAIR_MANIFOLDPLUS
@@ -1218,10 +1260,15 @@ def main() -> None:
     rejected_repairs: dict[str, dict[str, Any]] = {}
     accepted_ids: set[str] = set()
     if not args.manifest_only:
-        for idx, model_id in enumerate(process_model_ids, start=1):
+        model_indices = {
+            model_id: idx for idx, model_id in enumerate(process_model_ids, start=1)
+        }
+
+        def run_model(model_id: str):
             mesh_path = args.source_dir / f"{model_id}.glb"
             print(
-                f"[{idx}/{len(process_model_ids)}] processing {mesh_path.name}",
+                f"[{model_indices[model_id]}/{len(process_model_ids)}] "
+                f"processing {mesh_path.name}",
                 flush=True,
             )
             model_kwargs = dict(
@@ -1239,24 +1286,27 @@ def main() -> None:
                 fidelity_config=fidelity_config,
                 reuse_repair_fidelity=args.reuse_repair_fidelity,
             )
-            try:
-                output_path = object_output_paths(
-                    args.datasets_root, args.dataset_key, args.class_name, model_id
+            output_path = object_output_paths(
+                args.datasets_root, args.dataset_key, args.class_name, model_id
+            )
+            if args.skip_existing and output_path.is_file():
+                model_rng = (
+                    rng
+                    if args.model_workers == 1
+                    else np.random.default_rng(model_seed(args.seed, model_id))
                 )
-                if args.skip_existing and output_path.is_file():
-                    data_path, repair_info = process_model(
-                        **model_kwargs, rng=rng
-                    )
-                elif args.no_model_isolation:
-                    data_path, repair_info = process_model(
-                        **model_kwargs, rng=rng
-                    )
-                else:
-                    data_path, repair_info = process_model_isolated(
-                        **model_kwargs,
-                        seed=model_seed(args.seed, model_id),
-                    )
-            except Exception as error:
+                return process_model(**model_kwargs, rng=model_rng)
+            if args.no_model_isolation:
+                return process_model(**model_kwargs, rng=rng)
+            return process_model_isolated(
+                **model_kwargs,
+                seed=model_seed(args.seed, model_id),
+            )
+
+        for model_id, result, error in iter_model_results(
+            process_model_ids, args.model_workers, run_model
+        ):
+            if error is not None:
                 failures[model_id] = str(error)
                 products[model_id]["processed"] = False
                 products[model_id]["training_eligible"] = False
@@ -1264,7 +1314,8 @@ def main() -> None:
                 print(f"  failed {model_id}: {error}", flush=True)
                 if args.continue_on_error:
                     continue
-                raise
+                raise error
+            data_path, repair_info = result
             products[model_id]["preprocessing_repair"] = repair_info
             if data_path is None:
                 products[model_id].pop("cod_sdf_path", None)
