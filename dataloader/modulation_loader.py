@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 
-"""Lazy loader and normalization utilities for native COD latent tensors."""
+"""Creation, caching, and loading utilities for native COD latent tensors."""
 
+import copy
+import gc
+import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -9,6 +13,272 @@ import torch
 from torch.utils.data import Dataset
 
 from dataloader.conditioning import build_conditioning_sources
+
+
+SPLIT_KEYS = ("TrainSplit", "ValSplit", "TestSplit", "ModulationSplit")
+
+
+def _load_split(value):
+    if isinstance(value, dict):
+        return value
+    return json.loads(Path(value).read_text())
+
+
+def merge_splits(splits):
+    """Return the stable union of dataset/class/object entries in ``splits``."""
+    merged = {}
+    seen = set()
+    for split in splits:
+        for dataset, classes in split.items():
+            for class_name, object_ids in classes.items():
+                output = merged.setdefault(dataset, {}).setdefault(class_name, [])
+                for object_id in object_ids:
+                    key = (dataset, class_name, object_id)
+                    if key not in seen:
+                        seen.add(key)
+                        output.append(object_id)
+    return merged
+
+
+def configured_splits(specs):
+    """Load every split supplied by a stage-two configuration."""
+    return {
+        key: _load_split(specs[key])
+        for key in SPLIT_KEYS
+        if specs.get(key) is not None
+    }
+
+
+def _split_records(split, cache_path=None):
+    records = []
+    for dataset, classes in split.items():
+        for class_name, object_ids in classes.items():
+            for object_id in object_ids:
+                record = {
+                    "dataset": dataset,
+                    "class_name": class_name,
+                    "instance_name": object_id,
+                }
+                if cache_path is not None:
+                    record["latent_path"] = str(
+                        Path(cache_path) / class_name / object_id / "modulation.npz"
+                    )
+                records.append(record)
+    return records
+
+
+class SurfacePointLoader(Dataset):
+    """Read only the surface samples required by the COD latent encoder."""
+
+    def __init__(self, data_source, records, surface_point_count=2048):
+        self.surface_point_count = int(surface_point_count)
+        self.records = []
+        missing = []
+        root = Path(data_source)
+        for record in records:
+            path = (
+                root
+                / record["dataset"]
+                / record["class_name"]
+                / record["instance_name"]
+                / "cod_sdf.npz"
+            )
+            if path.is_file():
+                self.records.append({**record, "surface_path": str(path)})
+            else:
+                missing.append(path)
+        if missing:
+            preview = ", ".join(map(str, missing[:5]))
+            raise FileNotFoundError(
+                f"missing {len(missing)} COD surface files required for modulation "
+                f"caching; first paths: {preview}"
+            )
+
+    def __len__(self):
+        return len(self.records)
+
+    def __getitem__(self, index):
+        record = self.records[index]
+        with np.load(record["surface_path"]) as data:
+            surface = data["surface_points"]
+            indices = np.random.choice(
+                len(surface),
+                self.surface_point_count,
+                replace=len(surface) < self.surface_point_count,
+            )
+            surface = np.asarray(surface[indices], dtype=np.float32)
+        return {
+            "surface_points": torch.from_numpy(surface),
+            "dataset": record["dataset"],
+            "class_name": record["class_name"],
+            "object_id": record["instance_name"],
+        }
+
+
+def _save_modulation(path, object_id, mean, logvar):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    with temporary.open("wb") as output:
+        np.savez_compressed(
+            output,
+            object_id=np.asarray(object_id),
+            posterior_mean=np.asarray(mean, dtype=np.float32),
+            posterior_logvar=np.asarray(logvar, dtype=np.float32),
+        )
+    temporary.replace(path)
+
+
+def _load_stage1_encoder(checkpoint_path, fallback_specs):
+    """Load a stage-one model and discard all decoder-only components."""
+    from models.sdf_model import SdfModel
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint:
+        raise ValueError(
+            "modulation_ckpt_path must reference a Lightning checkpoint with a state_dict"
+        )
+    stage1_specs = copy.deepcopy(
+        checkpoint.get("hyper_parameters", {}).get("specs", fallback_specs)
+    )
+    # The Lightning checkpoint supersedes the upstream COD checkpoint. Avoid
+    # loading the latter just to overwrite it immediately.
+    stage1_specs.setdefault("CODVaeSpecs", {})["checkpoint_path"] = None
+    model = SdfModel(stage1_specs)
+    state = {
+        key[len("sdf_model."):]: value
+        for key, value in checkpoint["state_dict"].items()
+        if key.startswith("sdf_model.")
+    }
+    if not state:
+        raise RuntimeError(f"no sdf_model parameters found in {checkpoint_path}")
+    model.load_state_dict(state, strict=True)
+
+    # Surface encoding uses only the point encoder and variational projection.
+    # Remove the much larger triplane/SDF and latent decoder modules before the
+    # model is transferred to the accelerator.
+    del model.feature_adapter
+    del model.sdf_decoder
+    del model.cod_vae.latent_proj_out
+    del model.cod_vae.latent_decoder
+    del model.cod_vae.autoencoder.decoder
+    del model.cod_vae.autoencoder.head
+    del state
+    del checkpoint
+    gc.collect()
+    return model, stage1_specs
+
+
+@torch.no_grad()
+def ensure_modulation_cache(
+    specs,
+    exp_dir,
+    batch_size=8,
+    workers=0,
+    device=None,
+):
+    """Create missing modulations for the union of all configured splits.
+
+    The cache is always local to the stage-two experiment. The stage-one model
+    is loaded only when files are missing and is explicitly released before
+    this function returns.
+    """
+    splits = configured_splits(specs)
+    if "TrainSplit" not in splits:
+        raise ValueError("diffusion training requires TrainSplit")
+    all_split = merge_splits(splits.values())
+    cache_path = Path(exp_dir) / "modulations"
+    cache_path.mkdir(parents=True, exist_ok=True)
+    expected = _split_records(all_split, cache_path)
+    missing = [record for record in expected if not Path(record["latent_path"]).is_file()]
+
+    if missing:
+        checkpoint_path = specs.get("modulation_ckpt_path")
+        if not checkpoint_path:
+            raise ValueError(
+                "modulation_ckpt_path is required to create stage-two modulations"
+            )
+        encoder = None
+        surface_batch = None
+        latent = None
+        posterior = None
+        encoded = None
+        try:
+            encoder, stage1_specs = _load_stage1_encoder(checkpoint_path, specs)
+            data_source = specs.get("DataSource", stage1_specs.get("DataSource"))
+            if not data_source:
+                raise ValueError(
+                    "DataSource must be set in stage two or embedded in the stage-one checkpoint"
+                )
+            surface_count = int(
+                specs.get(
+                    "ModulationSurfacePointCount",
+                    stage1_specs.get("SurfacePointCount", 2048),
+                )
+            )
+            dataset = SurfacePointLoader(data_source, missing, surface_count)
+            loader = torch.utils.data.DataLoader(
+                dataset,
+                batch_size=max(1, int(batch_size)),
+                num_workers=max(0, int(workers)),
+                shuffle=False,
+                pin_memory=torch.cuda.is_available(),
+            )
+            device = device or torch.device(
+                "cuda" if torch.cuda.is_available() else "cpu"
+            )
+            encoder = encoder.to(device).eval()
+            for batch in loader:
+                surface_batch = batch["surface_points"].to(
+                    device, non_blocking=True
+                )
+                latent, posterior, encoded = encoder.encode_surface(
+                    surface_batch,
+                    sample_posterior=False,
+                )
+                if posterior is None:
+                    raise RuntimeError("the stage-one encoder did not return a posterior")
+                means = posterior.mean.detach().cpu().numpy()
+                logvars = posterior.logvar.detach().cpu().numpy()
+                for index, object_id in enumerate(batch["object_id"]):
+                    path = (
+                        cache_path
+                        / batch["class_name"][index]
+                        / object_id
+                        / "modulation.npz"
+                    )
+                    _save_modulation(path, object_id, means[index], logvars[index])
+                del surface_batch, latent, posterior, encoded
+                surface_batch = latent = posterior = encoded = None
+        finally:
+            del surface_batch, latent, posterior, encoded
+            if encoder is not None:
+                del encoder
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    incomplete = [
+        record["latent_path"]
+        for record in expected
+        if not Path(record["latent_path"]).is_file()
+    ]
+    if incomplete:
+        raise RuntimeError(
+            f"modulation caching left {len(incomplete)} files missing; first paths: "
+            + ", ".join(incomplete[:5])
+        )
+
+    train_records = ModulationLoader.build_records(cache_path, splits["TrainSplit"])
+    expected_train = _split_records(splits["TrainSplit"])
+    if len(train_records) != len(expected_train):
+        raise RuntimeError(
+            f"expected {len(expected_train)} training modulations, found {len(train_records)}"
+        )
+    mean, std = compute_latent_statistics(train_records)
+    stats_path = cache_path / "latent_stats.npz"
+    save_latent_statistics(stats_path, mean, std)
+    return str(cache_path), str(stats_path)
 
 
 def compute_latent_statistics(records):
@@ -34,8 +304,10 @@ def compute_latent_statistics(records):
 def save_latent_statistics(path, mean, std):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("wb") as output:
+    temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    with temporary.open("wb") as output:
         np.savez(output, mean=mean, std=std)
+    temporary.replace(path)
 
 
 class ModulationLoader(Dataset):

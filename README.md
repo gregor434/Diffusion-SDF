@@ -128,6 +128,13 @@ fields. Preprocessing metadata is written to
 datasets/abo/preprocessing_metadata.json; datasets/splits remains reserved for
 split manifests.
 
+To regenerate `cod_sdf.npz` records while reusing both the cached repaired
+meshes and their compatible fidelity validation sidecars, omit
+`--skip-existing` and pass `--reuse-repair-fidelity`. A missing sidecar or one
+created with a different fidelity sample count or distance threshold is
+validated again automatically. `--force-repair` still regenerates the proxy and
+therefore always performs a fresh fidelity validation.
+
 ## Stage one: COD-VAE SDF reconstruction
 
     python train.py -e config/cod/stage1_frozen_pretrained -b 8 -w 8
@@ -168,7 +175,14 @@ per-channel training statistics to modulations/latent_stats.npz.
 
     python train.py -e config/cod/stage2_transformer_diffusion -b 64 -w 8
 
-Stage two reads only cached modulation files and optional cached conditions.
+At startup, stage two caches modulations for the union of every configured
+TrainSplit, ValSplit, TestSplit, and ModulationSplit under the stage-two
+experiment directory at `modulations/`. Existing files are reused, and the
+stage-one encoder is loaded only when a modulation is missing. Latent statistics
+are computed from TrainSplit only. `modulation_batch_size` and
+`modulation_workers` optionally control this one-time extraction (defaults: up
+to 8 objects per batch and the training worker count). Stage two then reads the
+cached modulation files and optional cached conditions.
 The denoiser is a non-causal token transformer over [B,M,D]. It uses the EDM
 log-normal noise distribution, EDM preconditioning, weighted denoising loss,
 and second-order Heun sampling referenced by COD-VAE through VecSet.

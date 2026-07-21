@@ -225,6 +225,13 @@ def load_generation_models(specs, args, device):
 
 @torch.no_grad()
 def generate(specs, args, recon_dir, device):
+    specs = dict(specs)
+    if getattr(args, "exp_dir", None) is not None:
+        local_cache = Path(args.exp_dir) / "modulations"
+        local_stats = local_cache / "latent_stats.npz"
+        if local_cache.is_dir() and local_stats.is_file():
+            specs["data_path"] = str(local_cache)
+            specs["latent_stats_path"] = str(local_stats)
     model, sdf_model = load_generation_models(specs, args, device)
     conditional = bool(specs["diffusion_model_specs"].get("cond", False))
     batches = [None]

@@ -191,9 +191,8 @@ class ImageConditioning(ConditioningSource):
                 feature = self.encode_image(model, preprocess, device, image)
                 self.save_cached(feature, cache_path)
         finally:
-            if device == "cuda":
-                del model
-                release_clip_model(self.clip_model, device)
+            del model
+            release_clip_model(self.clip_model, device)
 
         return self.prepared_with_cuda
 

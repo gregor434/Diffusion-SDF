@@ -171,6 +171,15 @@ def parse_args() -> argparse.Namespace:
         help="Maximum fraction above the fidelity distance threshold in either direction.",
     )
     parser.add_argument(
+        "--reuse-repair-fidelity",
+        action="store_true",
+        help=(
+            "When regenerating COD/SDF records from cached repaired meshes, reuse a "
+            "compatible .obj.fidelity.json sidecar instead of repeating the "
+            "bidirectional original/repaired surface comparison."
+        ),
+    )
+    parser.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -545,15 +554,46 @@ def repaired_mesh_fidelity(
     }
 
 
+def repair_fidelity_cache_compatible(
+    fidelity: dict[str, Any], config: RepairFidelityConfig
+) -> bool:
+    try:
+        if int(fidelity.get("sample_count", -1)) != config.sample_count:
+            return False
+        if not np.isclose(
+            float(fidelity.get("distance_threshold", np.nan)),
+            config.distance_threshold,
+        ):
+            return False
+        for direction in ("original_to_repaired", "repaired_to_original"):
+            for statistic in ("mean", "p95", "p99", "max", "outlier_fraction"):
+                float(fidelity[direction][statistic])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return True
+
+
+def apply_repair_fidelity_config(
+    fidelity: dict[str, Any], config: RepairFidelityConfig
+) -> dict[str, Any]:
+    evaluated = dict(fidelity)
+    evaluated["sample_count"] = config.sample_count
+    evaluated["distance_threshold"] = config.distance_threshold
+    evaluated["max_p95_distance"] = config.max_p95_distance
+    evaluated["max_outlier_fraction"] = config.max_outlier_fraction
+    evaluated["accepted"] = all(
+        float(fidelity[direction]["p95"]) <= config.max_p95_distance
+        and float(fidelity[direction]["outlier_fraction"])
+        <= config.max_outlier_fraction
+        for direction in ("original_to_repaired", "repaired_to_original")
+    )
+    return evaluated
+
+
 def repair_fidelity_passes(
     fidelity: dict[str, Any], config: RepairFidelityConfig
 ) -> bool:
-    if int(fidelity.get("sample_count", -1)) != config.sample_count:
-        return False
-    if not np.isclose(
-        float(fidelity.get("distance_threshold", np.nan)),
-        config.distance_threshold,
-    ):
+    if not repair_fidelity_cache_compatible(fidelity, config):
         return False
     return all(
         float(fidelity[direction]["p95"]) <= config.max_p95_distance
@@ -745,6 +785,7 @@ def process_model(
     repair_config: RepairConfig | None = None,
     use_repaired_surface: bool = False,
     fidelity_config: RepairFidelityConfig | None = None,
+    reuse_repair_fidelity: bool = False,
 ) -> tuple[Path | None, dict[str, Any]]:
     def log_phase(message: str) -> None:
         print(f"  phase: {message}")
@@ -867,22 +908,39 @@ def process_model(
         }
         if fidelity_config is not None:
             log_phase("repaired-mesh fidelity validation")
-            original_scene = make_raycast_scene(mesh)
-            scene = make_raycast_scene(sdf_mesh)
-            fidelity = repaired_mesh_fidelity(
-                original_mesh=mesh,
-                repaired_mesh=sdf_mesh,
-                original_scene=original_scene,
-                repaired_scene=scene,
-                config=fidelity_config,
-                batch_size=batch_size,
-                rng=rng,
+            fidelity_sidecar_path = repair_fidelity_output_path(proxy_path)
+            cached_fidelity = (
+                load_repair_fidelity(fidelity_sidecar_path)
+                if reuse_repair_fidelity and repair_result.used_cache
+                else None
             )
-            del original_scene
+            if (
+                cached_fidelity is not None
+                and repair_fidelity_cache_compatible(
+                    cached_fidelity, fidelity_config
+                )
+            ):
+                fidelity = apply_repair_fidelity_config(
+                    cached_fidelity, fidelity_config
+                )
+                print("  fidelity: reused cached validation")
+            else:
+                if reuse_repair_fidelity and repair_result.used_cache:
+                    print("  fidelity: cached validation missing or incompatible; recomputing")
+                original_scene = make_raycast_scene(mesh)
+                scene = make_raycast_scene(sdf_mesh)
+                fidelity = repaired_mesh_fidelity(
+                    original_mesh=mesh,
+                    repaired_mesh=sdf_mesh,
+                    original_scene=original_scene,
+                    repaired_scene=scene,
+                    config=fidelity_config,
+                    batch_size=batch_size,
+                    rng=rng,
+                )
+                del original_scene
+                save_repair_fidelity(fidelity_sidecar_path, fidelity)
             repair_info["fidelity"] = fidelity
-            save_repair_fidelity(
-                repair_fidelity_output_path(proxy_path), fidelity
-            )
             if not fidelity["accepted"]:
                 print(
                     "  filter: rejected repaired mesh "
@@ -1179,6 +1237,7 @@ def main() -> None:
                 repair_config=repair_config,
                 use_repaired_surface=use_repaired_surface,
                 fidelity_config=fidelity_config,
+                reuse_repair_fidelity=args.reuse_repair_fidelity,
             )
             try:
                 output_path = object_output_paths(

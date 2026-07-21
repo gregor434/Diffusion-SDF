@@ -253,6 +253,127 @@ class CODPreprocessingTests(unittest.TestCase):
             preprocessing.repair_fidelity_passes(fidelity, changed)
         )
 
+    def test_regeneration_reuses_compatible_repair_fidelity_sidecar(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / "sample.glb"
+            original = trimesh.creation.box()
+            original.export(source)
+            repaired = original.copy()
+            repaired_root = root / "repaired"
+            proxy = repaired_root / "abo" / "ABO" / "sample.obj"
+            preprocessing.save_repair_fidelity(
+                preprocessing.repair_fidelity_output_path(proxy),
+                self.accepted_fidelity(),
+            )
+            config = RepairConfig(
+                method=REPAIR_MANIFOLDPLUS,
+                manifoldplus_bin=root / "ManifoldPlus",
+                repaired_mesh_dir=repaired_root,
+            )
+            arrays = {
+                "surface_points": np.zeros((8, 3), np.float32),
+                "surface_normals": np.zeros((8, 3), np.float32),
+                "near_surface_query_points": np.zeros((16, 3), np.float32),
+                "near_surface_sdf": np.zeros(16, np.float32),
+                "uniform_query_points": np.zeros((8, 3), np.float32),
+                "uniform_sdf": np.zeros(8, np.float32),
+            }
+
+            with mock.patch(
+                "scripts.prepare_abo_dataset.repair_mesh_with_manifoldplus",
+                return_value=RepairResult(repaired, used_cache=True),
+            ), mock.patch(
+                "scripts.prepare_abo_dataset.repaired_mesh_fidelity"
+            ) as validate, mock.patch(
+                "scripts.prepare_abo_dataset.make_raycast_scene",
+                return_value=mock.Mock(),
+            ) as make_scene, mock.patch(
+                "scripts.prepare_abo_dataset.sample_cod_supervision",
+                return_value=arrays,
+            ):
+                output, info = preprocessing.process_model(
+                    mesh_path=source,
+                    datasets_root=root,
+                    dataset_key="abo",
+                    class_name="ABO",
+                    surface_point_count=8,
+                    near_surface_stds=(0.005, 0.0005),
+                    uniform_point_count=8,
+                    batch_size=8,
+                    rng=np.random.default_rng(0),
+                    skip_existing=False,
+                    repair_config=config,
+                    use_repaired_surface=True,
+                    fidelity_config=RepairFidelityConfig(sample_count=32),
+                    reuse_repair_fidelity=True,
+                )
+
+            self.assertIsNotNone(output)
+            validate.assert_not_called()
+            self.assertEqual(make_scene.call_count, 1)
+            self.assertTrue(info["fidelity"]["accepted"])
+
+    def test_new_repaired_proxy_is_always_validated(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / "sample.glb"
+            original = trimesh.creation.box()
+            original.export(source)
+            repaired = original.copy()
+            repaired_root = root / "repaired"
+            proxy = repaired_root / "abo" / "ABO" / "sample.obj"
+            preprocessing.save_repair_fidelity(
+                preprocessing.repair_fidelity_output_path(proxy),
+                self.accepted_fidelity(),
+            )
+            config = RepairConfig(
+                method=REPAIR_MANIFOLDPLUS,
+                manifoldplus_bin=root / "ManifoldPlus",
+                repaired_mesh_dir=repaired_root,
+                force_repair=True,
+            )
+            arrays = {
+                "surface_points": np.zeros((8, 3), np.float32),
+                "surface_normals": np.zeros((8, 3), np.float32),
+                "near_surface_query_points": np.zeros((16, 3), np.float32),
+                "near_surface_sdf": np.zeros(16, np.float32),
+                "uniform_query_points": np.zeros((8, 3), np.float32),
+                "uniform_sdf": np.zeros(8, np.float32),
+            }
+
+            with mock.patch(
+                "scripts.prepare_abo_dataset.repair_mesh_with_manifoldplus",
+                return_value=RepairResult(repaired, used_cache=False),
+            ), mock.patch(
+                "scripts.prepare_abo_dataset.repaired_mesh_fidelity",
+                return_value=self.accepted_fidelity(),
+            ) as validate, mock.patch(
+                "scripts.prepare_abo_dataset.make_raycast_scene",
+                return_value=mock.Mock(),
+            ), mock.patch(
+                "scripts.prepare_abo_dataset.sample_cod_supervision",
+                return_value=arrays,
+            ):
+                preprocessing.process_model(
+                    mesh_path=source,
+                    datasets_root=root,
+                    dataset_key="abo",
+                    class_name="ABO",
+                    surface_point_count=8,
+                    near_surface_stds=(0.005, 0.0005),
+                    uniform_point_count=8,
+                    batch_size=8,
+                    rng=np.random.default_rng(0),
+                    skip_existing=False,
+                    repair_config=config,
+                    use_repaired_surface=True,
+                    fidelity_config=RepairFidelityConfig(sample_count=32),
+                    reuse_repair_fidelity=True,
+                )
+
+            validate.assert_called_once()
+
     @unittest.skipIf(preprocessing.o3d is None, "Open3D runtime unavailable")
     def test_repaired_mesh_fidelity_accepts_matching_mesh_and_rejects_drift(self):
         original = trimesh.creation.box(extents=(1.0, 1.0, 1.0))

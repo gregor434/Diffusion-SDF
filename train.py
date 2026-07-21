@@ -24,7 +24,7 @@ from diff_utils.helpers import save_code_to_conf
 #from metrics import evaluation_metrics
 
 from dataloader.sdf_loader import SdfLoader
-from dataloader.modulation_loader import ModulationLoader
+from dataloader.modulation_loader import ModulationLoader, ensure_modulation_cache
 from dataloader.conditioning import build_conditioning_sources
 from dataloader.virtual_dataset import VirtualDataset
 
@@ -39,6 +39,14 @@ def train():
 
     use_spawn_workers = False
     if specs['training_task'] == 'diffusion':
+        cache_path, stats_path = ensure_modulation_cache(
+            specs,
+            args.exp_dir,
+            batch_size=specs.get("modulation_batch_size", min(args.batch_size, 8)),
+            workers=specs.get("modulation_workers", args.workers),
+        )
+        specs["data_path"] = cache_path
+        specs["latent_stats_path"] = stats_path
         conditioning_sources = build_conditioning_sources(get_conditioning_specs(specs))
         train_records = ModulationLoader.build_records(specs["data_path"], split, conditioning_sources)
         val_records = (
