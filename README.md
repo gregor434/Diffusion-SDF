@@ -170,9 +170,16 @@ Extract native, unflattened modulations with the existing command:
 
     python test.py -e config/cod/stage1_decoder_finetune -r last
 
+By default extraction uses `ModulationSplit` when configured so it can populate
+the downstream modulation cache. To evaluate only the configured `TestSplit`,
+without extracting the full union, use:
+
+    python test.py -e config/cod/stage1_decoder_finetune -r last --test-split-only
+
 Each modulation.npz stores object_id, posterior_mean [M,D], and
-posterior_logvar [M,D]. Extraction uses the posterior mean and writes
-per-channel training statistics to modulations/latent_stats.npz.
+posterior_logvar [M,D]. Default full extraction uses the posterior mean to
+write per-channel training statistics to modulations/latent_stats.npz; the
+test-split-only mode does not recompute training statistics.
 
 ## Stage two: COD token diffusion
 

@@ -19,6 +19,7 @@ from tqdm.auto import tqdm
 from dataloader.modulation_loader import (
     ModulationLoader,
     compute_latent_statistics,
+    extraction_split_name,
     save_latent_statistics,
 )
 from dataloader.sdf_loader import SdfLoader
@@ -88,7 +89,8 @@ def save_modulation(path, object_id, posterior, conditioning=None):
 
 @torch.no_grad()
 def extract_modulations(specs, args, recon_dir, latent_dir, device):
-    split_name = "ModulationSplit" if specs.get("ModulationSplit") else "TestSplit"
+    test_split_only = getattr(args, "test_split_only", False)
+    split_name = extraction_split_name(specs, test_split_only)
     dataset = make_sdf_dataset(specs, split_name=split_name)
     loader = torch.utils.data.DataLoader(dataset, batch_size=1, num_workers=0)
     model = CombinedModel.load_from_checkpoint(
@@ -187,6 +189,8 @@ def extract_modulations(specs, args, recon_dir, latent_dir, device):
 
     if not records:
         raise RuntimeError("no modulations were saved")
+    if test_split_only:
+        return
     train_split = json.loads(Path(specs["TrainSplit"]).read_text())
     train_records = ModulationLoader.build_records(latent_dir, train_split)
     if not train_records:
@@ -320,6 +324,15 @@ def parse_args():
     parser.add_argument("--recon_resolution", default=256, type=int)
     parser.add_argument("--max_batch", default=2**18, type=int)
     parser.add_argument("--modulation_filter_threshold", default=None, type=float)
+    parser.add_argument(
+        "--test-split-only",
+        "--test_split_only",
+        action="store_true",
+        help=(
+            "extract/evaluate only objects from TestSplit, even when a larger "
+            "ModulationSplit is configured"
+        ),
+    )
     return parser.parse_args()
 
 

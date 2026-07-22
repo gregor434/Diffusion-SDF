@@ -49,6 +49,13 @@ def configured_splits(specs):
     }
 
 
+def extraction_split_name(specs, test_split_only=False):
+    """Select the stage-one extraction manifest."""
+    if test_split_only:
+        return "TestSplit"
+    return "ModulationSplit" if specs.get("ModulationSplit") else "TestSplit"
+
+
 def _split_records(split, cache_path=None):
     records = []
     for dataset, classes in split.items():
