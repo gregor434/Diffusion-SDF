@@ -48,7 +48,13 @@ def train():
         specs["data_path"] = cache_path
         specs["latent_stats_path"] = stats_path
         conditioning_sources = build_conditioning_sources(get_conditioning_specs(specs))
-        train_records = ModulationLoader.build_records(specs["data_path"], split, conditioning_sources)
+        modulation_variants = max(1, int(specs.get("modulation_variants", 1)))
+        train_records = ModulationLoader.build_records(
+            specs["data_path"],
+            split,
+            conditioning_sources,
+            modulation_variants=modulation_variants,
+        )
         val_records = (
             ModulationLoader.build_records(specs["data_path"], val_split, conditioning_sources)
             if val_split is not None
@@ -60,6 +66,9 @@ def train():
             split,
             conditioning_sources=conditioning_sources,
             records=train_records,
+            sample_posterior_latents=bool(
+                specs.get("sample_posterior_latents", False)
+            ),
         )
         val_dataset = (
             build_dataset(
@@ -185,7 +194,12 @@ def build_dataloader(dataset, drop_last, shuffle, use_spawn_workers=False):
     return torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
 
 
-def build_dataset(split, conditioning_sources=None, records=None):
+def build_dataset(
+    split,
+    conditioning_sources=None,
+    records=None,
+    sample_posterior_latents=False,
+):
     if specs['training_task'] == 'diffusion':
         return ModulationLoader(
             specs["data_path"],
@@ -194,6 +208,7 @@ def build_dataset(split, conditioning_sources=None, records=None):
             conditioning_sources=conditioning_sources,
             records=records,
             latent_stats_path=specs.get("latent_stats_path"),
+            sample_posterior=sample_posterior_latents,
         )
 
     return SdfLoader(

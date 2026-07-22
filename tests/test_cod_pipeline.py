@@ -63,6 +63,52 @@ class CODPipelineTests(unittest.TestCase):
         self.assertEqual(output["sdf"].shape, torch.Size([2, 5]))
         self.assertEqual(output["posterior"].mean.shape, torch.Size([2, 2, 3]))
 
+    def test_stage_two_validation_noise_and_cosine_schedule(self):
+        specs = {
+            "training_task": "diffusion",
+            "diffusion_specs": {
+                "sigma_data": 1.0,
+                "P_mean": -1.2,
+                "P_std": 1.2,
+                "sampling_steps": 2,
+            },
+            "diffusion_model_specs": {
+                "latent_tokens": 2,
+                "latent_dimension": 3,
+                "width": 16,
+                "depth": 1,
+                "heads": 4,
+                "cond": False,
+            },
+            "learning_rates": {"diffusion": 2e-5},
+            "lr_scheduler": {
+                "type": "cosine",
+                "min_lr": 1e-6,
+                "epochs": 10,
+            },
+            "validation_noise_seed": 17,
+            "num_epochs": 10,
+        }
+        model = CombinedModel(specs)
+        clean = torch.randn(3, 2, 3)
+        first_noise, first_sigma = model.deterministic_validation_noise(clean, 2)
+        second_noise, second_sigma = model.deterministic_validation_noise(clean, 2)
+        other_noise, other_sigma = model.deterministic_validation_noise(clean, 3)
+        torch.testing.assert_close(first_noise, second_noise, rtol=0, atol=0)
+        torch.testing.assert_close(first_sigma, second_sigma, rtol=0, atol=0)
+        self.assertFalse(torch.equal(first_noise, other_noise))
+        self.assertFalse(torch.equal(first_sigma, other_sigma))
+
+        configured = model.configure_optimizers()
+        optimizer = configured["optimizer"]
+        scheduler = configured["lr_scheduler"]["scheduler"]
+        self.assertEqual(configured["lr_scheduler"]["interval"], "epoch")
+        self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 2e-5)
+        for _ in range(10):
+            optimizer.step()
+            scheduler.step()
+        self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 1e-6)
+
     def test_official_solver_checkpoint_prefix_loads_strictly(self):
         specs = tiny_specs()
         specs["CODVaeSpecs"]["decoder_params"]["num_merged_tokens"] = 2

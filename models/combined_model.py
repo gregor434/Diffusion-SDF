@@ -292,11 +292,28 @@ class CombinedModel(pl.LightningModule):
             "active_dimensions": active_dimensions,
         }
 
-    def stage2_losses(self, batch):
+    def stage2_losses(self, batch, noise=None, sigma=None):
         loss, clean_estimate, _, _ = self.diffusion_model.training_loss(
-            batch["latent"], self._conditioning(batch)
+            batch["latent"], self._conditioning(batch), noise=noise, sigma=sigma
         )
         return {"loss": loss, "diffusion": loss, "clean_latent": clean_estimate}
+
+    def deterministic_validation_noise(self, clean, batch_idx):
+        seed = int(self.specs.get("validation_noise_seed", 0)) + int(batch_idx)
+        generator = torch.Generator(device=clean.device).manual_seed(seed)
+        rnd = torch.randn(
+            clean.shape[0], device=clean.device, generator=generator
+        )
+        sigma = (
+            rnd * self.diffusion_model.p_std + self.diffusion_model.p_mean
+        ).exp()
+        noise = torch.randn(
+            clean.shape,
+            dtype=clean.dtype,
+            device=clean.device,
+            generator=generator,
+        )
+        return noise, sigma
 
     def stage3_losses(self, batch):
         direct = self.sdf_model(
@@ -358,7 +375,13 @@ class CombinedModel(pl.LightningModule):
         return losses["loss"]
 
     def validation_step(self, batch, batch_idx):
-        losses = self._losses(batch)
+        if self.task == "diffusion":
+            noise, sigma = self.deterministic_validation_noise(
+                batch["latent"], batch_idx
+            )
+            losses = self.stage2_losses(batch, noise=noise, sigma=sigma)
+        else:
+            losses = self._losses(batch)
         batch_size = (
             batch["latent"].shape[0]
             if self.task == "diffusion"
@@ -408,6 +431,28 @@ class CombinedModel(pl.LightningModule):
             add_group("diffusion", self.diffusion_model, self.specs.get("diff_lr", 1e-5))
         if not groups:
             raise ValueError("the selected training mode has no trainable parameters")
-        return torch.optim.AdamW(
+        optimizer = torch.optim.AdamW(
             groups, weight_decay=float(self.specs.get("weight_decay", 0.0))
         )
+        scheduler_specs = self.specs.get("lr_scheduler")
+        if not scheduler_specs:
+            return optimizer
+        scheduler_type = scheduler_specs.get("type", "cosine")
+        if scheduler_type != "cosine":
+            raise ValueError(f"unknown lr_scheduler type: {scheduler_type}")
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(
+                1,
+                int(scheduler_specs.get("epochs", self.specs["num_epochs"])),
+            ),
+            eta_min=float(scheduler_specs.get("min_lr", 0.0)),
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",
+                "frequency": 1,
+            },
+        }

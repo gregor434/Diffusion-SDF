@@ -202,6 +202,27 @@ and second-order Heun sampling referenced by COD-VAE through VecSet.
 Sampling denormalizes tokens, loads the stage-one SDF/COD checkpoint, decodes
 tri-planes, queries the SDF head, and runs marching cubes.
 
+For the small ABO-chair dataset, use the compact augmented profile as a fresh
+run (its 192x4 denoiser is not resume-compatible with the older 256x6
+checkpoints):
+
+    python train.py -e config/cod/stage2_transformer_diffusion_small -b 32 -w 8
+
+This profile caches four independently surface-sampled encodings per training
+object, samples from their stored posteriors during training, uses canonical
+posterior means plus fixed EDM noise for repeatable validation, and applies
+epoch-wise cosine learning-rate decay from 2e-5 to 1e-6 over 200 epochs
+(about 8200 optimizer steps at batch size 32).
+Validation and test objects retain one canonical modulation each.
+
+The equivalent fresh image-conditioned run is:
+
+    python train.py -e config/cod/stage2_transformer_image_diffusion_small -b 32 -w 8
+
+It uses the same latent augmentation and cosine schedule while retaining the
+ViT-B/32 CLIP image-conditioning path. Its checkpoints are separate from and
+not resume-compatible with `stage2_transformer_image_diffusion`.
+
 ## Stage three: joint fine-tuning
 
     python train.py -e config/cod/stage3_full_joint -b 8 -w 8 -r finetune

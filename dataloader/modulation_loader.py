@@ -56,21 +56,33 @@ def extraction_split_name(specs, test_split_only=False):
     return "ModulationSplit" if specs.get("ModulationSplit") else "TestSplit"
 
 
-def _split_records(split, cache_path=None):
+def _modulation_filename(variant_index, base_name="modulation.npz"):
+    if variant_index == 0:
+        return base_name
+    base = Path(base_name)
+    return f"{base.stem}_{variant_index:03d}{base.suffix}"
+
+
+def _split_records(split, cache_path=None, modulation_variants=1):
     records = []
     for dataset, classes in split.items():
         for class_name, object_ids in classes.items():
             for object_id in object_ids:
-                record = {
-                    "dataset": dataset,
-                    "class_name": class_name,
-                    "instance_name": object_id,
-                }
-                if cache_path is not None:
-                    record["latent_path"] = str(
-                        Path(cache_path) / class_name / object_id / "modulation.npz"
-                    )
-                records.append(record)
+                for variant_index in range(max(1, int(modulation_variants))):
+                    record = {
+                        "dataset": dataset,
+                        "class_name": class_name,
+                        "instance_name": object_id,
+                        "variant_index": variant_index,
+                    }
+                    if cache_path is not None:
+                        record["latent_path"] = str(
+                            Path(cache_path)
+                            / class_name
+                            / object_id
+                            / _modulation_filename(variant_index)
+                        )
+                    records.append(record)
     return records
 
 
@@ -119,6 +131,7 @@ class SurfacePointLoader(Dataset):
             "dataset": record["dataset"],
             "class_name": record["class_name"],
             "object_id": record["instance_name"],
+            "latent_path": record["latent_path"],
         }
 
 
@@ -196,7 +209,18 @@ def ensure_modulation_cache(
     all_split = merge_splits(splits.values())
     cache_path = Path(exp_dir) / "modulations"
     cache_path.mkdir(parents=True, exist_ok=True)
-    expected = _split_records(all_split, cache_path)
+    modulation_variants = max(1, int(specs.get("modulation_variants", 1)))
+    # Validation/test objects need only the canonical variant. Training objects
+    # receive additional independently surface-sampled encodings.
+    expected_by_path = {
+        record["latent_path"]: record
+        for record in _split_records(all_split, cache_path)
+    }
+    for record in _split_records(
+        splits["TrainSplit"], cache_path, modulation_variants
+    ):
+        expected_by_path.setdefault(record["latent_path"], record)
+    expected = list(expected_by_path.values())
     missing = [record for record in expected if not Path(record["latent_path"]).is_file()]
 
     if missing:
@@ -248,12 +272,7 @@ def ensure_modulation_cache(
                 means = posterior.mean.detach().cpu().numpy()
                 logvars = posterior.logvar.detach().cpu().numpy()
                 for index, object_id in enumerate(batch["object_id"]):
-                    path = (
-                        cache_path
-                        / batch["class_name"][index]
-                        / object_id
-                        / "modulation.npz"
-                    )
+                    path = batch["latent_path"][index]
                     _save_modulation(path, object_id, means[index], logvars[index])
                 del surface_batch, latent, posterior, encoded
                 surface_batch = latent = posterior = encoded = None
@@ -276,29 +295,50 @@ def ensure_modulation_cache(
             + ", ".join(incomplete[:5])
         )
 
-    train_records = ModulationLoader.build_records(cache_path, splits["TrainSplit"])
-    expected_train = _split_records(splits["TrainSplit"])
+    train_records = ModulationLoader.build_records(
+        cache_path,
+        splits["TrainSplit"],
+        modulation_variants=modulation_variants,
+    )
+    expected_train = _split_records(
+        splits["TrainSplit"], modulation_variants=modulation_variants
+    )
     if len(train_records) != len(expected_train):
         raise RuntimeError(
             f"expected {len(expected_train)} training modulations, found {len(train_records)}"
         )
-    mean, std = compute_latent_statistics(train_records)
+    mean, std = compute_latent_statistics(
+        train_records,
+        include_posterior_variance=bool(
+            specs.get("sample_posterior_latents", False)
+        ),
+    )
     stats_path = cache_path / "latent_stats.npz"
     save_latent_statistics(stats_path, mean, std)
     return str(cache_path), str(stats_path)
 
 
-def compute_latent_statistics(records):
+def compute_latent_statistics(records, include_posterior_variance=False):
     count = 0
     total = None
     total_square = None
     for record in records:
         with np.load(record["latent_path"]) as data:
             latent = np.asarray(data["posterior_mean"], dtype=np.float64)
+            posterior_variance = (
+                np.exp(np.asarray(data["posterior_logvar"], dtype=np.float64))
+                if include_posterior_variance
+                else None
+            )
         flattened = latent.reshape(-1, latent.shape[-1])
         count += flattened.shape[0]
         value_sum = flattened.sum(axis=0)
-        square_sum = np.square(flattened).sum(axis=0)
+        square_values = np.square(flattened)
+        if posterior_variance is not None:
+            square_values += posterior_variance.reshape(
+                -1, posterior_variance.shape[-1]
+            )
+        square_sum = square_values.sum(axis=0)
         total = value_sum if total is None else total + value_sum
         total_square = square_sum if total_square is None else total_square + square_sum
     if count == 0:
@@ -327,6 +367,7 @@ class ModulationLoader(Dataset):
         records=None,
         latent_stats_path=None,
         normalize=True,
+        sample_posterior=False,
     ):
         super().__init__()
         self.conditioning_sources = (
@@ -339,13 +380,17 @@ class ModulationLoader(Dataset):
         )
         self.validate_required_conditioning_cache()
         self.normalize = bool(normalize)
+        self.sample_posterior = bool(sample_posterior)
 
         stats_path = Path(latent_stats_path or Path(data_path) / "latent_stats.npz")
         if stats_path.is_file():
             with np.load(stats_path) as data:
                 mean, std = data["mean"], data["std"]
         else:
-            mean, std = compute_latent_statistics(self.records)
+            mean, std = compute_latent_statistics(
+                self.records,
+                include_posterior_variance=self.sample_posterior,
+            )
             save_latent_statistics(stats_path, mean, std)
         self.mean = torch.from_numpy(np.asarray(mean, dtype=np.float32))
         self.std = torch.from_numpy(np.asarray(std, dtype=np.float32)).clamp_min(1e-6)
@@ -369,6 +414,13 @@ class ModulationLoader(Dataset):
                 if "posterior_logvar" in data
                 else None
             )
+        if self.sample_posterior:
+            if logvar is None:
+                raise ValueError(
+                    f"posterior sampling requested but logvar is missing: "
+                    f"{record['latent_path']}"
+                )
+            latent = latent + torch.exp(0.5 * logvar) * torch.randn_like(latent)
         if self.normalize:
             latent = (latent - self.mean.squeeze(0)) / self.std.squeeze(0)
         conditioning = {
@@ -390,23 +442,36 @@ class ModulationLoader(Dataset):
         return item
 
     @staticmethod
-    def build_records(data_source, split, conditioning_sources=None, f_name="modulation.npz"):
+    def build_records(
+        data_source,
+        split,
+        conditioning_sources=None,
+        f_name="modulation.npz",
+        modulation_variants=1,
+    ):
         conditioning_sources = conditioning_sources or []
         records = []
         for dataset, classes in split.items():
             for class_name, instance_names in classes.items():
                 for instance_name in instance_names:
-                    path = Path(data_source) / class_name / instance_name / f_name
-                    if not path.is_file():
-                        continue
-                    record = {
-                        "dataset": dataset,
-                        "class_name": class_name,
-                        "instance_name": instance_name,
-                        "latent_path": str(path),
-                    }
-                    if all(source.exists(record) for source in conditioning_sources):
-                        records.append(record)
+                    for variant_index in range(max(1, int(modulation_variants))):
+                        path = (
+                            Path(data_source)
+                            / class_name
+                            / instance_name
+                            / _modulation_filename(variant_index, f_name)
+                        )
+                        if not path.is_file():
+                            continue
+                        record = {
+                            "dataset": dataset,
+                            "class_name": class_name,
+                            "instance_name": instance_name,
+                            "variant_index": variant_index,
+                            "latent_path": str(path),
+                        }
+                        if all(source.exists(record) for source in conditioning_sources):
+                            records.append(record)
         return records
 
     def validate_required_conditioning_cache(self):

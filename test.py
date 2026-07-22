@@ -29,11 +29,12 @@ from utils.reconstruct import filter_threshold
 
 
 def checkpoint_path(exp_dir, resume):
-    name = (
-        f"{resume}.ckpt"
-        if resume in {"last", "best"}
-        else f"epoch={resume}.ckpt"
-    )
+    if resume.endswith(".ckpt"):
+        name = resume
+    elif resume in {"last", "best"} or resume.startswith(("last-", "best-")):
+        name = f"{resume}.ckpt"
+    else:
+        name = f"epoch={resume}.ckpt"
     return str(Path(exp_dir) / name)
 
 
@@ -47,6 +48,39 @@ def load_prefixed(module, path, prefix):
     if not state:
         raise RuntimeError(f"no parameters with prefix '{prefix}' in {path}")
     module.load_state_dict(state)
+
+
+def load_diffusion_checkpoint(model, path):
+    """Restore diffusion weights and their matching latent normalization."""
+    checkpoint = torch.load(path, map_location="cpu")
+    state_dict = checkpoint["state_dict"]
+    diffusion_state = {
+        key[len("diffusion_model."):]: value
+        for key, value in state_dict.items()
+        if key.startswith("diffusion_model.")
+    }
+    if not diffusion_state:
+        raise RuntimeError(f"no parameters with prefix 'diffusion_model.' in {path}")
+    model.diffusion_model.load_state_dict(diffusion_state)
+
+    missing_statistics = [
+        name for name in ("latent_mean", "latent_std") if name not in state_dict
+    ]
+    if missing_statistics:
+        raise RuntimeError(
+            f"stage-two checkpoint {path} is missing latent statistics: "
+            + ", ".join(missing_statistics)
+        )
+    with torch.no_grad():
+        for name in ("latent_mean", "latent_std"):
+            destination = getattr(model, name)
+            source = state_dict[name]
+            if destination.shape != source.shape:
+                raise RuntimeError(
+                    f"{name} shape mismatch in {path}: expected "
+                    f"{tuple(destination.shape)}, found {tuple(source.shape)}"
+                )
+            destination.copy_(source.to(destination))
 
 
 def make_sdf_dataset(specs, split_name="TestSplit", condition_surface=False):
@@ -215,7 +249,7 @@ def load_generation_models(specs, args, device):
         if args.resume == "finetune"
         else checkpoint_path(args.exp_dir, args.resume)
     )
-    load_prefixed(model.diffusion_model, diffusion_path, "diffusion_model.")
+    load_diffusion_checkpoint(model, diffusion_path)
     modulation_checkpoint = torch.load(
         specs["modulation_ckpt_path"], map_location="cpu"
     )

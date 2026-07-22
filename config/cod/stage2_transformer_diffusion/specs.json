@@ -3,7 +3,7 @@
   "TrainSplit": "datasets/splits/abo_fullchairs_CHAIR_train.json",
   "ValSplit": "datasets/splits/abo_fullchairs_CHAIR_val.json",
   "TestSplit": "datasets/splits/abo_fullchairs_CHAIR_val.json",
-  "modulation_ckpt_path": "config/cod/stage1_decoder_finetune/last.ckpt",
+  "modulation_ckpt_path": "config/cod/stage1_decoder_l1_finetune/last.ckpt",
   "training_task": "diffusion",
   "CODVaeSpecs": {
     "checkpoint_path": "tmp/cod_vae_m32_weights.pt",

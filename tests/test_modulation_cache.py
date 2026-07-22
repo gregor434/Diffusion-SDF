@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 from dataloader.modulation_loader import (
+    ModulationLoader,
     compute_latent_statistics,
     ensure_modulation_cache,
 )
@@ -90,6 +91,8 @@ class ModulationCacheTests(unittest.TestCase):
             specs = {
                 **split_paths,
                 "modulation_ckpt_path": str(checkpoint_path),
+                "modulation_variants": 3,
+                "sample_posterior_latents": True,
             }
             cache_path, stats_path = ensure_modulation_cache(
                 specs, exp_dir, batch_size=2, workers=0, device=torch.device("cpu")
@@ -101,14 +104,48 @@ class ModulationCacheTests(unittest.TestCase):
                 self.assertTrue(
                     (cache_path / "ABO" / object_id / "modulation.npz").is_file()
                 )
+            for variant_index in (1, 2):
+                self.assertTrue(
+                    (
+                        cache_path
+                        / "ABO"
+                        / "train"
+                        / f"modulation_{variant_index:03d}.npz"
+                    ).is_file()
+                )
+                self.assertFalse(
+                    (
+                        cache_path
+                        / "ABO"
+                        / "val"
+                        / f"modulation_{variant_index:03d}.npz"
+                    ).exists()
+                )
 
-            train_records = [{
-                "latent_path": str(cache_path / "ABO" / "train" / "modulation.npz")
-            }]
-            expected_mean, expected_std = compute_latent_statistics(train_records)
+            train_records = ModulationLoader.build_records(
+                cache_path,
+                {"abo": {"ABO": ["train"]}},
+                modulation_variants=3,
+            )
+            self.assertEqual(len(train_records), 3)
+            expected_mean, expected_std = compute_latent_statistics(
+                train_records, include_posterior_variance=True
+            )
             with np.load(stats_path) as statistics:
                 np.testing.assert_allclose(statistics["mean"], expected_mean)
                 np.testing.assert_allclose(statistics["std"], expected_std)
+
+            dataset = ModulationLoader(
+                cache_path,
+                records=train_records,
+                latent_stats_path=stats_path,
+                sample_posterior=True,
+            )
+            torch.manual_seed(0)
+            first = dataset[0]["latent"]
+            torch.manual_seed(1)
+            second = dataset[0]["latent"]
+            self.assertFalse(torch.equal(first, second))
 
             # A complete cache must not reload stage one on subsequent starts.
             checkpoint_path.unlink()

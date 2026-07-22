@@ -4,7 +4,6 @@
   "ValSplit": "datasets/splits/abo_fullchairs_CHAIR_val.json",
   "TestSplit": "datasets/splits/abo_fullchairs_CHAIR_val.json",
   "data_path": "config/cod/stage1_decoder_finetune/modulations",
-  "latent_stats_path": "config/cod/stage1_decoder_finetune/modulations/latent_stats.npz",
   "modulation_ckpt_path": "config/cod/stage1_decoder_finetune/last.ckpt",
   "conditioning": {
     "type": "image",

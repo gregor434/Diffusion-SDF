@@ -1,3 +1,5 @@
+import importlib.util
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,7 +8,18 @@ from unittest.mock import patch
 import torch
 from PIL import Image
 
-import test
+
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+_TEST_MODULE_SPEC = importlib.util.spec_from_file_location(
+    "diffusion_sdf_test_entrypoint",
+    _REPOSITORY_ROOT / "test.py",
+)
+test = importlib.util.module_from_spec(_TEST_MODULE_SPEC)
+sys.path.insert(0, str(_REPOSITORY_ROOT))
+try:
+    _TEST_MODULE_SPEC.loader.exec_module(test)
+finally:
+    sys.path.pop(0)
 
 
 class _GenerationDataset(torch.utils.data.Dataset):
@@ -50,11 +63,62 @@ class _SdfModel:
         return {"planes": torch.zeros(len(latent), 1)}
 
 
+class _CheckpointModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.diffusion_model = torch.nn.Linear(2, 2)
+        self.register_buffer("latent_mean", torch.zeros(1, 1, 2))
+        self.register_buffer("latent_std", torch.ones(1, 1, 2))
+
+
 class ImageConditionedGenerationTests(unittest.TestCase):
     def test_named_and_epoch_checkpoint_paths(self):
         self.assertEqual(test.checkpoint_path("experiment", "last"), "experiment/last.ckpt")
         self.assertEqual(test.checkpoint_path("experiment", "best"), "experiment/best.ckpt")
+        self.assertEqual(
+            test.checkpoint_path("experiment", "best-v2"),
+            "experiment/best-v2.ckpt",
+        )
+        self.assertEqual(
+            test.checkpoint_path("experiment", "best-v2.ckpt"),
+            "experiment/best-v2.ckpt",
+        )
         self.assertEqual(test.checkpoint_path("experiment", "99"), "experiment/epoch=99.ckpt")
+        self.assertEqual(
+            test.checkpoint_path("experiment", "1499-v1"),
+            "experiment/epoch=1499-v1.ckpt",
+        )
+
+    def test_diffusion_checkpoint_restores_embedded_latent_statistics(self):
+        model = _CheckpointModel()
+        expected_mean = torch.tensor([[[-0.5, 0.25]]])
+        expected_std = torch.tensor([[[0.8, 1.2]]])
+        checkpoint = {
+            "state_dict": {
+                "diffusion_model.weight": torch.full_like(
+                    model.diffusion_model.weight, 2.0
+                ),
+                "diffusion_model.bias": torch.full_like(
+                    model.diffusion_model.bias, 3.0
+                ),
+                "latent_mean": expected_mean,
+                "latent_std": expected_std,
+            }
+        }
+
+        with patch.object(test.torch, "load", return_value=checkpoint):
+            test.load_diffusion_checkpoint(model, "stage2.ckpt")
+
+        torch.testing.assert_close(model.latent_mean, expected_mean)
+        torch.testing.assert_close(model.latent_std, expected_std)
+        torch.testing.assert_close(
+            model.diffusion_model.weight,
+            torch.full_like(model.diffusion_model.weight, 2.0),
+        )
+        torch.testing.assert_close(
+            model.diffusion_model.bias,
+            torch.full_like(model.diffusion_model.bias, 3.0),
+        )
 
     def test_generation_passes_image_features_to_diffusion(self):
         model = _Model()
@@ -70,10 +134,14 @@ class ImageConditionedGenerationTests(unittest.TestCase):
             Image.new("RGB", (8, 8), color=(10, 20, 30)).save(
                 _GenerationDataset.image_path
             )
-            with patch("test.load_generation_models", return_value=(model, _SdfModel())):
-                with patch("test.make_generation_dataset", return_value=_GenerationDataset()):
-                    with patch("test.mesh.create_mesh") as create_mesh:
-                        with patch("test.evaluate.mesh_validity", return_value=1.0):
+            with patch.object(
+                test, "load_generation_models", return_value=(model, _SdfModel())
+            ):
+                with patch.object(
+                    test, "make_generation_dataset", return_value=_GenerationDataset()
+                ):
+                    with patch.object(test.mesh, "create_mesh") as create_mesh:
+                        with patch.object(test.evaluate, "mesh_validity", return_value=1.0):
                             test.generate(
                                 specs, args, Path(tmpdir), torch.device("cpu")
                             )
