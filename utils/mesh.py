@@ -111,6 +111,23 @@ def convert_sdf_samples_to_ply(
 
     numpy_3d_sdf_tensor = pytorch_3d_sdf_tensor.numpy()
 
+    # Marching cubes cannot close a zero level set that exits the sampled
+    # volume. Add one known-outside voxel around the model's [-1, 1] query
+    # domain so boundary-crossing surfaces close without querying the model
+    # outside its training domain.
+    outside_value = float(level_set) + max(
+        abs(float(voxel_size)), float(np.finfo(numpy_3d_sdf_tensor.dtype).eps)
+    )
+    numpy_3d_sdf_tensor = np.pad(
+        numpy_3d_sdf_tensor,
+        pad_width=1,
+        mode="constant",
+        constant_values=outside_value,
+    )
+    marching_cubes_origin = (
+        np.asarray(voxel_grid_origin, dtype=np.float64) - float(voxel_size)
+    )
+
     # use marching_cubes_lewiner or marching_cubes depending on pytorch version 
     try:
         verts, faces, normals, values = skimage.measure.marching_cubes(
@@ -123,9 +140,9 @@ def convert_sdf_samples_to_ply(
     # transform from voxel coordinates to camera coordinates
     # note x and y are flipped in the output of marching_cubes
     mesh_points = np.zeros_like(verts)
-    mesh_points[:, 0] = voxel_grid_origin[0] + verts[:, 0]
-    mesh_points[:, 1] = voxel_grid_origin[1] + verts[:, 1]
-    mesh_points[:, 2] = voxel_grid_origin[2] + verts[:, 2]
+    mesh_points[:, 0] = marching_cubes_origin[0] + verts[:, 0]
+    mesh_points[:, 1] = marching_cubes_origin[1] + verts[:, 1]
+    mesh_points[:, 2] = marching_cubes_origin[2] + verts[:, 2]
 
     num_verts = verts.shape[0]
     num_faces = faces.shape[0]
@@ -145,4 +162,3 @@ def convert_sdf_samples_to_ply(
 
     ply_data = plyfile.PlyData([el_verts, el_faces])
     ply_data.write(ply_filename_out)
-
