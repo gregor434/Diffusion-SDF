@@ -147,6 +147,23 @@ class ModulationCacheTests(unittest.TestCase):
             second = dataset[0]["latent"]
             self.assertFalse(torch.equal(first, second))
 
+            # A continuation experiment can reuse this exact cache instead of
+            # silently creating a new set of randomly sampled modulations.
+            continuation_specs = {
+                **specs,
+                "modulation_cache_path": str(cache_path),
+            }
+            continuation_cache, continuation_stats = ensure_modulation_cache(
+                continuation_specs,
+                root / "stage2_continuation",
+                batch_size=2,
+                workers=0,
+                device=torch.device("cpu"),
+            )
+            self.assertEqual(Path(continuation_cache), cache_path)
+            self.assertEqual(Path(continuation_stats), Path(stats_path))
+            self.assertFalse((root / "stage2_continuation" / "modulations").exists())
+
             # A complete cache must not reload stage one on subsequent starts.
             checkpoint_path.unlink()
             ensure_modulation_cache(

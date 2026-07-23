@@ -43,6 +43,37 @@ class WeightsOnlyInitializationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "state_dict"):
                 load_weights_only(nn.Linear(1, 1), checkpoint_path)
 
+    def test_only_explicit_new_parameters_may_be_missing(self):
+        class Source(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.base = nn.Linear(3, 2)
+
+        class Target(Source):
+            def __init__(self):
+                super().__init__()
+                self.refiner = nn.Linear(2, 2)
+
+        source = Source()
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint_path = Path(directory) / "source.ckpt"
+            torch.save({"state_dict": source.state_dict()}, checkpoint_path)
+            target = Target()
+            load_weights_only(
+                target,
+                checkpoint_path,
+                allowed_missing_prefixes=("refiner.",),
+            )
+            torch.testing.assert_close(target.base.weight, source.base.weight)
+            torch.testing.assert_close(target.base.bias, source.base.bias)
+
+            with self.assertRaisesRegex(RuntimeError, "checkpoint mismatch"):
+                load_weights_only(
+                    Target(),
+                    checkpoint_path,
+                    allowed_missing_prefixes=("unrelated.",),
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

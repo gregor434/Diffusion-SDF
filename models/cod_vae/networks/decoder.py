@@ -77,6 +77,11 @@ class CompactTriplaneDecoder(nn.Module):
                 conv_activation,
                 conv_layer(query_dim, query_dim),
             )
+            # The refinement branch is residual.  Starting its final projection
+            # at zero preserves the pretrained tri-planes exactly while still
+            # allowing the branch to learn local, cross-patch corrections.
+            nn.init.zeros_(self.conv_refine[-1].weight)
+            nn.init.zeros_(self.conv_refine[-1].bias)
 
         ## parameters
         self.mask_token = nn.Parameter(torch.empty(1, embed_dim))

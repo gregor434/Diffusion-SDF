@@ -14,6 +14,7 @@ from models.sdf_model import SdfModel
 
 STAGE1_COMPONENTS = {
     "sdf_head_only": {"sdf_network"},
+    "triplane_sdf_finetune": {"triplane_decoder", "sdf_network"},
     "cod_decoder_finetune": {"latent_decoder", "triplane_decoder", "sdf_network"},
     "full_cod_finetune": {
         "point_encoder", "variational_block", "latent_decoder",
@@ -48,6 +49,12 @@ def validate_training_specs(specs):
         active = set(STAGE3_COMPONENTS.get(mode, ())) | {"diffusion"}
     else:
         return
+    decoder_specs = specs.get("CODVaeSpecs", {}).get("decoder_params", {})
+    if (
+        "triplane_decoder" in active
+        and bool(decoder_specs.get("use_conv_refine", False))
+    ):
+        active.add("conv_refine")
     unused_rates = set(specs.get("learning_rates", {})).difference(active)
     if unused_rates:
         raise ValueError(
@@ -213,10 +220,18 @@ class CombinedModel(pl.LightningModule):
         weights = self.specs.get("loss_weights", {})
         needs_initial_sdf = float(weights.get("sdf_initial", 0.0)) > 0
         needs_uncertainty = float(weights.get("uncertainty", 0.0)) > 0
+        sample_posterior = bool(self.specs.get("sample_posterior", True))
+        if not self.training:
+            sample_posterior = bool(
+                self.specs.get(
+                    "validation_sample_posterior",
+                    sample_posterior,
+                )
+            )
         output = self.sdf_model(
             batch["surface_points"],
             batch["query_points"],
-            sample_posterior=bool(self.specs.get("sample_posterior", True)),
+            sample_posterior=sample_posterior,
             return_initial_sdf=needs_initial_sdf or needs_uncertainty,
             return_query_uncertainty=needs_uncertainty,
         )
@@ -254,7 +269,13 @@ class CombinedModel(pl.LightningModule):
             for name in ("surface_zero", "eikonal", "normal")
         }
         needs_geometry = any(geometry_enabled.values())
-        if self.training and torch.is_grad_enabled() and needs_geometry:
+        validate_geometry = (
+            not self.training
+            and bool(self.specs.get("ValidateGeometryRegularization", False))
+        )
+        if needs_geometry and (
+            (self.training and torch.is_grad_enabled()) or validate_geometry
+        ):
             surface_zero, eikonal, normal = self.stage1_geometry_losses(
                 output["planes"], batch,
                 compute_surface_zero=geometry_enabled["surface_zero"],
@@ -425,6 +446,13 @@ class CombinedModel(pl.LightningModule):
             })
 
         if self.task in {"modulation", "combined"}:
+            decoder = self.sdf_model.cod_vae.autoencoder.decoder
+            if "conv_refine" in rates and decoder.conv_refine is not None:
+                add_group(
+                    "conv_refine",
+                    decoder.conv_refine,
+                    rates.get("triplane_decoder", self.specs.get("sdf_lr", 1e-4)),
+                )
             for name, module in self.sdf_model.component_modules().items():
                 add_group(name, module, self.specs.get("sdf_lr", 1e-4))
         if self.task in {"diffusion", "combined"}:

@@ -95,6 +95,9 @@ class SdfModel(nn.Module):
                 self.cod_vae,
                 checkpoint_path,
                 strict=bool(cod_specs.get("strict_checkpoint_loading", True)),
+                allowed_missing_prefixes=cod_specs.get(
+                    "checkpoint_allowed_missing_prefixes", ()
+                ),
             )
 
     def encode_surface(self, surface_points, sample_posterior=True):

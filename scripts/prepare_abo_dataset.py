@@ -44,6 +44,28 @@ DEFAULT_TRAIN_RATIO = 0.8
 DEFAULT_REPAIRED_MESH_DIRNAME = "repaired_meshes_cod_0999"
 REPAIR_NONE = "none"
 REPAIR_MANIFOLDPLUS = "manifoldplus"
+SIGN_RAY_COUNT = 21
+
+
+def fibonacci_sphere_directions(count: int) -> np.ndarray:
+    """Return deterministic, well-separated ray directions on the unit sphere."""
+    if count <= 0 or count % 2 == 0:
+        raise ValueError("sign ray count must be a positive odd integer")
+    golden_angle = np.pi * (3.0 - np.sqrt(5.0))
+    directions = np.empty((count, 3), dtype=np.float32)
+    for index in range(count):
+        z = 1.0 - 2.0 * (index + 0.5) / count
+        radius = np.sqrt(max(0.0, 1.0 - z * z))
+        angle = (index + 0.5) * golden_angle
+        directions[index] = (
+            radius * np.cos(angle),
+            radius * np.sin(angle),
+            z,
+        )
+    return directions
+
+
+SIGN_RAY_DIRECTIONS = fibonacci_sphere_directions(SIGN_RAY_COUNT)
 
 
 @dataclass(frozen=True)
@@ -74,6 +96,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-dir", type=Path, default=DEFAULT_SOURCE_DIR)
     parser.add_argument("--datasets-root", type=Path, default=DEFAULT_DATASETS_ROOT)
     parser.add_argument("--dataset-key", default=DEFAULT_DATASET_KEY)
+    parser.add_argument(
+        "--repair-cache-dataset-key",
+        default=None,
+        help=(
+            "Dataset-key subdirectory used only for repaired-mesh cache lookup. "
+            "Defaults to --dataset-key; set this when writing records under a new "
+            "dataset key while reusing an existing repair cache."
+        ),
+    )
     parser.add_argument("--class-name", default=DEFAULT_CLASS_NAME)
     parser.add_argument("--split-prefix", default=DEFAULT_SPLIT_PREFIX)
     parser.add_argument("--metadata-in", type=Path, default=DEFAULT_METADATA_IN)
@@ -486,7 +517,22 @@ def compute_signed_distances(
         batch = query_points[start:stop]
         tensor = o3d.core.Tensor(batch)
         if sign_method == "occupancy":
-            sdf[start:stop] = scene.compute_signed_distance(tensor).numpy().reshape(-1, 1)
+            unsigned = scene.compute_distance(tensor).numpy().reshape(-1, 1)
+            inside_votes = np.zeros(len(batch), dtype=np.uint8)
+            rays = np.empty((len(batch), 6), dtype=np.float32)
+            rays[:, :3] = batch
+            # Count one direction at a time. This keeps peak ray-buffer memory
+            # bounded by batch_size rather than batch_size * SIGN_RAY_COUNT.
+            for direction in SIGN_RAY_DIRECTIONS:
+                rays[:, 3:] = direction
+                intersections = scene.count_intersections(
+                    o3d.core.Tensor(rays)
+                ).numpy()
+                inside_votes += (intersections & 1).astype(np.uint8)
+            inside = inside_votes > (SIGN_RAY_COUNT // 2)
+            unsigned[inside] *= -1.0
+            sdf[start:stop] = unsigned
+            del unsigned, inside_votes, rays, intersections, inside
         else:
             # Non-watertight fallback: closest-normal signs are only a pseudo-SDF.
             out = scene.compute_closest_points(tensor)
@@ -797,12 +843,14 @@ def process_model(
     use_repaired_surface: bool = False,
     fidelity_config: RepairFidelityConfig | None = None,
     reuse_repair_fidelity: bool = False,
+    repair_cache_dataset_key: str | None = None,
 ) -> tuple[Path | None, dict[str, Any]]:
     def log_phase(message: str) -> None:
         print(f"  phase: {message}")
 
     model_id = mesh_path.stem
     output_path = object_output_paths(datasets_root, dataset_key, class_name, model_id)
+    proxy_dataset_key = repair_cache_dataset_key or dataset_key
 
     if skip_existing and output_path.is_file():
         repair_info: dict[str, Any] = {"skipped_existing": True}
@@ -810,7 +858,10 @@ def process_model(
             if repair_config.repaired_mesh_dir is None:
                 raise ValueError("repaired mesh directory is required")
             proxy_path = repaired_mesh_output_path(
-                repair_config.repaired_mesh_dir, dataset_key, class_name, model_id
+                repair_config.repaired_mesh_dir,
+                proxy_dataset_key,
+                class_name,
+                model_id,
             )
             if not proxy_path.is_file():
                 raise FileNotFoundError(
@@ -898,7 +949,12 @@ def process_model(
     if repair_config is not None and repair_config.method == REPAIR_MANIFOLDPLUS:
         if repair_config.repaired_mesh_dir is None:
             raise ValueError("repaired mesh directory is required")
-        proxy_path = repaired_mesh_output_path(repair_config.repaired_mesh_dir, dataset_key, class_name, model_id)
+        proxy_path = repaired_mesh_output_path(
+            repair_config.repaired_mesh_dir,
+            proxy_dataset_key,
+            class_name,
+            model_id,
+        )
         log_phase("manifold repair")
         repair_result = repair_mesh_with_manifoldplus(mesh, proxy_path, repair_config)
         sdf_mesh = repair_result.mesh
@@ -1085,6 +1141,47 @@ def stable_product_type_key(entry: dict[str, Any], default_value: str) -> str:
 def write_manifest(manifest_path: Path, dataset_key: str, class_name: str, model_ids: list[str]) -> None:
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps({dataset_key: {class_name: model_ids}}, indent=2) + "\n", encoding="utf-8")
+
+
+def file_sha256(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def deduplicate_geometry_files(
+    model_ids: set[str],
+    geometry_paths: dict[str, Path],
+) -> tuple[set[str], dict[str, list[str]]]:
+    """Keep one ID per byte-identical geometry and return duplicate groups."""
+    by_size: dict[int, list[str]] = {}
+    for model_id in sorted(model_ids):
+        path = geometry_paths[model_id]
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"training-eligible model has no repaired geometry: {path}"
+            )
+        by_size.setdefault(path.stat().st_size, []).append(model_id)
+
+    retained = set(model_ids)
+    duplicate_groups: dict[str, list[str]] = {}
+    for same_size_ids in by_size.values():
+        if len(same_size_ids) < 2:
+            continue
+        by_digest: dict[str, list[str]] = {}
+        for model_id in same_size_ids:
+            digest = file_sha256(geometry_paths[model_id])
+            by_digest.setdefault(digest, []).append(model_id)
+        for identical_ids in by_digest.values():
+            if len(identical_ids) < 2:
+                continue
+            members = sorted(identical_ids)
+            canonical = members[0]
+            duplicate_groups[canonical] = members
+            retained.difference_update(members[1:])
+    return retained, duplicate_groups
 
 
 def validate_train_ratio(train_ratio: float) -> None:
@@ -1285,6 +1382,7 @@ def main() -> None:
                 use_repaired_surface=use_repaired_surface,
                 fidelity_config=fidelity_config,
                 reuse_repair_fidelity=args.reuse_repair_fidelity,
+                repair_cache_dataset_key=args.repair_cache_dataset_key,
             )
             output_path = object_output_paths(
                 args.datasets_root, args.dataset_key, args.class_name, model_id
@@ -1382,6 +1480,39 @@ def main() -> None:
     if args.manifest_only and not use_repaired_surface:
         accepted_ids.update(model_ids)
 
+    duplicate_geometry_groups: dict[str, list[str]] = {}
+    if use_repaired_surface:
+        if repair_config.repaired_mesh_dir is None:
+            raise ValueError("repaired mesh directory is required")
+        geometry_paths = {
+            model_id: repaired_mesh_output_path(
+                repair_config.repaired_mesh_dir,
+                args.repair_cache_dataset_key or args.dataset_key,
+                args.class_name,
+                model_id,
+            )
+            for model_id in accepted_ids
+        }
+        accepted_ids, duplicate_geometry_groups = deduplicate_geometry_files(
+            accepted_ids, geometry_paths
+        )
+        for canonical, members in duplicate_geometry_groups.items():
+            products[canonical]["geometry_group_id"] = canonical
+            products[canonical]["geometry_group_members"] = members
+            for duplicate in members[1:]:
+                products[duplicate]["geometry_group_id"] = canonical
+                products[duplicate]["duplicate_of"] = canonical
+                products[duplicate]["training_eligible"] = False
+                products[duplicate]["filter_reason"] = "duplicate_geometry"
+        duplicate_count = sum(
+            len(members) - 1 for members in duplicate_geometry_groups.values()
+        )
+        if duplicate_count:
+            print(
+                f"excluded {duplicate_count} duplicate repaired geometries "
+                f"from {len(duplicate_geometry_groups)} groups"
+            )
+
     type_to_ids: dict[str, list[str]] = {}
     for model_id in sorted(accepted_ids):
         product_type_key = products[model_id]["product_type_key"]
@@ -1419,6 +1550,10 @@ def main() -> None:
             "near_surface_stds": list(args.near_surface_stds),
             "uniform_point_count": args.uniform_point_count,
             "coordinate_bounds": [-1.0, 1.0],
+            "sdf_sign": {
+                "method": "multi_ray_majority",
+                "ray_count": SIGN_RAY_COUNT,
+            },
             "repair": {
                 "method": repair_config.method,
                 "manifoldplus_bin": str(repair_config.manifoldplus_bin)
@@ -1428,6 +1563,9 @@ def main() -> None:
                 "repaired_mesh_dir": str(repair_config.repaired_mesh_dir)
                 if repair_config.repaired_mesh_dir is not None
                 else None,
+                "cache_dataset_key": (
+                    args.repair_cache_dataset_key or args.dataset_key
+                ),
                 "surface_source": (
                     "repaired_mesh" if use_repaired_surface else "original_mesh"
                 ),
@@ -1446,6 +1584,7 @@ def main() -> None:
         "splits": split_paths,
         "failures": failures,
         "rejected_repairs": rejected_repairs,
+        "duplicate_geometry_groups": duplicate_geometry_groups,
         "training_eligible_count": len(accepted_ids),
         "products": products,
     }

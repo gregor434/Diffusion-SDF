@@ -181,9 +181,100 @@ class CODPreprocessingTests(unittest.TestCase):
                 float(arrays[name].max()), float(np.float32(0.999))
             )
 
+    @unittest.skipIf(preprocessing.o3d is None, "Open3D runtime unavailable")
+    def test_multi_ray_sign_uses_majority_with_bounded_ray_buffers(self):
+        class ArrayResult:
+            def __init__(self, values):
+                self.values = values
+
+            def numpy(self):
+                return self.values
+
+        class FakeScene:
+            def __init__(self):
+                self.intersection_calls = 0
+                self.largest_ray_batch = 0
+
+            def compute_distance(self, points):
+                return ArrayResult(np.ones(len(points), dtype=np.float32))
+
+            def count_intersections(self, rays):
+                values = rays.numpy()
+                self.largest_ray_batch = max(
+                    self.largest_ray_batch, len(values)
+                )
+                direction_index = (
+                    self.intersection_calls % preprocessing.SIGN_RAY_COUNT
+                )
+                self.intersection_calls += 1
+                counts = np.zeros(len(values), dtype=np.uint32)
+                # Negative-x queries receive an inside majority. Positive-x
+                # queries have one erroneous odd ray but remain outside.
+                counts[
+                    (values[:, 0] < 0) & (direction_index <= 10)
+                ] = 1
+                counts[
+                    (values[:, 0] > 0) & (direction_index == 0)
+                ] = 1
+                return ArrayResult(counts)
+
+        scene = FakeScene()
+        points = np.asarray(
+            [
+                [-0.5, 0.0, 0.0],
+                [0.5, 0.0, 0.0],
+                [-0.25, 0.0, 0.0],
+                [0.25, 0.0, 0.0],
+                [0.75, 0.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        sdf = preprocessing.compute_signed_distances(
+            scene, points, batch_size=2, sign_method="occupancy"
+        ).reshape(-1)
+
+        np.testing.assert_array_equal(
+            np.sign(sdf), np.asarray([-1, 1, -1, 1, 1])
+        )
+        self.assertEqual(
+            scene.intersection_calls,
+            preprocessing.SIGN_RAY_COUNT * 3,
+        )
+        self.assertLessEqual(scene.largest_ray_batch, 2)
+
     def test_compute_split_counts_preserves_validation(self):
         self.assertEqual(compute_split_counts(10, 0.8), (8, 2))
         self.assertEqual(compute_split_counts(3, 0.8), (2, 1))
+
+    def test_identical_repaired_geometry_is_deduplicated_before_splitting(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = {
+                model_id: root / f"{model_id}.obj"
+                for model_id in ("a", "b", "c", "d")
+            }
+            paths["a"].write_bytes(b"same repaired geometry")
+            paths["b"].write_bytes(b"same repaired geometry")
+            # Same byte length exercises the hash check rather than the
+            # inexpensive unique-size path.
+            paths["c"].write_bytes(b"other repair geometry!")
+            paths["d"].write_bytes(b"unique")
+
+            retained, groups = preprocessing.deduplicate_geometry_files(
+                set(paths), paths
+            )
+            splits = preprocessing.split_model_ids(
+                sorted(retained),
+                train_ratio=0.67,
+                rng=np.random.default_rng(0),
+            )
+
+        self.assertEqual(retained, {"a", "c", "d"})
+        self.assertEqual(groups, {"a": ["a", "b"]})
+        self.assertNotIn("b", splits["all"])
+        self.assertTrue(
+            set(splits["train"]).isdisjoint(splits["val"])
+        )
 
     def test_balanced_aggregate_splits(self):
         all_splits, per_type = build_split_sets(
@@ -597,6 +688,41 @@ class CODPreprocessingTests(unittest.TestCase):
             self.assertEqual(output, record)
             self.assertTrue(repair_info["skipped_existing"])
             self.assertEqual(repair_info["method"], REPAIR_MANIFOLDPLUS)
+            self.assertEqual(repair_info["repaired_mesh_path"], str(proxy))
+            self.assertTrue(repair_info["cache_hit"])
+
+    def test_output_dataset_key_can_differ_from_repair_cache_key(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            record = root / "abo_multiray21" / "ABO" / "sample" / "cod_sdf.npz"
+            record.parent.mkdir(parents=True)
+            record.touch()
+            repaired_root = root / "repaired_meshes_cod_0999"
+            proxy = repaired_root / "abo" / "ABO" / "sample.obj"
+            proxy.parent.mkdir(parents=True)
+            proxy.touch()
+            config = RepairConfig(
+                method=REPAIR_MANIFOLDPLUS,
+                manifoldplus_bin=root / "ManifoldPlus",
+                repaired_mesh_dir=repaired_root,
+            )
+
+            output, repair_info = preprocessing.process_model(
+                mesh_path=root / "sample.glb",
+                datasets_root=root,
+                dataset_key="abo_multiray21",
+                repair_cache_dataset_key="abo",
+                class_name="ABO",
+                surface_point_count=8,
+                near_surface_stds=(0.005, 0.0005),
+                uniform_point_count=8,
+                batch_size=8,
+                rng=np.random.default_rng(0),
+                skip_existing=True,
+                repair_config=config,
+            )
+
+            self.assertEqual(output, record)
             self.assertEqual(repair_info["repaired_mesh_path"], str(proxy))
             self.assertTrue(repair_info["cache_hit"])
 

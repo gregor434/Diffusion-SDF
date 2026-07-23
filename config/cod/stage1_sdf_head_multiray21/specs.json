@@ -1,0 +1,78 @@
+{
+  "Description": "Fresh SDF-head training on deduplicated multi-ray ABO supervision",
+  "DataSource": "datasets",
+  "TrainSplit": "datasets/splits/abo_fullchairs_multiray21_CHAIR_train.json",
+  "ValSplit": "datasets/splits/abo_fullchairs_multiray21_CHAIR_val.json",
+  "TestSplit": "datasets/splits/abo_fullchairs_multiray21_CHAIR_val.json",
+  "ModulationSplit": "datasets/splits/abo_fullchairs_multiray21_CHAIR_all.json",
+  "training_task": "modulation",
+  "stage1_mode": "sdf_head_only",
+  "sample_posterior": false,
+  "validation_sample_posterior": false,
+  "DeterministicValidationSampling": true,
+  "ValidationSamplingSeed": 0,
+  "ValidateGeometryRegularization": true,
+  "GeometryRegularizationSamples": 512,
+  "GeometryFiniteDifferenceStep": 0.01,
+  "CODVaeSpecs": {
+    "checkpoint_path": "tmp/cod_vae_m32_weights.pt",
+    "strict_checkpoint_loading": true,
+    "checkpoint_allowed_missing_prefixes": [
+      "autoencoder.decoder.conv_refine."
+    ],
+    "latent_tokens": 32,
+    "latent_dimension": 32,
+    "embed_dimension": 512,
+    "triplane_dimension": 32,
+    "latent_decoder_layers": 12,
+    "uncertainty_mode": "disabled",
+    "encoder_params": {
+      "num_patches": 512,
+      "num_blocks": 4,
+      "num_layers_per_block": 3
+    },
+    "decoder_params": {
+      "output_resolution": 128,
+      "output_patch_size": 8,
+      "num_layers": 12,
+      "num_init_layers": 1,
+      "mlp_ratio": 2,
+      "keep_ratio": 1.0,
+      "num_merged_tokens": 8,
+      "use_conv_refine": true
+    }
+  },
+  "SdfModelSpecs": {
+    "hidden_dim": 512,
+    "feature_dim": 32
+  },
+  "SurfacePointCount": 2048,
+  "SampPerMesh": 16000,
+  "NearSurfaceRatio": 0.7,
+  "sdf_loss": {
+    "type": "l1"
+  },
+  "loss_weights": {
+    "sdf": 1.0,
+    "sdf_initial": 0.0,
+    "cod_aux": 0.0,
+    "uncertainty": 0.0,
+    "surface_zero": 1.0,
+    "eikonal": 0.0,
+    "normal": 0.0,
+    "kl": 0.0
+  },
+  "learning_rates": {
+    "sdf_network": 0.0002
+  },
+  "lr_scheduler": {
+    "type": "cosine",
+    "min_lr": 0.000002,
+    "epochs": 1500
+  },
+  "weight_decay": 0.0,
+  "gradient_clip_val": 1.0,
+  "num_epochs": 1500,
+  "log_freq": 500,
+  "log_every_n_steps": 20
+}

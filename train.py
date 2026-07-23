@@ -81,7 +81,16 @@ def train():
         )
     else:
         train_dataset = build_dataset(split)
-        val_dataset = build_dataset(val_split) if val_split is not None else None
+        val_dataset = (
+            build_dataset(
+                val_split,
+                deterministic_sampling=bool(
+                    specs.get("DeterministicValidationSampling", False)
+                ),
+            )
+            if val_split is not None
+            else None
+        )
 
     if args.virtual_train_size is not None:
         train_dataset = VirtualDataset(train_dataset, args.virtual_train_size)
@@ -131,7 +140,13 @@ def train():
     # if resuming from training modulation, diffusion, or end-to-end, just load saved checkpoint 
     # however, if fine-tuning end-to-end after training modulation and diffusion separately, will need to load sdf and diffusion checkpoints separately
     if args.init_from is not None:
-        load_weights_only(model, args.init_from)
+        load_weights_only(
+            model,
+            args.init_from,
+            allowed_missing_prefixes=specs.get(
+                "init_from_allowed_missing_prefixes", ()
+            ),
+        )
         resume = None
     elif args.resume == 'finetune':
         with warnings.catch_warnings():
@@ -169,7 +184,7 @@ def train():
         trainer.fit(model=model, train_dataloaders=train_dataloader, ckpt_path=resume)
 
 
-def load_weights_only(model, checkpoint_path):
+def load_weights_only(model, checkpoint_path, allowed_missing_prefixes=()):
     """Load model parameters without restoring trainer or optimizer state."""
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint:
@@ -177,7 +192,21 @@ def load_weights_only(model, checkpoint_path):
             f"weights-only initialization requires a Lightning checkpoint "
             f"with a state_dict: {checkpoint_path}"
         )
-    model.load_state_dict(checkpoint["state_dict"], strict=True)
+    allowed_missing_prefixes = tuple(allowed_missing_prefixes)
+    if not allowed_missing_prefixes:
+        model.load_state_dict(checkpoint["state_dict"], strict=True)
+        return
+    result = model.load_state_dict(checkpoint["state_dict"], strict=False)
+    disallowed_missing = [
+        key for key in result.missing_keys
+        if not key.startswith(allowed_missing_prefixes)
+    ]
+    if disallowed_missing or result.unexpected_keys:
+        raise RuntimeError(
+            "checkpoint mismatch: "
+            f"missing keys={disallowed_missing}, "
+            f"unexpected keys={result.unexpected_keys}"
+        )
 
 
 def build_dataloader(dataset, drop_last, shuffle, use_spawn_workers=False):
@@ -199,6 +228,7 @@ def build_dataset(
     conditioning_sources=None,
     records=None,
     sample_posterior_latents=False,
+    deterministic_sampling=False,
 ):
     if specs['training_task'] == 'diffusion':
         return ModulationLoader(
@@ -221,6 +251,8 @@ def build_dataset(
         condition_surface=bool(
             specs.get("diffusion_model_specs", {}).get("cond", False)
         ),
+        deterministic_sampling=deterministic_sampling,
+        sampling_seed=int(specs.get("ValidationSamplingSeed", 0)),
     )
 
 

@@ -19,12 +19,16 @@ class SdfLoader(Dataset):
         near_surface_ratio=0.7,
         modulation_path=None,
         condition_surface=False,
+        deterministic_sampling=False,
+        sampling_seed=0,
         **_,
     ):
         self.samples_per_mesh = int(samples_per_mesh)
         self.surface_point_count = int(surface_point_count)
         self.near_surface_ratio = float(near_surface_ratio)
         self.condition_surface = bool(condition_surface)
+        self.deterministic_sampling = bool(deterministic_sampling)
+        self.sampling_seed = int(sampling_seed)
         if not 0 <= self.near_surface_ratio <= 1:
             raise ValueError("near_surface_ratio must be in [0, 1]")
         if self.surface_point_count <= 0:
@@ -50,9 +54,14 @@ class SdfLoader(Dataset):
         return len(self.records)
 
     def __getitem__(self, index):
+        rng = (
+            np.random.RandomState(self.sampling_seed + index)
+            if self.deterministic_sampling
+            else np.random
+        )
         path, dataset, class_name, object_id = self.records[index]
         with np.load(path) as data:
-            surface_indices = np.random.choice(
+            surface_indices = rng.choice(
                 len(data["surface_points"]),
                 self.surface_point_count,
                 replace=len(data["surface_points"]) < self.surface_point_count,
@@ -64,12 +73,12 @@ class SdfLoader(Dataset):
             )
             near_count = round(self.samples_per_mesh * self.near_surface_ratio)
             uniform_count = self.samples_per_mesh - near_count
-            near_indices = np.random.choice(
+            near_indices = rng.choice(
                 len(data["near_surface_query_points"]),
                 near_count,
                 replace=len(data["near_surface_query_points"]) < near_count,
             )
-            uniform_indices = np.random.choice(
+            uniform_indices = rng.choice(
                 len(data["uniform_query_points"]),
                 uniform_count,
                 replace=len(data["uniform_query_points"]) < uniform_count,
@@ -89,7 +98,7 @@ class SdfLoader(Dataset):
                 axis=0,
             )
 
-        permutation = np.random.permutation(len(query_points))
+        permutation = rng.permutation(len(query_points))
         query_is_near = np.concatenate(
             (np.ones(near_count, dtype=np.bool_), np.zeros(uniform_count, dtype=np.bool_))
         )[permutation]

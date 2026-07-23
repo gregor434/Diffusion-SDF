@@ -199,15 +199,19 @@ def ensure_modulation_cache(
 ):
     """Create missing modulations for the union of all configured splits.
 
-    The cache is always local to the stage-two experiment. The stage-one model
-    is loaded only when files are missing and is explicitly released before
-    this function returns.
+    By default the cache is local to the stage-two experiment. Continuation
+    experiments can set ``modulation_cache_path`` to reuse the exact cached
+    latents and normalization statistics of the experiment they initialize
+    from. The stage-one model is loaded only when files are missing and is
+    explicitly released before this function returns.
     """
     splits = configured_splits(specs)
     if "TrainSplit" not in splits:
         raise ValueError("diffusion training requires TrainSplit")
     all_split = merge_splits(splits.values())
-    cache_path = Path(exp_dir) / "modulations"
+    cache_path = Path(
+        specs.get("modulation_cache_path", Path(exp_dir) / "modulations")
+    )
     cache_path.mkdir(parents=True, exist_ok=True)
     modulation_variants = max(1, int(specs.get("modulation_variants", 1)))
     # Validation/test objects need only the canonical variant. Training objects

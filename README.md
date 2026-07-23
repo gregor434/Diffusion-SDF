@@ -65,7 +65,6 @@ Preprocess the full chair set under a separate split prefix. This writes
       --metadata-out datasets/abo/fullchairs_preprocessing_metadata.json \
       --split-prefix abo_fullchairs \
       --per-type-splits-only \
-      --skip-existing \
       --batch-size 50000 \
       --continue-on-error \
       --repair-method manifoldplus \
@@ -128,6 +127,13 @@ fields. Preprocessing metadata is written to
 datasets/abo/preprocessing_metadata.json; datasets/splits remains reserved for
 split manifests.
 
+Watertight repaired meshes use a deterministic 21-direction majority vote for
+SDF signs. Directions are evaluated one at a time within each query batch, so
+ray-buffer memory remains bounded by `--batch-size`. Before writing splits,
+byte-identical repaired meshes are grouped by SHA-256 and only the
+lexicographically first model ID in each group remains training eligible. This
+prevents exact repaired geometry from crossing train and validation splits.
+
 To regenerate `cod_sdf.npz` records while reusing both the cached repaired
 meshes and their compatible fidelity validation sidecars, omit
 `--skip-existing` and pass `--reuse-repair-fidelity`. Add `--model-workers 2`
@@ -137,6 +143,11 @@ sampling arrays. A missing sidecar or one created with a different fidelity
 sample count or distance threshold is validated again automatically.
 `--force-repair` still regenerates the proxy and therefore always performs a
 fresh fidelity validation.
+
+To preserve an existing record set, choose a new `--dataset-key` as well as a
+new `--split-prefix`. The old repair cache can still be reused by passing its
+dataset subdirectory through `--repair-cache-dataset-key`; this decouples only
+the cache lookup from the record and manifest dataset key.
 
 ## Stage one: COD-VAE SDF reconstruction
 
@@ -156,8 +167,38 @@ points:
 
     python train.py -e config/cod/stage1_overfit_one -b 10 -w 8 --virtual_train_size 100
 
-Available stage1_mode values are sdf_head_only, cod_decoder_finetune,
-full_cod_finetune, and train_from_scratch.
+Available stage1_mode values are sdf_head_only, triplane_sdf_finetune,
+cod_decoder_finetune, full_cod_finetune, and train_from_scratch.
+
+The latent-preserving geometry experiment keeps the encoder, posterior
+projection, and latent decoder frozen, and trains only the tri-plane decoder
+(including a zero-initialized residual convolutional refiner) and SDF head.
+Initialize it explicitly from the existing geometry checkpoint:
+
+    python train.py \
+      -e config/cod/stage1_decoder_geometry_conv_finetune \
+      --init_from config/cod/stage1_decoder_geometry_finetune/last.ckpt \
+      -b 8 -w 8
+
+The weights-only initialization starts a fresh optimizer and scheduler while
+accepting only the new convolutional-refiner parameters as missing from the
+source checkpoint.
+
+For the deduplicated 21-ray dataset, first train a clean SDF head while the
+official COD model and zero-residual convolutional refiner remain frozen:
+
+    python train.py \
+      -e config/cod/stage1_sdf_head_multiray21 \
+      -b 8 -w 8
+
+Then initialize the matching decoder, convolutional-refiner, and SDF-head
+experiment from the clean head checkpoint. This loads weights only and starts
+a fresh optimizer and scheduler:
+
+    python train.py \
+      -e config/cod/stage1_decoder_conv_head_multiray21 \
+      --init_from config/cod/stage1_sdf_head_multiray21/best.ckpt \
+      -b 8 -w 8
 
 learning_rates accepts independent values for point_encoder, variational_block,
 latent_decoder, triplane_decoder, and sdf_network, and rejects entries for
@@ -222,6 +263,17 @@ The equivalent fresh image-conditioned run is:
 It uses the same latent augmentation and cosine schedule while retaining the
 ViT-B/32 CLIP image-conditioning path. Its checkpoints are separate from and
 not resume-compatible with `stage2_transformer_image_diffusion`.
+
+Fresh 2000-epoch unconditional and image-conditioned runs using the
+geometry-calibrated stage-one checkpoint are configured separately:
+
+    python train.py -e config/cod/stage2_transformer_diffusion_geometry_2000 -b 32 -w 8
+    python train.py -e config/cod/stage2_transformer_image_diffusion_geometry_2000 -b 32 -w 8
+
+Do not pass `--resume` or `--init_from` for these runs. Each experiment creates
+its own modulation cache from
+`config/cod/stage1_decoder_geometry_finetune/last.ckpt`; reconstruction loads
+the same checkpoint through `modulation_ckpt_path`.
 
 ## Stage three: joint fine-tuning
 

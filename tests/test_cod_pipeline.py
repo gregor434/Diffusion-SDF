@@ -129,6 +129,50 @@ class CODPipelineTests(unittest.TestCase):
         for expected, actual in zip(original.parameters(), restored.parameters()):
             torch.testing.assert_close(actual, expected)
 
+    def test_conv_refiner_starts_as_an_exact_identity_and_loads_explicitly(self):
+        source_specs = tiny_specs()
+        source = SdfModel(source_specs).cod_vae
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "weights.pt"
+            torch.save(
+                {
+                    "state_dict": {
+                        f"model.{name}": value.clone()
+                        for name, value in source.state_dict().items()
+                    }
+                },
+                path,
+            )
+            target_specs = tiny_specs()
+            target_specs["CODVaeSpecs"]["decoder_params"]["use_conv_refine"] = True
+            target = SdfModel(target_specs).cod_vae
+            with self.assertRaisesRegex(RuntimeError, "Missing key"):
+                load_cod_checkpoint(target, path, strict=True)
+            result = load_cod_checkpoint(
+                target,
+                path,
+                strict=True,
+                allowed_missing_prefixes=(
+                    "autoencoder.decoder.conv_refine.",
+                ),
+            )
+
+        self.assertTrue(result.missing_keys)
+        self.assertTrue(
+            all(
+                key.startswith("autoencoder.decoder.conv_refine.")
+                for key in result.missing_keys
+            )
+        )
+        decoder = target.autoencoder.decoder
+        plane = torch.randn(2, decoder.query_dim, 8, 8)
+        torch.testing.assert_close(
+            decoder.conv_refine(plane),
+            torch.zeros_like(plane),
+            rtol=0,
+            atol=0,
+        )
+
     def test_disabled_mode_bypasses_uncertainty_pruning_and_merging(self):
         specs = tiny_specs()
         specs["CODVaeSpecs"]["uncertainty_mode"] = "disabled"
@@ -283,6 +327,92 @@ class CODPipelineTests(unittest.TestCase):
                         parameter, checkpoint_only_before[id(parameter)], rtol=0, atol=0
                     )
 
+    def test_triplane_sdf_finetune_freezes_the_complete_latent_path(self):
+        source_specs = tiny_specs()
+        source_specs["CODVaeSpecs"]["decoder_params"]["use_conv_refine"] = True
+        source = SdfModel(source_specs)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_path = Path(tmpdir) / "cod.pt"
+            torch.save(
+                {
+                    "state_dict": {
+                        f"model.{name}": value.clone()
+                        for name, value in source.cod_vae.state_dict().items()
+                    }
+                },
+                checkpoint_path,
+            )
+            specs = tiny_specs()
+            specs["CODVaeSpecs"]["decoder_params"]["use_conv_refine"] = True
+            specs.update(
+                {
+                    "training_task": "modulation",
+                    "stage1_mode": "triplane_sdf_finetune",
+                    "sample_posterior": False,
+                    "loss_weights": {"sdf": 1.0},
+                    "learning_rates": {
+                        "conv_refine": 1e-4,
+                        "triplane_decoder": 5e-6,
+                        "sdf_network": 2e-5,
+                    },
+                }
+            )
+            specs["CODVaeSpecs"]["checkpoint_path"] = str(checkpoint_path)
+            model = CombinedModel(specs).train()
+
+        batch = {
+            "surface_points": torch.rand(2, 8, 3) * 1.8 - 0.9,
+            "query_points": torch.rand(2, 6, 3) * 1.8 - 0.9,
+            "query_sdf": torch.randn(2, 6) * 0.05,
+        }
+        losses = model.stage1_losses(batch)
+        losses["loss"].backward()
+        components = model.sdf_model.component_modules()
+        for name in ("point_encoder", "variational_block", "latent_decoder"):
+            self.assertTrue(
+                all(
+                    not parameter.requires_grad and parameter.grad is None
+                    for parameter in components[name].parameters()
+                ),
+                name,
+            )
+        for name in ("triplane_decoder", "sdf_network"):
+            self.assertTrue(
+                any(
+                    parameter.requires_grad and parameter.grad is not None
+                    for parameter in components[name].parameters()
+                ),
+                name,
+            )
+        configured = model.configure_optimizers()
+        optimizer = (
+            configured["optimizer"]
+            if isinstance(configured, dict)
+            else configured
+        )
+        self.assertEqual(
+            [group["name"] for group in optimizer.param_groups],
+            ["conv_refine", "triplane_decoder", "sdf_network"],
+        )
+        self.assertEqual(
+            [group["lr"] for group in optimizer.param_groups],
+            [1e-4, 5e-6, 2e-5],
+        )
+        conv_parameters = {
+            id(parameter)
+            for parameter in model.sdf_model.cod_vae.autoencoder.decoder.conv_refine.parameters()
+        }
+        self.assertEqual(
+            {id(parameter) for parameter in optimizer.param_groups[0]["params"]},
+            conv_parameters,
+        )
+        self.assertTrue(
+            conv_parameters.isdisjoint(
+                id(parameter)
+                for parameter in optimizer.param_groups[1]["params"]
+            )
+        )
+
     def test_disabled_uncertainty_rejects_positive_loss_weight(self):
         specs = tiny_specs()
         specs.update({
@@ -293,6 +423,32 @@ class CODPipelineTests(unittest.TestCase):
         specs["CODVaeSpecs"]["uncertainty_mode"] = "disabled"
         with self.assertRaisesRegex(ValueError, "zero uncertainty loss weight"):
             validate_training_specs(specs)
+
+    def test_stage_one_geometry_regularization_can_be_validated(self):
+        specs = tiny_specs()
+        specs.update({
+            "training_task": "modulation",
+            "stage1_mode": "train_from_scratch",
+            "sample_posterior": False,
+            "ValidateGeometryRegularization": True,
+            "GeometryRegularizationSamples": 4,
+            "loss_weights": {
+                "sdf": 1.0,
+                "surface_zero": 1.0,
+                "eikonal": 0.01,
+            },
+        })
+        model = CombinedModel(specs).eval()
+        batch = {
+            "surface_points": torch.rand(2, 8, 3) * 1.8 - 0.9,
+            "query_points": torch.rand(2, 6, 3) * 1.8 - 0.9,
+            "query_sdf": torch.randn(2, 6) * 0.05,
+        }
+        with torch.no_grad():
+            losses = model.stage1_losses(batch)
+        self.assertGreater(losses["surface_zero"].item(), 0.0)
+        self.assertGreater(losses["eikonal"].item(), 0.0)
+        self.assertTrue(torch.isfinite(losses["loss"]))
 
     def test_sdf_loader_separates_cod_surface_and_query_samples(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -314,13 +470,25 @@ class CODPipelineTests(unittest.TestCase):
                 samples_per_mesh=10,
                 surface_point_count=8,
                 near_surface_ratio=0.6,
+                deterministic_sampling=True,
+                sampling_seed=17,
             )
             item = dataset[0]
+            repeated = dataset[0]
         self.assertEqual(item["surface_points"].shape, torch.Size([8, 3]))
         self.assertEqual(item["query_points"].shape, torch.Size([10, 3]))
         self.assertEqual(item["query_sdf"].shape, torch.Size([10]))
         self.assertEqual(item["query_is_near"].sum().item(), 6)
         self.assertEqual(item["object_id"], "item")
+        torch.testing.assert_close(
+            item["surface_points"], repeated["surface_points"], rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            item["query_points"], repeated["query_points"], rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            item["query_sdf"], repeated["query_sdf"], rtol=0, atol=0
+        )
 
 
 if __name__ == "__main__":
