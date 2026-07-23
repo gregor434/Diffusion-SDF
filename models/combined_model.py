@@ -336,33 +336,67 @@ class CombinedModel(pl.LightningModule):
         )
         return noise, sigma
 
-    def stage3_losses(self, batch):
-        direct = self.sdf_model(
-            batch["surface_points"],
-            batch["query_points"],
-            sample_posterior=True,
-        )
-        direct_sdf = self.sdf_reconstruction_loss(
-            direct["sdf"], batch["query_sdf"]
-        )
-        clean = self.normalize_latent(direct["latent"])
-        diffusion_loss, clean_estimate, _, _ = self.diffusion_model.training_loss(
-            clean, self._conditioning(batch)
-        )
-        denoised_latent = self.denormalize_latent(clean_estimate)
-        generated_planes = self.sdf_model.decode_latent(denoised_latent)["planes"]
-        generated_sdf = self.sdf_model.query_sdf(
-            generated_planes, batch["query_points"]
-        )
-        generated_loss = self.sdf_reconstruction_loss(
-            generated_sdf, batch["query_sdf"]
-        )
-        kl = self.kl_loss(direct["posterior"]).to(direct_sdf.device)
+    def stage3_losses(self, batch, deterministic_noise_batch_idx=None):
         weights = self.specs.get("loss_weights", {})
+        direct_weight = float(weights.get("direct", 1.0))
+        generated_weight = float(weights.get("generated", 1.0))
+        sample_posterior = bool(self.specs.get("sample_posterior", True))
+        if not self.training:
+            sample_posterior = bool(
+                self.specs.get(
+                    "validation_sample_posterior",
+                    sample_posterior,
+                )
+            )
+
+        if direct_weight > 0:
+            direct = self.sdf_model(
+                batch["surface_points"],
+                batch["query_points"],
+                sample_posterior=sample_posterior,
+            )
+            direct_sdf = self.sdf_reconstruction_loss(
+                direct["sdf"], batch["query_sdf"]
+            )
+            latent = direct["latent"]
+            posterior = direct["posterior"]
+        else:
+            latent, posterior, _ = self.sdf_model.encode_surface(
+                batch["surface_points"],
+                sample_posterior=sample_posterior,
+            )
+            direct_sdf = latent.new_zeros(())
+
+        clean = self.normalize_latent(latent)
+        noise = sigma = None
+        if deterministic_noise_batch_idx is not None:
+            noise, sigma = self.deterministic_validation_noise(
+                clean, deterministic_noise_batch_idx
+            )
+        diffusion_loss, clean_estimate, _, _ = self.diffusion_model.training_loss(
+            clean,
+            self._conditioning(batch),
+            noise=noise,
+            sigma=sigma,
+        )
+        if generated_weight > 0:
+            denoised_latent = self.denormalize_latent(clean_estimate)
+            generated_planes = self.sdf_model.decode_latent(
+                denoised_latent
+            )["planes"]
+            generated_sdf = self.sdf_model.query_sdf(
+                generated_planes, batch["query_points"]
+            )
+            generated_loss = self.sdf_reconstruction_loss(
+                generated_sdf, batch["query_sdf"]
+            )
+        else:
+            generated_loss = direct_sdf.new_zeros(())
+        kl = self.kl_loss(posterior).to(direct_sdf.device)
         total = (
-            float(weights.get("direct", 1.0)) * direct_sdf
+            direct_weight * direct_sdf
             + float(weights.get("diffusion", 1.0)) * diffusion_loss
-            + float(weights.get("generated", 1.0)) * generated_loss
+            + generated_weight * generated_loss
             + float(weights.get("kl", 0.0)) * kl
         )
         return {
@@ -401,6 +435,11 @@ class CombinedModel(pl.LightningModule):
                 batch["latent"], batch_idx
             )
             losses = self.stage2_losses(batch, noise=noise, sigma=sigma)
+        elif self.task == "combined":
+            losses = self.stage3_losses(
+                batch,
+                deterministic_noise_batch_idx=batch_idx,
+            )
         else:
             losses = self._losses(batch)
         batch_size = (

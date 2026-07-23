@@ -4,7 +4,12 @@ import torch
 import torch.utils.data 
 from torch.nn import functional as F
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, Callback, LearningRateMonitor
+from pytorch_lightning.callbacks import (
+    ModelCheckpoint,
+    Callback,
+    EarlyStopping,
+    LearningRateMonitor,
+)
 from pytorch_lightning import loggers as pl_loggers
 
 import os
@@ -80,10 +85,19 @@ def train():
             else None
         )
     else:
-        train_dataset = build_dataset(split)
+        conditioning_sources = (
+            build_conditioning_sources(get_conditioning_specs(specs))
+            if specs["training_task"] == "combined"
+            else []
+        )
+        train_dataset = build_dataset(
+            split,
+            conditioning_sources=conditioning_sources,
+        )
         val_dataset = (
             build_dataset(
                 val_split,
+                conditioning_sources=conditioning_sources,
                 deterministic_sampling=bool(
                     specs.get("DeterministicValidationSampling", False)
                 ),
@@ -91,6 +105,14 @@ def train():
             if val_split is not None
             else None
         )
+        if conditioning_sources:
+            all_records = train_dataset.records + (
+                val_dataset.records if val_dataset is not None else []
+            )
+            use_spawn_workers = (
+                prepare_conditioning_sources(conditioning_sources, all_records)
+                and args.workers > 0
+            )
 
     if args.virtual_train_size is not None:
         train_dataset = VirtualDataset(train_dataset, args.virtual_train_size)
@@ -122,17 +144,30 @@ def train():
         save_last=True,
         every_n_epochs=specs["log_freq"],
     )
+    checkpoint_monitor = specs.get("checkpoint_monitor", "val/loss")
     best_callback = ModelCheckpoint(
         dirpath=args.exp_dir,
         filename='best',
-        monitor='val/loss',
-        mode='min',
+        monitor=checkpoint_monitor,
+        mode=specs.get("checkpoint_mode", "min"),
         save_top_k=1,
     ) if val_dataloader is not None else None
     lr_monitor = LearningRateMonitor(logging_interval='step')
     callbacks = [periodic_callback, lr_monitor]
     if best_callback is not None:
         callbacks.append(best_callback)
+    early_stopping_specs = specs.get("early_stopping")
+    if early_stopping_specs:
+        if val_dataloader is None:
+            raise ValueError("early_stopping requires a validation split")
+        callbacks.append(EarlyStopping(
+            monitor=early_stopping_specs.get("monitor", "val/loss"),
+            mode=early_stopping_specs.get("mode", "min"),
+            patience=int(early_stopping_specs.get("patience", 100)),
+            min_delta=float(early_stopping_specs.get("min_delta", 0.0)),
+            verbose=bool(early_stopping_specs.get("verbose", True)),
+            check_finite=bool(early_stopping_specs.get("check_finite", True)),
+        ))
 
     model = CombinedModel(specs)
 
@@ -146,6 +181,7 @@ def train():
             allowed_missing_prefixes=specs.get(
                 "init_from_allowed_missing_prefixes", ()
             ),
+            excluded_keys=specs.get("init_from_excluded_keys", ()),
         )
         resume = None
     elif args.resume == 'finetune':
@@ -184,7 +220,12 @@ def train():
         trainer.fit(model=model, train_dataloaders=train_dataloader, ckpt_path=resume)
 
 
-def load_weights_only(model, checkpoint_path, allowed_missing_prefixes=()):
+def load_weights_only(
+    model,
+    checkpoint_path,
+    allowed_missing_prefixes=(),
+    excluded_keys=(),
+):
     """Load model parameters without restoring trainer or optimizer state."""
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint:
@@ -193,13 +234,20 @@ def load_weights_only(model, checkpoint_path, allowed_missing_prefixes=()):
             f"with a state_dict: {checkpoint_path}"
         )
     allowed_missing_prefixes = tuple(allowed_missing_prefixes)
-    if not allowed_missing_prefixes:
+    excluded_keys = set(excluded_keys)
+    if not allowed_missing_prefixes and not excluded_keys:
         model.load_state_dict(checkpoint["state_dict"], strict=True)
         return
-    result = model.load_state_dict(checkpoint["state_dict"], strict=False)
+    state_dict = {
+        key: value
+        for key, value in checkpoint["state_dict"].items()
+        if key not in excluded_keys
+    }
+    result = model.load_state_dict(state_dict, strict=False)
     disallowed_missing = [
         key for key in result.missing_keys
-        if not key.startswith(allowed_missing_prefixes)
+        if key not in excluded_keys
+        and not key.startswith(allowed_missing_prefixes)
     ]
     if disallowed_missing or result.unexpected_keys:
         raise RuntimeError(
@@ -253,6 +301,7 @@ def build_dataset(
         ),
         deterministic_sampling=deterministic_sampling,
         sampling_seed=int(specs.get("ValidationSamplingSeed", 0)),
+        conditioning_sources=conditioning_sources,
     )
 
 

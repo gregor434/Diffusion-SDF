@@ -9,6 +9,9 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from dataloader.conditioning import build_conditioning_sources
+
+
 class SdfLoader(Dataset):
     def __init__(
         self,
@@ -19,6 +22,8 @@ class SdfLoader(Dataset):
         near_surface_ratio=0.7,
         modulation_path=None,
         condition_surface=False,
+        conditioning=None,
+        conditioning_sources=None,
         deterministic_sampling=False,
         sampling_seed=0,
         **_,
@@ -27,6 +32,11 @@ class SdfLoader(Dataset):
         self.surface_point_count = int(surface_point_count)
         self.near_surface_ratio = float(near_surface_ratio)
         self.condition_surface = bool(condition_surface)
+        self.conditioning_sources = (
+            conditioning_sources
+            if conditioning_sources is not None
+            else build_conditioning_sources(conditioning)
+        )
         self.deterministic_sampling = bool(deterministic_sampling)
         self.sampling_seed = int(sampling_seed)
         if not 0 <= self.near_surface_ratio <= 1:
@@ -45,10 +55,25 @@ class SdfLoader(Dataset):
                         modulation = modulation_path / class_name / object_id / "modulation.npz"
                         if not modulation.is_file():
                             continue
+                    record = {
+                        "data_path": str(path),
+                        "dataset": dataset,
+                        "class_name": class_name,
+                        "instance_name": object_id,
+                    }
                     if not path.is_file():
                         logging.warning("Requested non-existent file '%s'", path)
                         continue
-                    self.records.append((path, dataset, class_name, object_id))
+                    if not all(
+                        source.exists(record)
+                        for source in self.conditioning_sources
+                    ):
+                        logging.warning(
+                            "Missing conditioning data for '%s/%s/%s'",
+                            dataset, class_name, object_id,
+                        )
+                        continue
+                    self.records.append(record)
 
     def __len__(self):
         return len(self.records)
@@ -59,7 +84,11 @@ class SdfLoader(Dataset):
             if self.deterministic_sampling
             else np.random
         )
-        path, dataset, class_name, object_id = self.records[index]
+        record = self.records[index]
+        path = Path(record["data_path"])
+        dataset = record["dataset"]
+        class_name = record["class_name"]
+        object_id = record["instance_name"]
         with np.load(path) as data:
             surface_indices = rng.choice(
                 len(data["surface_points"]),
@@ -116,7 +145,16 @@ class SdfLoader(Dataset):
             "dataset": dataset,
             "class_name": class_name,
         }
-        if self.condition_surface:
+        if self.conditioning_sources:
+            item["conditioning"] = {
+                source.name: source.load(record)
+                for source in self.conditioning_sources
+            }
+            item["conditioning_paths"] = {
+                source.name: source.resolve(record)
+                for source in self.conditioning_sources
+            }
+        elif self.condition_surface:
             item["conditioning"] = {"point_cloud": surface}
         if surface_normals is not None:
             item["surface_normals"] = torch.from_numpy(

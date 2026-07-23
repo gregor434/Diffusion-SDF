@@ -238,6 +238,58 @@ The denoiser is a non-causal token transformer over [B,M,D]. It uses the EDM
 log-normal noise distribution, EDM preconditioning, weighted denoising loss,
 and second-order Heun sampling referenced by COD-VAE through VecSet.
 
+For the deduplicated 21-ray chairs and the matching frozen-latent stage-one
+checkpoint, fresh unconditional and CLIP image-conditioned runs are:
+
+    python train.py -e config/cod/stage2_transformer_diffusion_multiray21 -b 32 -w 8
+    python train.py -e config/cod/stage2_transformer_image_diffusion_multiray21 -b 32 -w 8
+
+No separate modulation command is required for these profiles. On first
+startup, `train.py` encodes every configured object with
+`stage1_decoder_conv_head_multiray21/best.ckpt`, stores four posterior
+mean/log-variance variants per training object in the unconditional stage-two
+experiment, and computes training-only latent statistics. Both profiles share
+this cache; the conditional profile additionally prepares and caches its CLIP
+image features.
+
+Do not initialize these profiles from the older full-chair diffusion
+checkpoints. Most objects overlap and 58 of the 76 multi-ray validation objects
+were part of the old training split, so doing so would invalidate the new
+validation result. Both profiles therefore start diffusion training from
+scratch. They log scalar data every 20 steps, retain periodic checkpoints only
+every 400 epochs, and stop early after 200 validation epochs without an
+improvement of at least 1e-4.
+
+Each stage-two model and its matching reconstruction-guided refinement phase
+is launched independently. Start the unconditional pipeline with:
+
+    python scripts/train_stage2_pipeline.py \
+      --model unconditional \
+      --stage2-batch-size 32 \
+      --refinement-batch-size 2 \
+      --workers 8
+
+Start the conditional pipeline separately with:
+
+    python scripts/train_stage2_pipeline.py \
+      --model conditional \
+      --stage2-batch-size 32 \
+      --refinement-batch-size 2 \
+      --workers 8
+
+When the selected stage-two trainer reaches early stopping or its 1600-epoch
+ceiling, its process returns and the launcher immediately initializes only its
+matching stage-three experiment from `best.ckpt`. Stage three freezes the
+complete COD/SDF model and refines only the diffusion network with
+`0.1 * EDM loss + 1.0 * generated-SDF L1 loss`.
+Validation surface/query sampling, posterior selection, and EDM noise are
+deterministic. Stage-three early stopping monitors `val/sdf_denoised` with
+patience 15.
+
+Use `--skip-stage2` to refine an existing best checkpoint or
+`--skip-refinement` to train only the selected prior. Interrupted stages can
+be continued with `--resume-stage2` or `--resume-refinement`.
+
     python test.py -e config/cod/stage2_transformer_diffusion -r last -n 5
 
 Sampling denormalizes tokens, loads the stage-one SDF/COD checkpoint, decodes

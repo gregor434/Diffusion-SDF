@@ -74,6 +74,28 @@ class WeightsOnlyInitializationTests(unittest.TestCase):
                     allowed_missing_prefixes=("unrelated.",),
                 )
 
+    def test_excluded_buffers_keep_target_values(self):
+        class Model(nn.Module):
+            def __init__(self, statistic):
+                super().__init__()
+                self.projection = nn.Linear(2, 2)
+                self.register_buffer("latent_mean", torch.tensor([statistic]))
+
+        source = Model(3.0)
+        target = Model(7.0)
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint_path = Path(directory) / "source.ckpt"
+            torch.save({"state_dict": source.state_dict()}, checkpoint_path)
+            load_weights_only(
+                target,
+                checkpoint_path,
+                excluded_keys=("latent_mean",),
+            )
+
+        torch.testing.assert_close(target.projection.weight, source.projection.weight)
+        torch.testing.assert_close(target.projection.bias, source.projection.bias)
+        torch.testing.assert_close(target.latent_mean, torch.tensor([7.0]))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -109,6 +109,66 @@ class CODPipelineTests(unittest.TestCase):
             scheduler.step()
         self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 1e-6)
 
+    def test_stage_three_reconstruction_refines_only_diffusion(self):
+        specs = tiny_specs()
+        specs.update({
+            "training_task": "combined",
+            "stage3_mode": "diffusion_only",
+            "sample_posterior": False,
+            "validation_sample_posterior": False,
+            "validation_noise_seed": 11,
+            "diffusion_specs": {
+                "sigma_data": 1.0,
+                "P_mean": -1.2,
+                "P_std": 1.2,
+                "sampling_steps": 2,
+            },
+            "diffusion_model_specs": {
+                "latent_tokens": 2,
+                "latent_dimension": 3,
+                "width": 16,
+                "depth": 1,
+                "heads": 4,
+                "dropout": 0.0,
+                "cond": True,
+                "condition_dim": 8,
+                "condition_encoders": [
+                    {"type": "image", "clip_feature_dim": 12}
+                ],
+            },
+            "loss_weights": {
+                "direct": 0.0,
+                "diffusion": 0.1,
+                "generated": 1.0,
+                "kl": 0.0,
+            },
+            "learning_rates": {"diffusion": 5e-6},
+        })
+        model = CombinedModel(specs).train()
+        batch = {
+            "surface_points": torch.rand(2, 8, 3) * 1.8 - 0.9,
+            "query_points": torch.rand(2, 6, 3) * 1.8 - 0.9,
+            "query_sdf": torch.randn(2, 6) * 0.05,
+            "conditioning": {"image": torch.randn(2, 1, 12)},
+        }
+        losses = model.stage3_losses(batch)
+        losses["loss"].backward()
+
+        self.assertEqual(losses["sdf_direct"].item(), 0.0)
+        self.assertTrue(torch.isfinite(losses["sdf_denoised"]))
+        self.assertTrue(
+            any(
+                parameter.grad is not None
+                for parameter in model.diffusion_model.parameters()
+            )
+        )
+        self.assertTrue(
+            all(
+                parameter.grad is None
+                for parameter in model.sdf_model.parameters()
+            )
+        )
+
     def test_official_solver_checkpoint_prefix_loads_strictly(self):
         specs = tiny_specs()
         specs["CODVaeSpecs"]["decoder_params"]["num_merged_tokens"] = 2
@@ -489,6 +549,45 @@ class CODPipelineTests(unittest.TestCase):
         torch.testing.assert_close(
             item["query_sdf"], repeated["query_sdf"], rtol=0, atol=0
         )
+
+    def test_sdf_loader_supports_stage_three_conditioning_sources(self):
+        class StubImageSource:
+            name = "image"
+
+            def exists(self, record):
+                return record["instance_name"] == "item"
+
+            def load(self, record):
+                return torch.ones(1, 12)
+
+            def resolve(self, record):
+                return f"{record['instance_name']}.png"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "abo" / "ABO" / "item" / "cod_sdf.npz"
+            path.parent.mkdir(parents=True)
+            np.savez(
+                path,
+                surface_points=np.random.randn(12, 3).astype(np.float32),
+                near_surface_query_points=np.random.randn(10, 3).astype(np.float32),
+                near_surface_sdf=np.linspace(-1, 1, 10).astype(np.float32),
+                uniform_query_points=np.random.randn(8, 3).astype(np.float32),
+                uniform_sdf=np.linspace(-1, 1, 8).astype(np.float32),
+            )
+            dataset = SdfLoader(
+                tmpdir,
+                {"abo": {"ABO": ["item"]}},
+                samples_per_mesh=10,
+                surface_point_count=8,
+                conditioning_sources=[StubImageSource()],
+            )
+            item = dataset[0]
+
+        self.assertEqual(
+            item["conditioning"]["image"].shape,
+            torch.Size([1, 12]),
+        )
+        self.assertEqual(item["conditioning_paths"]["image"], "item.png")
 
 
 if __name__ == "__main__":
