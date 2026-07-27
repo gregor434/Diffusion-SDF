@@ -72,6 +72,34 @@ class _CheckpointModel(torch.nn.Module):
 
 
 class ImageConditionedGenerationTests(unittest.TestCase):
+    def test_generation_dataset_accepts_stage_three_modulation_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            split_path = root / "split.json"
+            split_path.write_text('{"abo": {"ABO": ["item0"]}}')
+            modulation_dir = root / "modulations" / "ABO" / "item0"
+            modulation_dir.mkdir(parents=True)
+            import numpy as np
+
+            np.savez(
+                modulation_dir / "modulation.npz",
+                object_id=np.asarray("item0"),
+                posterior_mean=np.zeros((2, 3), dtype=np.float32),
+                posterior_logvar=np.zeros((2, 3), dtype=np.float32),
+            )
+            np.savez(
+                root / "modulations" / "latent_stats.npz",
+                mean=np.zeros((1, 1, 3), dtype=np.float32),
+                std=np.ones((1, 1, 3), dtype=np.float32),
+            )
+
+            dataset = test.make_generation_dataset({
+                "TestSplit": str(split_path),
+                "modulation_path": str(root / "modulations"),
+                "conditioning": None,
+            })
+
+            self.assertEqual(len(dataset), 1)
     def test_named_and_epoch_checkpoint_paths(self):
         self.assertEqual(test.checkpoint_path("experiment", "last"), "experiment/last.ckpt")
         self.assertEqual(test.checkpoint_path("experiment", "best"), "experiment/best.ckpt")

@@ -1,0 +1,86 @@
+{
+  "Description": "Controlled medium-capacity unconditional COD token diffusion on encoder-refined multi-ray ABO chair latents",
+  "DataSource": "datasets",
+  "TrainSplit": "datasets/splits/abo_fullchairs_multiray21_CHAIR_train.json",
+  "ValSplit": "datasets/splits/abo_fullchairs_multiray21_CHAIR_val.json",
+  "TestSplit": "datasets/splits/abo_fullchairs_multiray21_CHAIR_val.json",
+  "modulation_ckpt_path": "config/cod/stage1_encoder_refine_multiray21/best-v1.ckpt",
+  "modulation_cache_path": "config/cod/stage2_transformer_diffusion_multiray21_encoder_refined/modulations",
+  "data_path": "config/cod/stage2_transformer_diffusion_multiray21_encoder_refined/modulations",
+  "latent_stats_path": "config/cod/stage2_transformer_diffusion_multiray21_encoder_refined/modulations/latent_stats.npz",
+  "modulation_variants": 4,
+  "sample_posterior_latents": true,
+  "validation_noise_seed": 0,
+  "conditioning": null,
+  "training_task": "diffusion",
+  "CODVaeSpecs": {
+    "checkpoint_path": "tmp/cod_vae_m32_weights.pt",
+    "strict_checkpoint_loading": true,
+    "checkpoint_allowed_missing_prefixes": [
+      "autoencoder.decoder.conv_refine."
+    ],
+    "latent_tokens": 32,
+    "latent_dimension": 32,
+    "embed_dimension": 512,
+    "triplane_dimension": 32,
+    "latent_decoder_layers": 12,
+    "uncertainty_mode": "disabled",
+    "encoder_params": {
+      "num_patches": 512,
+      "num_blocks": 4,
+      "num_layers_per_block": 3
+    },
+    "decoder_params": {
+      "output_resolution": 128,
+      "output_patch_size": 8,
+      "num_layers": 12,
+      "num_init_layers": 1,
+      "mlp_ratio": 2,
+      "keep_ratio": 1.0,
+      "num_merged_tokens": 8,
+      "use_conv_refine": true
+    }
+  },
+  "SdfModelSpecs": {
+    "hidden_dim": 512,
+    "feature_dim": 32
+  },
+  "diffusion_specs": {
+    "sigma_data": 1.0,
+    "P_mean": -1.2,
+    "P_std": 1.2,
+    "sigma_min": 0.002,
+    "sigma_max": 80.0,
+    "rho": 7.0,
+    "sampling_steps": 40
+  },
+  "diffusion_model_specs": {
+    "latent_tokens": 32,
+    "latent_dimension": 32,
+    "width": 256,
+    "depth": 8,
+    "heads": 8,
+    "mlp_ratio": 4,
+    "dropout": 0.25,
+    "cond": false
+  },
+  "learning_rates": {
+    "diffusion": 0.00001
+  },
+  "lr_scheduler": {
+    "type": "cosine",
+    "min_lr": 0.000001,
+    "epochs": 15000
+  },
+  "early_stopping": {
+    "monitor": "val/loss",
+    "mode": "min",
+    "patience": 75,
+    "min_delta": 0.0001
+  },
+  "weight_decay": 0.05,
+  "gradient_clip_val": 1.0,
+  "num_epochs": 5000,
+  "log_freq": 400,
+  "log_every_n_steps": 20
+}

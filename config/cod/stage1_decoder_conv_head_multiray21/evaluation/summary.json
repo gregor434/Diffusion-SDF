@@ -13,21 +13,21 @@
     "discovered_reconstructions": 76,
     "expected_test_instances": 76,
     "missing_expected_reconstructions": 0,
-    "missing_iou_comparisons": 65,
+    "missing_iou_comparisons": 6,
     "missing_references": 0,
     "partial": true,
     "usable_references": 76,
-    "valid_iou_comparisons": 11,
+    "valid_iou_comparisons": 70,
     "valid_reconstructions": 76
   },
   "mesh_health": {
     "component_count_omitted": 13,
     "discovered": 76,
     "invalid": 0,
-    "mean_outside_domain_vertex_fraction": 0.0,
-    "multi_component_fraction": 0.9365079365079365,
+    "mean_outside_domain_vertex_fraction": 0.00035601242145682545,
+    "multi_component_fraction": 0.9206349206349206,
     "valid": 76,
-    "watertight_fraction": 0.14473684210526316
+    "watertight_fraction": 0.9210526315789473
   },
   "metric_definitions": {
     "chamfer": {
@@ -56,69 +56,69 @@
   "paired_fidelity": {
     "cd_reference_to_sample": {
       "count": 76,
-      "mean": 0.016030833216104868,
-      "median": 0.014637459941234268,
-      "p95": 0.027134398816328457
+      "mean": 0.01604580153373476,
+      "median": 0.014709876696621058,
+      "p95": 0.02755433169317844
     },
     "cd_sample_to_reference": {
       "count": 76,
-      "mean": 0.017456814055229374,
-      "median": 0.015003648835200414,
-      "p95": 0.03748857486037839
+      "mean": 0.017648060978948932,
+      "median": 0.014799755096790601,
+      "p95": 0.03926571612135004
     },
     "chamfer": {
       "count": 76,
-      "mean": 0.03348764727133424,
-      "median": 0.02974131904402839,
-      "p95": 0.06534337325135815
+      "mean": 0.0336938625126837,
+      "median": 0.029687921870646995,
+      "p95": 0.06756407931706164
     },
     "fscore@0.01": {
       "count": 76,
-      "mean": 0.264350953274219,
-      "median": 0.26794532525789294,
-      "p95": 0.4086510409232586
+      "mean": 0.26510104011624336,
+      "median": 0.26969765032973736,
+      "p95": 0.41013824955711037
     },
     "fscore@0.02": {
       "count": 76,
-      "mean": 0.7361494539314062,
-      "median": 0.7892053031484005,
-      "p95": 0.9131707214383685
+      "mean": 0.7357412770502452,
+      "median": 0.7936378267919338,
+      "p95": 0.9152831268534423
     },
     "hausdorff95": {
       "count": 76,
-      "mean": 0.03640439622735353,
-      "median": 0.02817651639010428,
-      "p95": 0.09715187895908589
+      "mean": 0.03738727898353679,
+      "median": 0.02814629121257444,
+      "p95": 0.10289968350261758
     },
     "iou": {
-      "count": 11,
-      "mean": 0.6663002757748366,
-      "median": 0.8772102161100196,
-      "p95": 0.9653292539524211
+      "count": 70,
+      "mean": 0.8353925992465953,
+      "median": 0.9282765135977378,
+      "p95": 0.9684706187053433
     },
     "precision@0.01": {
       "count": 76,
-      "mean": 0.26377236842105267,
-      "median": 0.26749999999999996,
-      "p95": 0.40380000000000005
+      "mean": 0.2643328947368421,
+      "median": 0.26815,
+      "p95": 0.4053
     },
     "precision@0.02": {
       "count": 76,
-      "mean": 0.7304907894736841,
-      "median": 0.78285,
-      "p95": 0.908475
+      "mean": 0.7301513157894737,
+      "median": 0.7926,
+      "p95": 0.9186
     },
     "recall@0.01": {
       "count": 76,
-      "mean": 0.2649921052631579,
-      "median": 0.26949999999999996,
-      "p95": 0.4144
+      "mean": 0.2659171052631579,
+      "median": 0.27285000000000004,
+      "p95": 0.41885
     },
     "recall@0.02": {
       "count": 76,
-      "mean": 0.7424473684210527,
-      "median": 0.79965,
-      "p95": 0.923525
+      "mean": 0.7420302631578949,
+      "median": 0.8009999999999999,
+      "p95": 0.9216249999999999
     }
   },
   "parameters": {
@@ -131,10 +131,10 @@
     "num_points": 10000,
     "reconstruction_domain": 1.0,
     "seed": 0,
-    "workers": 2
+    "workers": 8
   },
   "schema_version": 3,
   "warnings": [
-    "65 paired reconstruction(s) have no valid IoU"
+    "6 paired reconstruction(s) have no valid IoU"
   ]
 }

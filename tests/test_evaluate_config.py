@@ -103,6 +103,35 @@ class CODEvaluationTests(unittest.TestCase):
             self.assertEqual(result["valid"], 0)
             self.assertIn("posterior shape", result["invalid"]["ABO/item"])
 
+    def test_stage_three_validates_modulation_path(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data_source = root / "datasets"
+            data_source.mkdir()
+            specs = self._write_configuration(root, data_source, task="combined")
+            specs["diffusion_model_specs"] = {
+                "latent_tokens": 2,
+                "latent_dimension": 3,
+                "cond": False,
+            }
+            specs["modulation_path"] = str(root / "cached_modulations")
+            (root / "specs.json").write_text(json.dumps(specs))
+            modulation_dir = root / "cached_modulations" / "ABO" / "item"
+            modulation_dir.mkdir(parents=True)
+            np.savez(
+                modulation_dir / "modulation.npz",
+                object_id=np.asarray("item"),
+                posterior_mean=np.zeros((2, 3), dtype=np.float32),
+                posterior_logvar=np.zeros((2, 3), dtype=np.float32),
+            )
+
+            result = evaluate_config.validate_modulations(
+                evaluate_config.resolve_configuration(root)
+            )
+
+            self.assertEqual(result["path"], str((root / "cached_modulations")))
+            self.assertEqual(result["valid"], 1)
+
     def test_stage_two_resolves_data_source_from_stage_one_specs(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

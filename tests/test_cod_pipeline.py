@@ -473,6 +473,75 @@ class CODPipelineTests(unittest.TestCase):
             )
         )
 
+    def test_encoder_finetune_updates_only_encoder_and_variational_block(self):
+        source_specs = tiny_specs()
+        source = SdfModel(source_specs)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_path = Path(tmpdir) / "cod.pt"
+            torch.save(
+                {
+                    "state_dict": {
+                        f"model.{name}": value.clone()
+                        for name, value in source.cod_vae.state_dict().items()
+                    }
+                },
+                checkpoint_path,
+            )
+            specs = tiny_specs()
+            specs.update(
+                {
+                    "training_task": "modulation",
+                    "stage1_mode": "encoder_finetune",
+                    "sample_posterior": True,
+                    "loss_weights": {"sdf": 1.0, "kl": 1e-4},
+                    "learning_rates": {
+                        "point_encoder": 2e-6,
+                        "variational_block": 1e-5,
+                    },
+                }
+            )
+            specs["CODVaeSpecs"]["checkpoint_path"] = str(checkpoint_path)
+            model = CombinedModel(specs).train()
+
+        batch = {
+            "surface_points": torch.rand(2, 8, 3) * 1.8 - 0.9,
+            "query_points": torch.rand(2, 6, 3) * 1.8 - 0.9,
+            "query_sdf": torch.randn(2, 6) * 0.05,
+        }
+        losses = model.stage1_losses(batch)
+        losses["loss"].backward()
+        components = model.sdf_model.component_modules()
+        for name in ("point_encoder", "variational_block"):
+            self.assertTrue(
+                any(
+                    parameter.requires_grad and parameter.grad is not None
+                    for parameter in components[name].parameters()
+                ),
+                name,
+            )
+        for name in ("latent_decoder", "triplane_decoder", "sdf_network"):
+            self.assertTrue(
+                all(
+                    not parameter.requires_grad and parameter.grad is None
+                    for parameter in components[name].parameters()
+                ),
+                name,
+            )
+        configured = model.configure_optimizers()
+        optimizer = (
+            configured["optimizer"]
+            if isinstance(configured, dict)
+            else configured
+        )
+        self.assertEqual(
+            [group["name"] for group in optimizer.param_groups],
+            ["point_encoder", "variational_block"],
+        )
+        self.assertEqual(
+            [group["lr"] for group in optimizer.param_groups],
+            [2e-6, 1e-5],
+        )
+
     def test_disabled_uncertainty_rejects_positive_loss_weight(self):
         specs = tiny_specs()
         specs.update({

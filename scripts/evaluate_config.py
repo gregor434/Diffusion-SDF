@@ -644,7 +644,9 @@ def validate_modulations(context):
         modulation_dir = config_dir / "modulations"
     else:
         modulation_value = (
-            specs.get("modulation_cache_path") or specs.get("data_path")
+            specs.get("modulation_cache_path")
+            or specs.get("data_path")
+            or specs.get("modulation_path")
         )
         modulation_dir = (
             _resolve_path(modulation_value, config_dir, must_exist=False)

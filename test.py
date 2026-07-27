@@ -97,8 +97,18 @@ def make_sdf_dataset(specs, split_name="TestSplit", condition_surface=False):
 
 def make_generation_dataset(specs):
     split = json.loads(Path(specs["TestSplit"]).read_text())
+    modulation_path = (
+        specs.get("data_path")
+        or specs.get("modulation_cache_path")
+        or specs.get("modulation_path")
+    )
+    if not modulation_path:
+        raise ValueError(
+            "conditional generation requires data_path, modulation_cache_path, "
+            "or modulation_path in specs.json"
+        )
     return ModulationLoader(
-        specs["data_path"],
+        modulation_path,
         split_file=split,
         conditioning=specs.get("conditioning"),
         latent_stats_path=specs.get("latent_stats_path"),
