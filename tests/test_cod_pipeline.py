@@ -542,6 +542,60 @@ class CODPipelineTests(unittest.TestCase):
             [2e-6, 1e-5],
         )
 
+    def test_joint_refinement_freezes_only_the_point_encoder_backbone(self):
+        source_specs = tiny_specs()
+        source_specs["CODVaeSpecs"]["decoder_params"]["use_conv_refine"] = True
+        source = SdfModel(source_specs)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_path = Path(tmpdir) / "cod.pt"
+            torch.save(
+                {
+                    "state_dict": {
+                        f"model.{name}": value.clone()
+                        for name, value in source.cod_vae.state_dict().items()
+                    }
+                },
+                checkpoint_path,
+            )
+            specs = tiny_specs()
+            specs["CODVaeSpecs"]["decoder_params"]["use_conv_refine"] = True
+            specs["CODVaeSpecs"]["checkpoint_path"] = str(checkpoint_path)
+            specs.update(
+                {
+                    "training_task": "modulation",
+                    "stage1_mode": "joint_refinement",
+                    "learning_rates": {
+                        "variational_block": 1e-5,
+                        "latent_decoder": 1e-5,
+                        "triplane_decoder": 1e-5,
+                        "conv_refine": 2e-4,
+                        "sdf_network": 1e-4,
+                    },
+                }
+            )
+            model = CombinedModel(specs)
+
+        components = model.sdf_model.component_modules()
+        self.assertTrue(
+            all(not parameter.requires_grad for parameter in components["point_encoder"].parameters())
+        )
+        for name in (
+            "variational_block", "latent_decoder", "triplane_decoder", "sdf_network",
+        ):
+            self.assertTrue(
+                any(parameter.requires_grad for parameter in components[name].parameters()),
+                name,
+            )
+        configured = model.configure_optimizers()
+        optimizer = configured["optimizer"] if isinstance(configured, dict) else configured
+        self.assertEqual(
+            [group["name"] for group in optimizer.param_groups],
+            [
+                "conv_refine", "variational_block", "latent_decoder",
+                "triplane_decoder", "sdf_network",
+            ],
+        )
+
     def test_disabled_uncertainty_rejects_positive_loss_weight(self):
         specs = tiny_specs()
         specs.update({

@@ -17,6 +17,9 @@ STAGE1_COMPONENTS = {
     "encoder_finetune": {"point_encoder", "variational_block"},
     "triplane_sdf_finetune": {"triplane_decoder", "sdf_network"},
     "cod_decoder_finetune": {"latent_decoder", "triplane_decoder", "sdf_network"},
+    "joint_refinement": {
+        "variational_block", "latent_decoder", "triplane_decoder", "sdf_network",
+    },
     "full_cod_finetune": {
         "point_encoder", "variational_block", "latent_decoder",
         "triplane_decoder", "sdf_network",
