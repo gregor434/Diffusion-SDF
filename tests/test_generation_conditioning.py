@@ -187,6 +187,39 @@ class ImageConditionedGenerationTests(unittest.TestCase):
         )
         self.assertEqual(create_mesh.call_count, 2)
 
+    def test_generation_skips_existing_sample_meshes(self):
+        model = _Model()
+        specs = {"diffusion_model_specs": {"cond": True}}
+        args = type("Args", (), {
+            "num_samples": 2,
+            "recon_resolution": 16,
+            "max_batch": 32,
+            "skip_existing": True,
+        })()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            output_dir = root / "ABO" / "item0"
+            output_dir.mkdir(parents=True)
+            (output_dir / "0_recon.ply").touch()
+            _GenerationDataset.image_path = root / "source.jpg"
+            Image.new("RGB", (8, 8)).save(_GenerationDataset.image_path)
+            with patch.object(
+                test, "load_generation_models", return_value=(model, _SdfModel())
+            ):
+                with patch.object(
+                    test, "make_generation_dataset", return_value=_GenerationDataset()
+                ):
+                    with patch.object(test.mesh, "create_mesh") as create_mesh:
+                        with patch.object(test.evaluate, "mesh_validity", return_value=1.0):
+                            test.generate(specs, args, root, torch.device("cpu"))
+
+        self.assertEqual(create_mesh.call_count, 1)
+        self.assertEqual(
+            create_mesh.call_args.args[2],
+            str(output_dir / "1_recon"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

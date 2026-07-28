@@ -673,6 +673,42 @@ class CODPipelineTests(unittest.TestCase):
             item["query_sdf"], repeated["query_sdf"], rtol=0, atol=0
         )
 
+    def test_sdf_loader_can_fix_surface_without_fixing_query_supervision(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "abo" / "ABO" / "item" / "cod_sdf.npz"
+            path.parent.mkdir(parents=True)
+            surface = np.arange(90, dtype=np.float32).reshape(30, 3)
+            near = np.arange(180, dtype=np.float32).reshape(60, 3)
+            uniform = np.arange(180, 360, dtype=np.float32).reshape(60, 3)
+            np.savez(
+                path,
+                surface_points=surface,
+                near_surface_query_points=near,
+                near_surface_sdf=np.arange(60, dtype=np.float32),
+                uniform_query_points=uniform,
+                uniform_sdf=np.arange(60, 120, dtype=np.float32),
+            )
+            dataset = SdfLoader(
+                tmpdir,
+                {"abo": {"ABO": ["item"]}},
+                samples_per_mesh=20,
+                surface_point_count=12,
+                near_surface_ratio=0.5,
+                deterministic_surface_sampling=True,
+                sampling_seed=23,
+            )
+            first = dataset[0]
+            second = dataset[0]
+
+        torch.testing.assert_close(
+            first["surface_points"],
+            second["surface_points"],
+            rtol=0,
+            atol=0,
+        )
+        self.assertFalse(torch.equal(first["query_points"], second["query_points"]))
+        self.assertFalse(torch.equal(first["query_sdf"], second["query_sdf"]))
+
     def test_sdf_loader_supports_stage_three_conditioning_sources(self):
         class StubImageSource:
             name = "image"

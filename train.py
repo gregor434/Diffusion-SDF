@@ -93,6 +93,10 @@ def train():
         train_dataset = build_dataset(
             split,
             conditioning_sources=conditioning_sources,
+            deterministic_surface_sampling=bool(
+                specs.get("DeterministicTrainSurfaceSampling", False)
+            ),
+            sampling_seed=int(specs.get("TrainSurfaceSamplingSeed", 0)),
         )
         val_dataset = (
             build_dataset(
@@ -277,6 +281,8 @@ def build_dataset(
     records=None,
     sample_posterior_latents=False,
     deterministic_sampling=False,
+    deterministic_surface_sampling=False,
+    sampling_seed=None,
 ):
     if specs['training_task'] == 'diffusion':
         return ModulationLoader(
@@ -300,7 +306,12 @@ def build_dataset(
             specs.get("diffusion_model_specs", {}).get("cond", False)
         ),
         deterministic_sampling=deterministic_sampling,
-        sampling_seed=int(specs.get("ValidationSamplingSeed", 0)),
+        deterministic_surface_sampling=deterministic_surface_sampling,
+        sampling_seed=(
+            int(specs.get("ValidationSamplingSeed", 0))
+            if sampling_seed is None
+            else int(sampling_seed)
+        ),
         conditioning_sources=conditioning_sources,
     )
 

@@ -131,6 +131,15 @@ def save_modulation(path, object_id, posterior, conditioning=None):
     temporary.replace(path)
 
 
+def open_metrics(path, fieldnames, append=False):
+    mode = "a" if append and path.is_file() else "w"
+    metric_file = path.open(mode, newline="")
+    writer = csv.DictWriter(metric_file, fieldnames=fieldnames)
+    if mode == "w" or path.stat().st_size == 0:
+        writer.writeheader()
+    return metric_file, writer
+
+
 @torch.no_grad()
 def extract_modulations(specs, args, recon_dir, latent_dir, device):
     test_split_only = getattr(args, "test_split_only", False)
@@ -142,18 +151,32 @@ def extract_modulations(specs, args, recon_dir, latent_dir, device):
     ).to(device).eval()
     records = []
     metrics_path = recon_dir / "sdf_metrics.csv"
-    with metrics_path.open("w", newline="") as metric_file:
-        writer = csv.DictWriter(
-            metric_file,
-            fieldnames=[
-                "object_id", "sdf_reconstruction_error", "near_surface_error",
-                "uniform_error", "sign_accuracy", "encoding_time",
-                "decoding_time", "peak_memory", "chamfer_distance",
-                "f_score", "normal_consistency", "mesh_validity",
-            ],
-        )
-        writer.writeheader()
+    metric_file, writer = open_metrics(
+        metrics_path,
+        [
+            "object_id", "sdf_reconstruction_error", "near_surface_error",
+            "uniform_error", "sign_accuracy", "encoding_time",
+            "decoding_time", "peak_memory", "chamfer_distance",
+            "f_score", "normal_consistency", "mesh_validity",
+        ],
+        append=getattr(args, "skip_existing", False),
+    )
+    with metric_file:
         for batch in tqdm(loader, desc="extracting COD modulations"):
+            object_id = batch["object_id"][0]
+            class_name = batch["class_name"][0]
+            output_dir = recon_dir / class_name / object_id
+            mesh_path = output_dir / "reconstruct"
+            modulation_path = latent_dir / class_name / object_id / "modulation.npz"
+            if (
+                getattr(args, "skip_existing", False)
+                and mesh_path.with_suffix(".ply").is_file()
+                and modulation_path.is_file()
+            ):
+                records.append({"latent_path": str(modulation_path)})
+                continue
+
+            output_dir.mkdir(parents=True, exist_ok=True)
             surface = batch["surface_points"].to(device)
             queries = batch["query_points"].to(device)
             target = batch["query_sdf"].to(device)
@@ -174,11 +197,6 @@ def extract_modulations(specs, args, recon_dir, latent_dir, device):
                 torch.cuda.synchronize(device)
             decoding_time = time.perf_counter() - start
 
-            object_id = batch["object_id"][0]
-            class_name = batch["class_name"][0]
-            output_dir = recon_dir / class_name / object_id
-            output_dir.mkdir(parents=True, exist_ok=True)
-            mesh_path = output_dir / "reconstruct"
             mesh.create_mesh(
                 model.sdf_model,
                 decoded["planes"],
@@ -205,7 +223,6 @@ def extract_modulations(specs, args, recon_dir, latent_dir, device):
                 )
             ):
                 continue
-            modulation_path = latent_dir / class_name / object_id / "modulation.npz"
             save_modulation(
                 modulation_path, object_id, posterior, batch.get("conditioning")
             )
@@ -287,28 +304,38 @@ def generate(specs, args, recon_dir, device):
         dataset = make_generation_dataset(specs)
         batches = torch.utils.data.DataLoader(dataset, batch_size=1, num_workers=0)
 
-    metrics_file = (recon_dir / "generated_metrics.csv").open("w", newline="")
-    metrics_writer = csv.DictWriter(
-        metrics_file,
-        fieldnames=[
+    metrics_file, metrics_writer = open_metrics(
+        recon_dir / "generated_metrics.csv",
+        [
             "object_id", "sample", "chamfer_distance", "f_score",
             "normal_consistency", "mesh_validity",
         ],
+        append=getattr(args, "skip_existing", False),
     )
-    metrics_writer.writeheader()
     for batch_index, batch in enumerate(tqdm(batches, desc="generating COD latents")):
         conditioning = None
         output_dir = recon_dir
         surface = None
+        if batch is not None:
+            output_dir = (
+                recon_dir / batch["class_name"][0] / batch["object_id"][0]
+            )
+        missing_samples = [
+            sample_index
+            for sample_index in range(args.num_samples)
+            if not (
+                getattr(args, "skip_existing", False)
+                and (output_dir / f"{sample_index}_recon.ply").is_file()
+            )
+        ]
+        if not missing_samples:
+            continue
         if batch is not None:
             conditioning = {
                 name: value.to(device)
                 for name, value in batch["conditioning"].items()
             }
             surface = conditioning.get("point_cloud")
-            output_dir = (
-                recon_dir / batch["class_name"][0] / batch["object_id"][0]
-            )
             output_dir.mkdir(parents=True, exist_ok=True)
             image_paths = batch.get("conditioning_paths", {}).get("image")
             if image_paths:
@@ -322,7 +349,7 @@ def generate(specs, args, recon_dir, device):
         )
         latent = model.denormalize_latent(normalized)
         planes = sdf_model.decode_latent(latent)["planes"]
-        for sample_index in range(len(planes)):
+        for sample_index in missing_samples:
             path = output_dir / f"{sample_index}_recon"
             mesh.create_mesh(
                 sdf_model,
@@ -368,6 +395,12 @@ def parse_args():
     parser.add_argument("--recon_resolution", default=256, type=int)
     parser.add_argument("--max_batch", default=2**18, type=int)
     parser.add_argument("--modulation_filter_threshold", default=None, type=float)
+    parser.add_argument(
+        "--skip-existing",
+        "--skip_existing",
+        action="store_true",
+        help="reuse existing modulation and reconstruction artifacts",
+    )
     parser.add_argument(
         "--test-split-only",
         "--test_split_only",

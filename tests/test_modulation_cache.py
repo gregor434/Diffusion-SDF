@@ -8,6 +8,7 @@ import torch
 
 from dataloader.modulation_loader import (
     ModulationLoader,
+    SurfacePointLoader,
     compute_latent_statistics,
     ensure_modulation_cache,
 )
@@ -49,6 +50,39 @@ def tiny_stage1_specs(data_source):
 
 
 class ModulationCacheTests(unittest.TestCase):
+    def test_surface_cache_sampling_can_be_reproduced(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            path = root / "abo" / "ABO" / "item" / "cod_sdf.npz"
+            path.parent.mkdir(parents=True)
+            np.savez(
+                path,
+                surface_points=np.arange(90, dtype=np.float32).reshape(30, 3),
+            )
+            records = [{
+                "dataset": "abo",
+                "class_name": "ABO",
+                "instance_name": "item",
+                "variant_index": 0,
+                "latent_path": str(root / "cache" / "modulation.npz"),
+            }]
+            first = SurfacePointLoader(
+                root,
+                records,
+                surface_point_count=12,
+                deterministic_sampling=True,
+                sampling_seed=31,
+            )[0]["surface_points"]
+            second = SurfacePointLoader(
+                root,
+                records,
+                surface_point_count=12,
+                deterministic_sampling=True,
+                sampling_seed=31,
+            )[0]["surface_points"]
+
+        torch.testing.assert_close(first, second, rtol=0, atol=0)
+
     def test_caches_union_of_splits_and_reuses_complete_cache(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
