@@ -178,6 +178,17 @@ class CombinedModel(pl.LightningModule):
         decoded = F.layer_norm(decoded, (decoded.shape[-1],))
         return F.mse_loss(decoded, encoded.detach())
 
+    @staticmethod
+    def latent_set_consistency_loss(first, second):
+        """Squared symmetric Chamfer distance between latent token sets."""
+        distances = (
+            first[:, :, None, :] - second[:, None, :, :]
+        ).square().mean(dim=-1)
+        return (
+            distances.min(dim=-1).values.mean()
+            + distances.min(dim=-2).values.mean()
+        )
+
     def stage1_geometry_losses(
         self, planes, batch, *, compute_surface_zero, compute_eikonal,
         compute_normal,
@@ -265,6 +276,26 @@ class CombinedModel(pl.LightningModule):
             aux = self.cod_auxiliary_loss(
                 output["encoded_features"], output["decoded_latent"]
             )
+        latent_consistency = sdf.new_zeros(())
+        if float(weights.get("latent_consistency", 0.0)) > 0:
+            paired_surface = batch.get("paired_surface_points")
+            if paired_surface is None:
+                raise ValueError(
+                    "a positive latent_consistency weight requires "
+                    "PairedSurfaceSampling"
+                )
+            _, paired_posterior, _ = self.sdf_model.encode_surface(
+                paired_surface,
+                sample_posterior=False,
+            )
+            if output["posterior"] is None or paired_posterior is None:
+                raise ValueError(
+                    "latent_consistency requires variational encoder posteriors"
+                )
+            latent_consistency = self.latent_set_consistency_loss(
+                output["posterior"].mean,
+                paired_posterior.mean,
+            )
         surface_zero = sdf.new_zeros(())
         eikonal = sdf.new_zeros(())
         normal = sdf.new_zeros(())
@@ -292,6 +323,8 @@ class CombinedModel(pl.LightningModule):
             + float(weights.get("uncertainty", 0.0)) * uncertainty
             + float(weights.get("kl", self.specs.get("kld_weight", 0.0))) * kl
             + float(weights.get("cod_aux", 0.0)) * aux
+            + float(weights.get("latent_consistency", 0.0))
+            * latent_consistency
             + float(weights.get("surface_zero", 0.0)) * surface_zero
             + float(weights.get("eikonal", 0.0)) * eikonal
             + float(weights.get("normal", 0.0)) * normal
@@ -313,6 +346,7 @@ class CombinedModel(pl.LightningModule):
             "normal": normal,
             "kl": kl,
             "cod_aux": aux,
+            "latent_consistency": latent_consistency,
             "posterior_std": posterior_std,
             "active_dimensions": active_dimensions,
         }

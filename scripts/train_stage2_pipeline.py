@@ -20,6 +20,18 @@ PIPELINES = {
         "stage2": ROOT / "config/cod/stage2_transformer_image_diffusion_multiray21",
         "stage3": ROOT / "config/cod/stage3_image_diffusion_reconstruction_multiray21",
     },
+    "joint-refined": {
+        "stage2": ROOT / "config/cod/stage2_transformer_diffusion_multiray21_joint_refined",
+        "stage3": ROOT / "config/cod/stage3_diffusion_reconstruction_multiray21_joint_refined",
+    },
+    "encoder-refined-unconditional": {
+        "stage2": ROOT / "config/cod/stage2_transformer_diffusion_multiray21_encoder_refined",
+        "stage3": ROOT / "config/cod/stage3_diffusion_reconstruction_multiray21_encoder_refined",
+    },
+    "encoder-refined-conditional": {
+        "stage2": ROOT / "config/cod/stage2_transformer_image_diffusion_multiray21_encoder_refined",
+        "stage3": ROOT / "config/cod/stage3_image_diffusion_reconstruction_multiray21_encoder_refined",
+    },
 }
 
 
@@ -74,7 +86,7 @@ def main():
     )
     parser.add_argument(
         "--model",
-        choices=("unconditional", "conditional"),
+        choices=tuple(PIPELINES),
         required=True,
         help="Select the independent diffusion/refinement pipeline to run.",
     )

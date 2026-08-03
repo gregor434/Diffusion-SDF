@@ -25,6 +25,8 @@ class SdfLoader(Dataset):
         conditioning=None,
         conditioning_sources=None,
         deterministic_sampling=False,
+        deterministic_surface_sampling=False,
+        paired_surface_sampling=False,
         sampling_seed=0,
         **_,
     ):
@@ -38,6 +40,10 @@ class SdfLoader(Dataset):
             else build_conditioning_sources(conditioning)
         )
         self.deterministic_sampling = bool(deterministic_sampling)
+        self.deterministic_surface_sampling = bool(
+            deterministic_surface_sampling
+        )
+        self.paired_surface_sampling = bool(paired_surface_sampling)
         self.sampling_seed = int(sampling_seed)
         if not 0 <= self.near_surface_ratio <= 1:
             raise ValueError("near_surface_ratio must be in [0, 1]")
@@ -79,9 +85,15 @@ class SdfLoader(Dataset):
         return len(self.records)
 
     def __getitem__(self, index):
-        rng = (
+        query_rng = (
             np.random.RandomState(self.sampling_seed + index)
             if self.deterministic_sampling
+            else np.random
+        )
+        surface_rng = (
+            np.random.RandomState(self.sampling_seed + index)
+            if self.deterministic_sampling
+            or self.deterministic_surface_sampling
             else np.random
         )
         record = self.records[index]
@@ -90,24 +102,32 @@ class SdfLoader(Dataset):
         class_name = record["class_name"]
         object_id = record["instance_name"]
         with np.load(path) as data:
-            surface_indices = rng.choice(
+            surface_indices = surface_rng.choice(
                 len(data["surface_points"]),
                 self.surface_point_count,
                 replace=len(data["surface_points"]) < self.surface_point_count,
             )
             surface = data["surface_points"][surface_indices]
+            paired_surface = None
+            if self.paired_surface_sampling:
+                paired_surface_indices = surface_rng.choice(
+                    len(data["surface_points"]),
+                    self.surface_point_count,
+                    replace=len(data["surface_points"]) < self.surface_point_count,
+                )
+                paired_surface = data["surface_points"][paired_surface_indices]
             surface_normals = (
                 data["surface_normals"][surface_indices]
                 if "surface_normals" in data else None
             )
             near_count = round(self.samples_per_mesh * self.near_surface_ratio)
             uniform_count = self.samples_per_mesh - near_count
-            near_indices = rng.choice(
+            near_indices = query_rng.choice(
                 len(data["near_surface_query_points"]),
                 near_count,
                 replace=len(data["near_surface_query_points"]) < near_count,
             )
-            uniform_indices = rng.choice(
+            uniform_indices = query_rng.choice(
                 len(data["uniform_query_points"]),
                 uniform_count,
                 replace=len(data["uniform_query_points"]) < uniform_count,
@@ -127,7 +147,7 @@ class SdfLoader(Dataset):
                 axis=0,
             )
 
-        permutation = rng.permutation(len(query_points))
+        permutation = query_rng.permutation(len(query_points))
         query_is_near = np.concatenate(
             (np.ones(near_count, dtype=np.bool_), np.zeros(uniform_count, dtype=np.bool_))
         )[permutation]
@@ -145,6 +165,10 @@ class SdfLoader(Dataset):
             "dataset": dataset,
             "class_name": class_name,
         }
+        if paired_surface is not None:
+            item["paired_surface_points"] = torch.from_numpy(
+                np.asarray(paired_surface, dtype=np.float32)
+            )
         if self.conditioning_sources:
             item["conditioning"] = {
                 source.name: source.load(record)

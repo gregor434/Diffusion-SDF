@@ -633,6 +633,72 @@ class CODPipelineTests(unittest.TestCase):
         self.assertGreater(losses["eikonal"].item(), 0.0)
         self.assertTrue(torch.isfinite(losses["loss"]))
 
+    def test_latent_consistency_matches_unordered_token_sets(self):
+        first = torch.tensor(
+            [[[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]]]
+        )
+        permuted = first[:, [2, 0, 1]]
+        shifted = first + 1.0
+
+        torch.testing.assert_close(
+            CombinedModel.latent_set_consistency_loss(first, permuted),
+            torch.zeros(()),
+        )
+        self.assertGreater(
+            CombinedModel.latent_set_consistency_loss(first, shifted).item(),
+            0.0,
+        )
+
+    def test_latent_consistency_updates_encoder_from_paired_surfaces(self):
+        source = SdfModel(tiny_specs())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_path = Path(tmpdir) / "cod.pt"
+            torch.save(
+                {
+                    "state_dict": {
+                        f"model.{name}": value.clone()
+                        for name, value in source.cod_vae.state_dict().items()
+                    }
+                },
+                checkpoint_path,
+            )
+            specs = tiny_specs()
+            specs.update(
+                {
+                    "training_task": "modulation",
+                    "stage1_mode": "encoder_finetune",
+                    "sample_posterior": True,
+                    "loss_weights": {
+                        "sdf": 0.0,
+                        "latent_consistency": 1.0,
+                    },
+                }
+            )
+            specs["CODVaeSpecs"]["checkpoint_path"] = str(checkpoint_path)
+            model = CombinedModel(specs).train()
+        batch = {
+            "surface_points": torch.rand(2, 8, 3) * 1.8 - 0.9,
+            "paired_surface_points": torch.rand(2, 8, 3) * 1.8 - 0.9,
+            "query_points": torch.rand(2, 6, 3) * 1.8 - 0.9,
+            "query_sdf": torch.randn(2, 6) * 0.05,
+        }
+
+        losses = model.stage1_losses(batch)
+        self.assertGreater(losses["latent_consistency"].item(), 0.0)
+        losses["loss"].backward()
+
+        components = model.sdf_model.component_modules()
+        for name in ("point_encoder", "variational_block"):
+            self.assertTrue(
+                any(parameter.grad is not None for parameter in components[name].parameters()),
+                name,
+            )
+        for name in ("latent_decoder", "triplane_decoder", "sdf_network"):
+            self.assertTrue(
+                all(parameter.grad is None for parameter in components[name].parameters()),
+                name,
+            )
+
     def test_sdf_loader_separates_cod_surface_and_query_samples(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "abo" / "ABO" / "item" / "cod_sdf.npz"
@@ -708,6 +774,45 @@ class CODPipelineTests(unittest.TestCase):
         )
         self.assertFalse(torch.equal(first["query_points"], second["query_points"]))
         self.assertFalse(torch.equal(first["query_sdf"], second["query_sdf"]))
+
+    def test_sdf_loader_returns_reproducible_independent_surface_pairs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "abo" / "ABO" / "item" / "cod_sdf.npz"
+            path.parent.mkdir(parents=True)
+            surface = np.arange(180, dtype=np.float32).reshape(60, 3)
+            np.savez(
+                path,
+                surface_points=surface,
+                near_surface_query_points=surface[:30],
+                near_surface_sdf=np.arange(30, dtype=np.float32),
+                uniform_query_points=surface[30:],
+                uniform_sdf=np.arange(30, 60, dtype=np.float32),
+            )
+            dataset = SdfLoader(
+                tmpdir,
+                {"abo": {"ABO": ["item"]}},
+                samples_per_mesh=20,
+                surface_point_count=12,
+                paired_surface_sampling=True,
+                deterministic_sampling=True,
+                sampling_seed=29,
+            )
+            first = dataset[0]
+            repeated = dataset[0]
+
+        self.assertEqual(first["paired_surface_points"].shape, torch.Size([12, 3]))
+        self.assertFalse(
+            torch.equal(first["surface_points"], first["paired_surface_points"])
+        )
+        torch.testing.assert_close(
+            first["surface_points"], repeated["surface_points"], rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            first["paired_surface_points"],
+            repeated["paired_surface_points"],
+            rtol=0,
+            atol=0,
+        )
 
     def test_sdf_loader_supports_stage_three_conditioning_sources(self):
         class StubImageSource:

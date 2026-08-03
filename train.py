@@ -96,6 +96,9 @@ def train():
             deterministic_surface_sampling=bool(
                 specs.get("DeterministicTrainSurfaceSampling", False)
             ),
+            paired_surface_sampling=bool(
+                specs.get("PairedSurfaceSampling", False)
+            ),
             sampling_seed=int(specs.get("TrainSurfaceSamplingSeed", 0)),
         )
         val_dataset = (
@@ -104,6 +107,9 @@ def train():
                 conditioning_sources=conditioning_sources,
                 deterministic_sampling=bool(
                     specs.get("DeterministicValidationSampling", False)
+                ),
+                paired_surface_sampling=bool(
+                    specs.get("PairedSurfaceSampling", False)
                 ),
             )
             if val_split is not None
@@ -282,6 +288,7 @@ def build_dataset(
     sample_posterior_latents=False,
     deterministic_sampling=False,
     deterministic_surface_sampling=False,
+    paired_surface_sampling=False,
     sampling_seed=None,
 ):
     if specs['training_task'] == 'diffusion':
@@ -307,6 +314,7 @@ def build_dataset(
         ),
         deterministic_sampling=deterministic_sampling,
         deterministic_surface_sampling=deterministic_surface_sampling,
+        paired_surface_sampling=paired_surface_sampling,
         sampling_seed=(
             int(specs.get("ValidationSamplingSeed", 0))
             if sampling_seed is None

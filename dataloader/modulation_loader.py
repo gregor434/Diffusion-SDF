@@ -89,8 +89,17 @@ def _split_records(split, cache_path=None, modulation_variants=1):
 class SurfacePointLoader(Dataset):
     """Read only the surface samples required by the COD latent encoder."""
 
-    def __init__(self, data_source, records, surface_point_count=2048):
+    def __init__(
+        self,
+        data_source,
+        records,
+        surface_point_count=2048,
+        deterministic_sampling=False,
+        sampling_seed=0,
+    ):
         self.surface_point_count = int(surface_point_count)
+        self.deterministic_sampling = bool(deterministic_sampling)
+        self.sampling_seed = int(sampling_seed)
         self.records = []
         missing = []
         root = Path(data_source)
@@ -118,9 +127,14 @@ class SurfacePointLoader(Dataset):
 
     def __getitem__(self, index):
         record = self.records[index]
+        rng = (
+            np.random.RandomState(self.sampling_seed + index)
+            if self.deterministic_sampling
+            else np.random
+        )
         with np.load(record["surface_path"]) as data:
             surface = data["surface_points"]
-            indices = np.random.choice(
+            indices = rng.choice(
                 len(surface),
                 self.surface_point_count,
                 replace=len(surface) < self.surface_point_count,
@@ -251,7 +265,15 @@ def ensure_modulation_cache(
                     stage1_specs.get("SurfacePointCount", 2048),
                 )
             )
-            dataset = SurfacePointLoader(data_source, missing, surface_count)
+            dataset = SurfacePointLoader(
+                data_source,
+                missing,
+                surface_count,
+                deterministic_sampling=bool(
+                    specs.get("DeterministicModulationSurfaceSampling", False)
+                ),
+                sampling_seed=int(specs.get("ModulationSurfaceSamplingSeed", 0)),
+            )
             loader = torch.utils.data.DataLoader(
                 dataset,
                 batch_size=max(1, int(batch_size)),
