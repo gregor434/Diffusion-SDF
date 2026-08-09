@@ -278,6 +278,23 @@ are computed from TrainSplit only. `modulation_batch_size` and
 `modulation_workers` optionally control this one-time extraction (defaults: up
 to 8 objects per batch and the training worker count). Stage two then reads the
 cached modulation files and optional cached conditions.
+An optional `modulation_filter_threshold` scores each training modulation by
+decoding its posterior mean, reconstructing a mesh, and computing the existing
+squared symmetric Chamfer distance against a deterministic reference surface
+sample. Variants above the threshold, invalid meshes, and non-finite scores are
+excluded from training and from `latent_stats.npz`; validation remains
+unfiltered. All modulation files are preserved, while reusable per-variant
+scores are stored in `modulations/latent_quality.json`. The primary multi-ray
+unconditional and image-conditioned profiles share this manifest and use a
+maximum Chamfer distance of 0.005.
+
+A separate unconditional experiment directory is available for a clean run
+whose checkpoints and logs do not overlap the original profile:
+
+    python train.py \
+      -e config/cod/stage2_transformer_diffusion_multiray21_quality_filtered \
+      -b 32 -w 8
+
 The denoiser is a non-causal token transformer over [B,M,D]. It uses the EDM
 log-normal noise distribution, EDM preconditioning, weighted denoising loss,
 and second-order Heun sampling referenced by COD-VAE through VecSet.

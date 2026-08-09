@@ -4,8 +4,10 @@
 
 import copy
 import gc
+import hashlib
 import json
 import os
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +18,8 @@ from dataloader.conditioning import build_conditioning_sources
 
 
 SPLIT_KEYS = ("TrainSplit", "ValSplit", "TestSplit", "ModulationSplit")
+QUALITY_MANIFEST_NAME = "latent_quality.json"
+QUALITY_MANIFEST_VERSION = 1
 
 
 def _load_split(value):
@@ -163,8 +167,8 @@ def _save_modulation(path, object_id, mean, logvar):
     temporary.replace(path)
 
 
-def _load_stage1_encoder(checkpoint_path, fallback_specs):
-    """Load a stage-one model and discard all decoder-only components."""
+def _load_stage1_encoder(checkpoint_path, fallback_specs, encoder_only=True):
+    """Load stage one, optionally discarding components unused by encoding."""
     from models.sdf_model import SdfModel
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
@@ -188,19 +192,136 @@ def _load_stage1_encoder(checkpoint_path, fallback_specs):
         raise RuntimeError(f"no sdf_model parameters found in {checkpoint_path}")
     model.load_state_dict(state, strict=True)
 
-    # Surface encoding uses only the point encoder and variational projection.
-    # Remove the much larger triplane/SDF and latent decoder modules before the
-    # model is transferred to the accelerator.
-    del model.feature_adapter
-    del model.sdf_decoder
-    del model.cod_vae.latent_proj_out
-    del model.cod_vae.latent_decoder
-    del model.cod_vae.autoencoder.decoder
-    del model.cod_vae.autoencoder.head
+    if encoder_only:
+        # Surface encoding uses only the point encoder and variational projection.
+        # Remove the much larger decoder modules before transferring to the GPU.
+        del model.feature_adapter
+        del model.sdf_decoder
+        del model.cod_vae.latent_proj_out
+        del model.cod_vae.latent_decoder
+        del model.cod_vae.autoencoder.decoder
+        del model.cod_vae.autoencoder.head
     del state
     del checkpoint
     gc.collect()
     return model, stage1_specs
+
+
+def _quality_key(cache_path, latent_path):
+    return Path(latent_path).relative_to(cache_path).as_posix()
+
+
+def _quality_seed(base_seed, key):
+    digest = hashlib.sha256(key.encode("utf8")).digest()
+    return (int(base_seed) + int.from_bytes(digest[:4], "little")) % (2**32)
+
+
+def _load_quality_manifest(path, settings):
+    path = Path(path)
+    if path.is_file():
+        try:
+            manifest = json.loads(path.read_text())
+            if (
+                manifest.get("version") == QUALITY_MANIFEST_VERSION
+                and manifest.get("settings") == settings
+                and isinstance(manifest.get("scores"), dict)
+            ):
+                return manifest
+        except (OSError, ValueError, TypeError):
+            pass
+    return {
+        "version": QUALITY_MANIFEST_VERSION,
+        "settings": settings,
+        "scores": {},
+    }
+
+
+def _save_quality_manifest(path, manifest):
+    path = Path(path)
+    temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    temporary.replace(path)
+
+
+def _quality_scores(cache_path):
+    path = Path(cache_path) / QUALITY_MANIFEST_NAME
+    if not path.is_file():
+        return {}
+    try:
+        scores = json.loads(path.read_text()).get("scores", {})
+        return scores if isinstance(scores, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def filter_records_by_quality(records, cache_path, threshold):
+    """Select records with finite cached Chamfer no greater than ``threshold``."""
+    if threshold is None:
+        return records
+    scores = _quality_scores(cache_path)
+    accepted = []
+    for record in records:
+        score = scores.get(_quality_key(cache_path, record["latent_path"]), {}).get(
+            "chamfer_distance"
+        )
+        if score is not None and np.isfinite(score) and float(score) <= float(threshold):
+            accepted.append(record)
+    return accepted
+
+
+@torch.no_grad()
+def _score_modulation_reconstruction(
+    model,
+    record,
+    data_source,
+    cache_path,
+    surface_point_count,
+    reconstruction_resolution,
+    reconstruction_max_batch,
+    base_seed,
+):
+    """Decode one cached posterior mean and measure deterministic mesh Chamfer."""
+    from utils import mesh
+    from utils.reconstruct import reconstruction_chamfer
+
+    key = _quality_key(cache_path, record["latent_path"])
+    seed = _quality_seed(base_seed, key)
+    surface_path = (
+        Path(data_source)
+        / record["dataset"]
+        / record["class_name"]
+        / record["instance_name"]
+        / "cod_sdf.npz"
+    )
+    with np.load(surface_path) as data:
+        surface = np.asarray(data["surface_points"], dtype=np.float32)
+    rng = np.random.RandomState(seed)
+    indices = rng.choice(
+        len(surface),
+        int(surface_point_count),
+        replace=len(surface) < int(surface_point_count),
+    )
+    reference = surface[indices]
+    with np.load(record["latent_path"]) as data:
+        latent = torch.from_numpy(
+            np.asarray(data["posterior_mean"], dtype=np.float32)
+        ).unsqueeze(0)
+    device = next(model.parameters()).device
+    decoded = model.decode_latent(latent.to(device))
+    with tempfile.TemporaryDirectory(prefix="latent-quality-") as temporary:
+        mesh_path = Path(temporary) / "reconstruct"
+        mesh.create_mesh(
+            model,
+            decoded["planes"],
+            str(mesh_path),
+            N=int(reconstruction_resolution),
+            max_batch=int(reconstruction_max_batch),
+            from_plane_features=True,
+        )
+        chamfer = reconstruction_chamfer(mesh_path, reference, seed=seed + 1)
+    return {
+        "chamfer_distance": float(chamfer) if np.isfinite(chamfer) else None
+    }
 
 
 @torch.no_grad()
@@ -321,17 +442,116 @@ def ensure_modulation_cache(
             + ", ".join(incomplete[:5])
         )
 
+    quality_threshold = specs.get("modulation_filter_threshold")
+    if quality_threshold is not None:
+        quality_threshold = float(quality_threshold)
+        if quality_threshold < 0:
+            raise ValueError("modulation_filter_threshold must be non-negative")
+        checkpoint_path = specs.get("modulation_ckpt_path")
+        if not checkpoint_path:
+            raise ValueError(
+                "modulation_ckpt_path is required to score reconstruction quality"
+            )
+        reconstruction_resolution = int(
+            specs.get("modulation_filter_recon_resolution", 256)
+        )
+        reconstruction_max_batch = int(
+            specs.get("modulation_filter_max_batch", 2**18)
+        )
+        surface_point_count = int(
+            specs.get("modulation_filter_surface_samples", 2048)
+        )
+        base_seed = int(specs.get("modulation_filter_seed", 0))
+        settings = {
+            "metric": "squared_symmetric_mesh_chamfer",
+            "checkpoint_path": str(checkpoint_path),
+            "reconstruction_resolution": reconstruction_resolution,
+            "reconstruction_max_batch": reconstruction_max_batch,
+            "surface_point_count": surface_point_count,
+            "seed": base_seed,
+        }
+        manifest_path = cache_path / QUALITY_MANIFEST_NAME
+        manifest = _load_quality_manifest(manifest_path, settings)
+        unfiltered_train_records = ModulationLoader.build_records(
+            cache_path,
+            splits["TrainSplit"],
+            modulation_variants=modulation_variants,
+        )
+        unscored = [
+            record
+            for record in unfiltered_train_records
+            if _quality_key(cache_path, record["latent_path"])
+            not in manifest["scores"]
+        ]
+        if unscored:
+            quality_model = None
+            try:
+                quality_model, stage1_specs = _load_stage1_encoder(
+                    checkpoint_path, specs, encoder_only=False
+                )
+                data_source = specs.get("DataSource", stage1_specs.get("DataSource"))
+                if not data_source:
+                    raise ValueError(
+                        "DataSource must be set to score reconstruction quality"
+                    )
+                quality_device = device or torch.device(
+                    "cuda" if torch.cuda.is_available() else "cpu"
+                )
+                quality_model = quality_model.to(quality_device).eval()
+                for index, record in enumerate(unscored, start=1):
+                    key = _quality_key(cache_path, record["latent_path"])
+                    manifest["scores"][key] = _score_modulation_reconstruction(
+                        quality_model,
+                        record,
+                        data_source,
+                        cache_path,
+                        surface_point_count,
+                        reconstruction_resolution,
+                        reconstruction_max_batch,
+                        base_seed,
+                    )
+                    if index % 10 == 0:
+                        _save_quality_manifest(manifest_path, manifest)
+                _save_quality_manifest(manifest_path, manifest)
+            finally:
+                if quality_model is not None:
+                    del quality_model
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
     train_records = ModulationLoader.build_records(
         cache_path,
         splits["TrainSplit"],
         modulation_variants=modulation_variants,
+        quality_threshold=quality_threshold,
     )
     expected_train = _split_records(
         splits["TrainSplit"], modulation_variants=modulation_variants
     )
-    if len(train_records) != len(expected_train):
+    if quality_threshold is None and len(train_records) != len(expected_train):
         raise RuntimeError(
             f"expected {len(expected_train)} training modulations, found {len(train_records)}"
+        )
+    if quality_threshold is not None:
+        accepted_objects = len({
+            (record["dataset"], record["class_name"], record["instance_name"])
+            for record in train_records
+        })
+        expected_objects = sum(
+            len(object_ids)
+            for classes in splits["TrainSplit"].values()
+            for object_ids in classes.values()
+        )
+        print(
+            "COD latent quality filter: "
+            f"accepted {len(train_records)}/{len(expected_train)} variants from "
+            f"{accepted_objects}/{expected_objects} training objects "
+            f"(mesh Chamfer <= {quality_threshold:g})"
+        )
+    if not train_records:
+        raise RuntimeError(
+            "no training modulations passed the reconstruction-quality filter"
         )
     mean, std = compute_latent_statistics(
         train_records,
@@ -474,6 +694,7 @@ class ModulationLoader(Dataset):
         conditioning_sources=None,
         f_name="modulation.npz",
         modulation_variants=1,
+        quality_threshold=None,
     ):
         conditioning_sources = conditioning_sources or []
         records = []
@@ -498,7 +719,9 @@ class ModulationLoader(Dataset):
                         }
                         if all(source.exists(record) for source in conditioning_sources):
                             records.append(record)
-        return records
+        return filter_records_by_quality(
+            records, data_source, quality_threshold
+        )
 
     def validate_required_conditioning_cache(self):
         missing_paths = []

@@ -1,5 +1,5 @@
 {
-  "Description": "Unconditional COD token diffusion on deduplicated multi-ray ABO chairs",
+  "Description": "Unconditional COD token diffusion on reconstruction-quality-filtered deduplicated multi-ray ABO chair latents",
   "DataSource": "datasets",
   "TrainSplit": "datasets/splits/abo_fullchairs_multiray21_CHAIR_train.json",
   "ValSplit": "datasets/splits/abo_fullchairs_multiray21_CHAIR_val.json",

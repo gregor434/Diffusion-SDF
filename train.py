@@ -59,6 +59,7 @@ def train():
             split,
             conditioning_sources,
             modulation_variants=modulation_variants,
+            quality_threshold=specs.get("modulation_filter_threshold"),
         )
         val_records = (
             ModulationLoader.build_records(specs["data_path"], val_split, conditioning_sources)

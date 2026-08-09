@@ -9,6 +9,7 @@
   "data_path": "config/cod/stage2_transformer_diffusion_multiray21/modulations",
   "latent_stats_path": "config/cod/stage2_transformer_diffusion_multiray21/modulations/latent_stats.npz",
   "modulation_variants": 4,
+  "modulation_filter_threshold": 0.005,
   "sample_posterior_latents": true,
   "validation_noise_seed": 0,
   "conditioning": {

@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import torch
@@ -203,6 +204,108 @@ class ModulationCacheTests(unittest.TestCase):
             ensure_modulation_cache(
                 specs, exp_dir, batch_size=2, workers=0, device=torch.device("cpu")
             )
+
+    def test_quality_filter_selects_variants_drops_objects_and_reuses_scores(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            data_source = root / "data"
+            for index, object_id in enumerate(("partial", "rejected", "validation")):
+                path = data_source / "abo" / "ABO" / object_id / "cod_sdf.npz"
+                path.parent.mkdir(parents=True)
+                rng = np.random.default_rng(index)
+                np.savez(
+                    path,
+                    surface_points=rng.normal(size=(12, 3)).astype(np.float32),
+                )
+
+            train_split = {"abo": {"ABO": ["partial", "rejected"]}}
+            val_split = {"abo": {"ABO": ["validation"]}}
+            train_path = root / "train.json"
+            val_path = root / "val.json"
+            train_path.write_text(json.dumps(train_split))
+            val_path.write_text(json.dumps(val_split))
+
+            stage1_specs = tiny_stage1_specs(data_source)
+            stage1 = SdfModel(stage1_specs)
+            checkpoint_path = root / "stage1.ckpt"
+            torch.save(
+                {
+                    "state_dict": {
+                        f"sdf_model.{name}": value
+                        for name, value in stage1.state_dict().items()
+                    },
+                    "hyper_parameters": {"specs": stage1_specs},
+                },
+                checkpoint_path,
+            )
+            del stage1
+
+            specs = {
+                "TrainSplit": str(train_path),
+                "ValSplit": str(val_path),
+                "modulation_ckpt_path": str(checkpoint_path),
+                "modulation_variants": 2,
+                "modulation_filter_threshold": 0.005,
+            }
+
+            def fake_score(_model, record, *_args):
+                if record["instance_name"] == "partial" and record["variant_index"] == 0:
+                    return {"chamfer_distance": 0.005}
+                if record["instance_name"] == "rejected" and record["variant_index"] == 0:
+                    return {"chamfer_distance": None}
+                return {"chamfer_distance": 0.006}
+
+            with mock.patch(
+                "dataloader.modulation_loader._score_modulation_reconstruction",
+                side_effect=fake_score,
+            ) as scorer:
+                cache_path, stats_path = ensure_modulation_cache(
+                    specs,
+                    root / "stage2",
+                    batch_size=2,
+                    workers=0,
+                    device=torch.device("cpu"),
+                )
+            self.assertEqual(scorer.call_count, 4)
+
+            train_records = ModulationLoader.build_records(
+                cache_path,
+                train_split,
+                modulation_variants=2,
+                quality_threshold=0.005,
+            )
+            self.assertEqual(
+                [(record["instance_name"], record["variant_index"]) for record in train_records],
+                [("partial", 0)],
+            )
+            self.assertTrue(
+                (Path(cache_path) / "ABO" / "rejected" / "modulation_001.npz").is_file()
+            )
+
+            val_records = ModulationLoader.build_records(cache_path, val_split)
+            self.assertEqual(len(val_records), 1)
+            expected_mean, expected_std = compute_latent_statistics(train_records)
+            with np.load(stats_path) as statistics:
+                np.testing.assert_allclose(statistics["mean"], expected_mean)
+                np.testing.assert_allclose(statistics["std"], expected_std)
+
+            manifest = json.loads(
+                (Path(cache_path) / "latent_quality.json").read_text()
+            )
+            self.assertEqual(len(manifest["scores"]), 4)
+
+            checkpoint_path.unlink()
+            with mock.patch(
+                "dataloader.modulation_loader._score_modulation_reconstruction"
+            ) as scorer:
+                ensure_modulation_cache(
+                    specs,
+                    root / "stage2",
+                    batch_size=2,
+                    workers=0,
+                    device=torch.device("cpu"),
+                )
+            scorer.assert_not_called()
 
 
 if __name__ == "__main__":
