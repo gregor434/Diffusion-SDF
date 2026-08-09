@@ -28,6 +28,18 @@ STAGE1_COMPONENTS = {
         "point_encoder", "variational_block", "latent_decoder",
         "triplane_decoder", "sdf_network",
     },
+    "learned_query_adaptation": {
+        "compact_queries", "compact_token_attention",
+    },
+    "learned_query_encoder_refinement": {
+        "compact_queries", "compact_token_attention",
+        "point_encoder_backbone", "variational_block",
+    },
+    "learned_query_vae_finetune": {
+        "compact_queries", "compact_token_attention",
+        "point_encoder_backbone", "variational_block",
+        "latent_decoder", "triplane_decoder", "sdf_network",
+    },
 }
 STAGE3_COMPONENTS = {
     "diffusion_only": set(),
@@ -46,6 +58,12 @@ def validate_training_specs(specs):
     if task == "modulation":
         mode = specs.get("stage1_mode", "sdf_head_only")
         active = set(STAGE1_COMPONENTS.get(mode, ()))
+        if mode.startswith("learned_query_") and not bool(
+            specs.get("CODVaeSpecs", {}).get("use_learnable_positions", False)
+        ):
+            raise ValueError(
+                f"{mode} requires CODVaeSpecs.use_learnable_positions=true"
+            )
     elif task == "diffusion":
         active = {"diffusion"}
     elif task == "combined":
@@ -53,6 +71,12 @@ def validate_training_specs(specs):
         active = set(STAGE3_COMPONENTS.get(mode, ())) | {"diffusion"}
     else:
         return
+    if bool(
+        specs.get("diffusion_model_specs", {}).get(
+            "use_learnable_slot_embeddings", False
+        )
+    ):
+        active.add("diffusion_slot_embeddings")
     decoder_specs = specs.get("CODVaeSpecs", {}).get("decoder_params", {})
     if (
         "triplane_decoder" in active
@@ -530,9 +554,28 @@ class CombinedModel(pl.LightningModule):
                     decoder.conv_refine,
                     rates.get("triplane_decoder", self.specs.get("sdf_lr", 1e-4)),
                 )
-            for name, module in self.sdf_model.component_modules().items():
-                add_group(name, module, self.specs.get("sdf_lr", 1e-4))
+            selected = getattr(
+                self.sdf_model, "_trainable_component_names", set()
+            )
+            for name, parameters in self.sdf_model.component_parameters().items():
+                if name not in selected:
+                    continue
+                add_group(
+                    name,
+                    nn.ParameterList(parameters),
+                    self.specs.get("sdf_lr", 1e-4),
+                )
         if self.task in {"diffusion", "combined"}:
+            slot_embedding = self.diffusion_model.model.slot_embedding
+            if slot_embedding is not None:
+                add_group(
+                    "diffusion_slot_embeddings",
+                    nn.ParameterList([slot_embedding]),
+                    rates.get(
+                        "diffusion",
+                        self.specs.get("diff_lr", 1e-5),
+                    ),
+                )
             add_group("diffusion", self.diffusion_model, self.specs.get("diff_lr", 1e-5))
         if not groups:
             raise ValueError("the selected training mode has no trainable parameters")

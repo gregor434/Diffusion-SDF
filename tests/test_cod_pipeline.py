@@ -2,13 +2,20 @@ import tempfile
 import unittest
 import json
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import torch
+from torch import nn
 
 from dataloader.sdf_loader import SdfLoader
-from models.combined_model import CombinedModel, validate_training_specs
+from models.combined_model import (
+    STAGE1_COMPONENTS,
+    CombinedModel,
+    validate_training_specs,
+)
 from models.cod_vae.checkpoint import load_cod_checkpoint
+from models.diffusion import CODLatentTransformer
 from models.sdf_model import SdfModel
 
 
@@ -45,6 +52,35 @@ def tiny_specs():
 
 
 class CODPipelineTests(unittest.TestCase):
+    def test_diffusion_slot_embeddings_break_token_permutation_equivariance(self):
+        plain = CODLatentTransformer(
+            latent_tokens=3,
+            latent_dimension=4,
+            width=16,
+            depth=1,
+            heads=4,
+        ).eval()
+        slot_aware = CODLatentTransformer(
+            latent_tokens=3,
+            latent_dimension=4,
+            width=16,
+            depth=1,
+            heads=4,
+            use_learnable_slot_embeddings=True,
+        ).eval()
+        nn.init.normal_(plain.output_projection.weight)
+        nn.init.normal_(slot_aware.output_projection.weight)
+        latent = torch.randn(2, 3, 4)
+        noise = torch.randn(2)
+        permutation = torch.tensor([2, 0, 1])
+        inverse = torch.argsort(permutation)
+
+        plain_permuted = plain(latent[:, permutation], noise)[:, inverse]
+        torch.testing.assert_close(plain(latent, noise), plain_permuted)
+        slot_permuted = slot_aware(latent[:, permutation], noise)[:, inverse]
+        self.assertFalse(torch.allclose(slot_aware(latent, noise), slot_permuted))
+        self.assertEqual(slot_aware.slot_embedding.shape, (1, 3, 16))
+
     def test_all_repository_configs_are_semantically_consistent(self):
         repository = Path(__file__).resolve().parents[1]
         for path in (repository / "config").glob("**/specs.json"):
@@ -62,6 +98,126 @@ class CODPipelineTests(unittest.TestCase):
         self.assertEqual(output["planes"].shape, torch.Size([2, 3, 4, 8, 8]))
         self.assertEqual(output["sdf"].shape, torch.Size([2, 5]))
         self.assertEqual(output["posterior"].mean.shape, torch.Size([2, 2, 3]))
+
+    def test_learned_queries_replace_only_compact_fps(self):
+        specs = tiny_specs()
+        specs["CODVaeSpecs"]["use_learnable_positions"] = True
+        model = SdfModel(specs)
+        points = torch.rand(2, 8, 3) * 1.8 - 0.9
+        from models.cod_vae import pointops
+
+        with mock.patch.object(pointops, "fps", wraps=pointops.fps) as fps:
+            encoded = model.cod_vae.encode_embed(points)
+
+        self.assertEqual(fps.call_count, 1)
+        self.assertEqual(fps.call_args.args[1], 4)
+        self.assertEqual(encoded.shape, torch.Size([2, 2, 16]))
+        encoded.sum().backward()
+        self.assertIsNotNone(model.cod_vae.autoencoder.latent_pos.grad)
+
+    def test_learned_query_adaptation_trains_only_full_interaction_path(self):
+        source = SdfModel(tiny_specs())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_path = Path(tmpdir) / "cod.pt"
+            torch.save(
+                {
+                    "state_dict": {
+                        f"model.{name}": value.clone()
+                        for name, value in source.cod_vae.state_dict().items()
+                    }
+                },
+                checkpoint_path,
+            )
+            specs = tiny_specs()
+            specs["CODVaeSpecs"].update(
+                {
+                    "checkpoint_path": str(checkpoint_path),
+                    "use_learnable_positions": True,
+                    "checkpoint_allowed_missing_prefixes": (
+                        "autoencoder.latent_pos",
+                    ),
+                }
+            )
+            specs.update(
+                {
+                    "training_task": "modulation",
+                    "stage1_mode": "learned_query_adaptation",
+                    "learning_rates": {
+                        "compact_queries": 1e-3,
+                        "compact_token_attention": 1e-5,
+                    },
+                }
+            )
+            model = CombinedModel(specs).train()
+
+        groups = model.sdf_model.component_parameters()
+        trainable = {
+            id(parameter)
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        }
+        expected = {
+            id(parameter)
+            for name in ("compact_queries", "compact_token_attention")
+            for parameter in groups[name]
+        }
+        self.assertEqual(trainable, expected)
+        for name in (
+            "point_encoder_backbone", "variational_block", "latent_decoder",
+            "triplane_decoder", "sdf_network",
+        ):
+            self.assertTrue(all(not parameter.requires_grad for parameter in groups[name]))
+
+        optimizer = model.configure_optimizers()
+        self.assertEqual(
+            [group["name"] for group in optimizer.param_groups],
+            ["compact_queries", "compact_token_attention"],
+        )
+
+    def test_learned_query_modes_require_learned_positions(self):
+        specs = tiny_specs()
+        specs.update(
+            {
+                "training_task": "modulation",
+                "stage1_mode": "learned_query_adaptation",
+            }
+        )
+        with self.assertRaisesRegex(ValueError, "use_learnable_positions"):
+            validate_training_specs(specs)
+
+    def test_all_learned_query_stages_select_exact_parameter_unions(self):
+        specs = tiny_specs()
+        specs["CODVaeSpecs"]["use_learnable_positions"] = True
+        model = SdfModel(specs)
+        groups = model.component_parameters()
+
+        for mode in (
+            "learned_query_adaptation",
+            "learned_query_encoder_refinement",
+            "learned_query_vae_finetune",
+        ):
+            with self.subTest(mode=mode):
+                selected = STAGE1_COMPONENTS[mode]
+                model.set_trainable_components(selected)
+                expected = {
+                    id(parameter)
+                    for name in selected
+                    for parameter in groups[name]
+                }
+                actual = {
+                    id(parameter)
+                    for parameter in model.parameters()
+                    if parameter.requires_grad
+                }
+                self.assertEqual(actual, expected)
+                sdf_trainable = mode == "learned_query_vae_finetune"
+                self.assertEqual(
+                    any(
+                        parameter.requires_grad
+                        for parameter in groups["sdf_network"]
+                    ),
+                    sdf_trainable,
+                )
 
     def test_stage_two_validation_noise_and_cosine_schedule(self):
         specs = {
@@ -108,6 +264,39 @@ class CODPipelineTests(unittest.TestCase):
             optimizer.step()
             scheduler.step()
         self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 1e-6)
+
+    def test_slot_embeddings_have_a_separate_learning_rate(self):
+        specs = {
+            "training_task": "diffusion",
+            "diffusion_specs": {"sampling_steps": 2},
+            "diffusion_model_specs": {
+                "latent_tokens": 2,
+                "latent_dimension": 3,
+                "width": 16,
+                "depth": 1,
+                "heads": 4,
+                "use_learnable_slot_embeddings": True,
+            },
+            "learning_rates": {
+                "diffusion": 1e-5,
+                "diffusion_slot_embeddings": 1e-4,
+            },
+        }
+        model = CombinedModel(specs)
+        optimizer = model.configure_optimizers()
+        self.assertEqual(
+            [group["name"] for group in optimizer.param_groups],
+            ["diffusion_slot_embeddings", "diffusion"],
+        )
+        self.assertEqual(
+            [group["lr"] for group in optimizer.param_groups],
+            [1e-4, 1e-5],
+        )
+        self.assertEqual(len(optimizer.param_groups[0]["params"]), 1)
+        self.assertIs(
+            optimizer.param_groups[0]["params"][0],
+            model.diffusion_model.model.slot_embedding,
+        )
 
     def test_stage_three_reconstruction_refines_only_diffusion(self):
         specs = tiny_specs()

@@ -1,14 +1,35 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 from torch import nn
 
-from train import load_weights_only
+from train import load_weights_only, resolve_initialization_checkpoint
 
 
 class WeightsOnlyInitializationTests(unittest.TestCase):
+    def test_config_initialization_is_overridden_by_cli_and_disabled_by_resume(self):
+        specs = {"init_from_checkpoint": "configured.ckpt"}
+        self.assertEqual(
+            resolve_initialization_checkpoint(
+                SimpleNamespace(init_from=None, resume=None), specs
+            ),
+            "configured.ckpt",
+        )
+        self.assertEqual(
+            resolve_initialization_checkpoint(
+                SimpleNamespace(init_from="cli.ckpt", resume=None), specs
+            ),
+            "cli.ckpt",
+        )
+        self.assertIsNone(
+            resolve_initialization_checkpoint(
+                SimpleNamespace(init_from=None, resume="last"), specs
+            )
+        )
+
     def test_loads_state_dict_without_reusing_optimizer_learning_rate(self):
         source = nn.Linear(3, 2)
         source_optimizer = torch.optim.AdamW(source.parameters(), lr=1e-3)

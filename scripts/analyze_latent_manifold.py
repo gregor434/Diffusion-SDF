@@ -164,6 +164,34 @@ def distribution_summary(values):
     }
 
 
+def relative_stability(current, baseline):
+    """Compare median resampling distances without imposing a pass/fail gate."""
+    comparison = {}
+    for name, current_summary in current.items():
+        baseline_summary = baseline.get(name)
+        if not isinstance(current_summary, dict) or not isinstance(
+            baseline_summary, dict
+        ):
+            continue
+        baseline_median = float(baseline_summary["median"])
+        current_median = float(current_summary["median"])
+        comparison[name] = {
+            "baseline_median": baseline_median,
+            "current_median": current_median,
+            "relative_delta": (
+                current_median / baseline_median - 1.0
+                if baseline_median != 0.0
+                else None
+            ),
+            "relative_reduction": (
+                1.0 - current_median / baseline_median
+                if baseline_median != 0.0
+                else None
+            ),
+        }
+    return comparison
+
+
 def save_embedding_plot(path, projections, labels):
     fig, axis = plt.subplots(figsize=(8, 6), constrained_layout=True)
     styles = {
@@ -244,6 +272,14 @@ def main():
         ),
     )
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument(
+        "--baseline-report",
+        type=Path,
+        help=(
+            "Optional report.json from the FPS-initialized baseline; adds "
+            "source-relative resampling deltas without applying a threshold"
+        ),
+    )
     parser.add_argument("--samples", type=int, default=76)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
@@ -322,6 +358,10 @@ def main():
         ],
         dtype=np.float32,
     )
+    variant_aligned_mse = np.asarray(
+        [np.square(first - second).mean() for first, second in variant_pairs],
+        dtype=np.float32,
+    )
 
     all_logvar = np.concatenate((train_logvar, validation_logvar), axis=0)
     posterior_std = np.exp(0.5 * all_logvar).mean(axis=0)
@@ -372,6 +412,9 @@ def main():
         },
         "encoder_surface_resampling_stability": {
             "variant_to_canonical_chamfer": distribution_summary(variant_distance),
+            "variant_to_canonical_aligned_mse": distribution_summary(
+                variant_aligned_mse
+            ),
             "variant_to_train_median_ratio": float(
                 np.median(variant_distance) / train_median
             ),
@@ -382,6 +425,15 @@ def main():
             "maximum_mean_token_channel_std": float(posterior_std.max()),
         },
     }
+    if args.baseline_report is not None:
+        baseline_report = json.loads(args.baseline_report.read_text())
+        baseline_stability = baseline_report.get(
+            "encoder_surface_resampling_stability", {}
+        )
+        report["encoder_surface_resampling_comparison"] = relative_stability(
+            report["encoder_surface_resampling_stability"],
+            baseline_stability,
+        )
 
     output_dir = args.output_dir or args.exp_dir / "latent_manifold"
     output_dir.mkdir(parents=True, exist_ok=True)

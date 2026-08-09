@@ -169,30 +169,116 @@ class SdfModel(nn.Module):
             sdf_network=nn.ModuleList([self.feature_adapter, self.sdf_decoder]),
         )
 
+    def component_parameters(self):
+        """Return optimizer-facing parameter groups, including encoder subsets.
+
+        ``component_modules`` is kept as the stable, coarse-grained view used by
+        the original training modes.  Learned compact queries need finer,
+        disjoint groups so they and the cross-attention path can be adapted
+        without also updating patch construction/processing.
+        """
+        ae = self.cod_vae.autoencoder
+        encoder = ae.encoder
+
+        def parameters(*items):
+            values = []
+            seen = set()
+            for item in items:
+                candidates = (
+                    (item,)
+                    if isinstance(item, nn.Parameter)
+                    else item.parameters()
+                )
+                for parameter in candidates:
+                    if id(parameter) not in seen:
+                        seen.add(id(parameter))
+                        values.append(parameter)
+            return tuple(values)
+
+        coarse = self.component_modules()
+        groups = OrderedDict(
+            (name, parameters(module)) for name, module in coarse.items()
+        )
+
+        compact_attention = []
+        patch_backbone = [ae.point_embed, encoder.norm_point]
+        for block in encoder.blocks:
+            compact_attention.extend((block.patch2latents, block.latents2points))
+            if block.points2patch is not None:
+                patch_backbone.append(block.points2patch)
+            patch_backbone.extend(
+                (block.ln_ffn, block.patch_ffn, block.processing_layers)
+            )
+        compact_attention.append(encoder.last_block)
+
+        query_items = [ae.norm_latent]
+        if ae.latent_pos is not None:
+            query_items.insert(0, ae.latent_pos)
+        groups.update(
+            compact_queries=parameters(*query_items),
+            compact_token_attention=parameters(*compact_attention),
+            point_encoder_backbone=parameters(*patch_backbone),
+        )
+        return groups
+
+    def component_runtime_modules(self):
+        """Modules whose train/eval state follows each trainable component."""
+        ae = self.cod_vae.autoencoder
+        encoder = ae.encoder
+        compact_attention = []
+        patch_backbone = [ae.point_embed, encoder.norm_point]
+        for block in encoder.blocks:
+            compact_attention.extend((block.patch2latents, block.latents2points))
+            if block.points2patch is not None:
+                patch_backbone.append(block.points2patch)
+            patch_backbone.extend(
+                (block.ln_ffn, block.patch_ffn, block.processing_layers)
+            )
+        compact_attention.append(encoder.last_block)
+        modules = OrderedDict(self.component_modules())
+        modules.update(
+            compact_queries=ae.norm_latent,
+            compact_token_attention=nn.ModuleList(compact_attention),
+            point_encoder_backbone=nn.ModuleList(patch_backbone),
+        )
+        return modules
+
     def set_trainable_components(self, names):
         names = set(names)
-        components = self.component_modules()
+        components = self.component_parameters()
         unknown = names.difference(components)
         if unknown:
             raise ValueError(f"unknown trainable COD components: {sorted(unknown)}")
         # Freeze unlisted parameters as well, including the checkpoint-only
         # occupancy head, before selectively enabling the SDF pipeline.
         self.requires_grad_(False)
-        for name, module in components.items():
-            module.requires_grad_(name in names)
+        trainable = {
+            id(parameter)
+            for name in names
+            for parameter in components[name]
+        }
+        for parameter in self.parameters():
+            parameter.requires_grad_(id(parameter) in trainable)
         decoder = self.cod_vae.autoencoder.decoder
         if decoder.uncertainty_mode == "disabled":
             decoder.uncertainty_out.requires_grad_(False)
             if decoder.merging_module is not None:
                 decoder.merging_module.requires_grad_(False)
-        self._frozen_component_names = set(components).difference(names)
+        self._trainable_component_names = names
 
     def train(self, mode=True):
         super().train(mode)
         if mode:
-            for name, module in self.component_modules().items():
-                if name in getattr(self, "_frozen_component_names", set()):
+            selected = getattr(self, "_trainable_component_names", set())
+            runtime_modules = self.component_runtime_modules()
+            for name, module in runtime_modules.items():
+                if name not in selected:
                     module.eval()
+            # Granular learned-query groups overlap the legacy point_encoder
+            # view. Re-enable selected groups after freezing coarse groups.
+            for name, module in runtime_modules.items():
+                if name in selected:
+                    module.train()
             decoder = self.cod_vae.autoencoder.decoder
             if decoder.uncertainty_mode == "disabled":
                 decoder.uncertainty_out.eval()

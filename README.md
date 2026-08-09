@@ -168,7 +168,51 @@ points:
     python train.py -e config/cod/stage1_overfit_one -b 10 -w 8 --virtual_train_size 100
 
 Available stage1_mode values are sdf_head_only, triplane_sdf_finetune,
-cod_decoder_finetune, full_cod_finetune, and train_from_scratch.
+cod_decoder_finetune, full_cod_finetune, train_from_scratch,
+learned_query_adaptation, learned_query_encoder_refinement, and
+learned_query_vae_finetune.
+
+The learned-query experiment replaces only the final 32-token FPS while
+retaining the 512-patch FPS. Its three configs contain their own weights-only
+checkpoint chain, start from the mature ABO decoder/convolutional-refiner/SDF
+checkpoint (`stage1_decoder_conv_head_multiray21/best.ckpt`), and resample
+encoder surfaces during training. Run them in order:
+
+    python train.py -e config/cod/stage1_learned_query_adaptation_multiray21 -b 8 -w 8
+    python train.py -e config/cod/stage1_learned_query_encoder_refinement_multiray21 -b 8 -w 8
+    python train.py -e config/cod/stage1_learned_query_vae_finetune_multiray21 -b 8 -w 8
+
+The SDF head stays frozen during query adaptation and encoder refinement, then
+is updated in the final joint fine-tune at `1e-6` so it can track the refined
+VAE features without dominating the pretrained geometry representation.
+
+After selecting the best learned-query encoder/VAE checkpoint, build fresh
+learned-query latent caches and retrain either or both diffusion variants. The
+provided configs use the encoder-refined checkpoint because the subsequent
+joint VAE fine-tune regressed validation SDF reconstruction:
+
+    python train.py -e config/cod/stage2_transformer_diffusion_multiray21_learned_query -b 32 -w 8
+    python train.py -e config/cod/stage2_transformer_image_diffusion_multiray21_learned_query -b 32 -w 8
+
+To compare resampling stability with an FPS baseline report, pass
+`--baseline-report` to `scripts/analyze_latent_manifold.py`. The report includes
+both token-set Chamfer and token-aligned posterior-mean MSE; it records relative
+deltas without automatically selecting a patch-FPS replacement.
+
+To compare query-only adaptation with the later encoder-refined checkpoint on
+exactly paired point-cloud resamples, run:
+
+    python scripts/compare_encoder_resampling.py \
+      --baseline-checkpoint config/cod/stage1_learned_query_adaptation_multiray21/best-v2.ckpt \
+      --candidate-checkpoint config/cod/stage1_learned_query_encoder_refinement_multiray21/best.ckpt \
+      --split datasets/splits/abo_fullchairs_multiray21_CHAIR_val.json \
+      --surface-samples 8 --surface-points 2048 --query-points 4096 \
+      --seed 0 \
+      --output config/cod/stage1_learned_query_encoder_refinement_multiray21/resampling_comparison.json
+
+The comparison uses posterior means and reports aligned latent MSE, token-set
+Chamfer, SDF-field disagreement, sign flips, and ground-truth SDF error. Run it
+after encoder refinement has finished writing its final best checkpoint.
 
 The latent-preserving geometry experiment keeps the encoder, posterior
 projection, and latent decoder frozen, and trains only the tri-plane decoder

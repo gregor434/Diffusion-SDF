@@ -119,6 +119,7 @@ class CODLatentTransformer(nn.Module):
 
     def __init__(
         self,
+        latent_tokens=32,
         latent_dimension=32,
         width=512,
         depth=12,
@@ -128,6 +129,7 @@ class CODLatentTransformer(nn.Module):
         cond=False,
         condition_dim=128,
         condition_encoders=None,
+        use_learnable_slot_embeddings=False,
         **_,
     ):
         super().__init__()
@@ -136,9 +138,17 @@ class CODLatentTransformer(nn.Module):
                 f"transformer width ({width}) must be divisible by heads ({heads})"
             )
         self.latent_dimension = latent_dimension
+        self.latent_tokens = int(latent_tokens)
         self.width = width
         self.conditional = bool(cond)
         self.input_projection = nn.Linear(latent_dimension, width, bias=False)
+        self.slot_embedding = (
+            nn.Parameter(torch.empty(1, self.latent_tokens, width))
+            if use_learnable_slot_embeddings
+            else None
+        )
+        if self.slot_embedding is not None:
+            nn.init.normal_(self.slot_embedding, mean=0.0, std=0.02)
         self.noise_embedding = PositionalEmbedding(256)
         self.noise_mlp = nn.Sequential(
             nn.Linear(256, width),
@@ -176,6 +186,13 @@ class CODLatentTransformer(nn.Module):
             )
         time = self.noise_mlp(self.noise_embedding(noise)).unsqueeze(1)
         value = self.input_projection(latent)
+        if self.slot_embedding is not None:
+            if latent.shape[1] != self.latent_tokens:
+                raise ValueError(
+                    "slot-aware COD transformer expected "
+                    f"{self.latent_tokens} tokens, got {latent.shape[1]}"
+                )
+            value = value + self.slot_embedding
         context = None
         if self.conditional and conditioning is not None:
             context = self.condition_projection(self.condition_encoder(conditioning))

@@ -184,10 +184,11 @@ def train():
     # note on loading from checkpoint:
     # if resuming from training modulation, diffusion, or end-to-end, just load saved checkpoint 
     # however, if fine-tuning end-to-end after training modulation and diffusion separately, will need to load sdf and diffusion checkpoints separately
-    if args.init_from is not None:
+    init_from = resolve_initialization_checkpoint(args, specs)
+    if args.resume is None and init_from is not None:
         load_weights_only(
             model,
-            args.init_from,
+            init_from,
             allowed_missing_prefixes=specs.get(
                 "init_from_allowed_missing_prefixes", ()
             ),
@@ -228,6 +229,15 @@ def train():
         trainer.fit(model=model, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader, ckpt_path=resume)
     else:
         trainer.fit(model=model, train_dataloaders=train_dataloader, ckpt_path=resume)
+
+
+def resolve_initialization_checkpoint(arguments, experiment_specs):
+    """Resolve weights-only initialization without overriding a true resume."""
+    if arguments.resume is not None:
+        return None
+    if arguments.init_from is not None:
+        return arguments.init_from
+    return experiment_specs.get("init_from_checkpoint")
 
 
 def load_weights_only(
