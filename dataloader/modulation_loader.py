@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from tqdm.auto import tqdm
 
 from dataloader.conditioning import build_conditioning_sources
 
@@ -498,7 +499,13 @@ def ensure_modulation_cache(
                     "cuda" if torch.cuda.is_available() else "cpu"
                 )
                 quality_model = quality_model.to(quality_device).eval()
-                for index, record in enumerate(unscored, start=1):
+                progress = tqdm(
+                    unscored,
+                    desc="scoring latent reconstructions",
+                    unit="latent",
+                    dynamic_ncols=True,
+                )
+                for index, record in enumerate(progress, start=1):
                     key = _quality_key(cache_path, record["latent_path"])
                     manifest["scores"][key] = _score_modulation_reconstruction(
                         quality_model,
