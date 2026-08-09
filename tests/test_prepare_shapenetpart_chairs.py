@@ -8,12 +8,24 @@ import numpy as np
 
 from scripts.prepare_shapenetpart_chairs import (
     normalize_points_abo,
+    partition_model_ids,
     prepare_dataset,
     resolve_source_root,
 )
 
 
 class ShapeNetPartPreparationTests(unittest.TestCase):
+    def test_partition_uses_every_object_without_test_split(self):
+        first = partition_model_ids((f"chair_{index}" for index in range(10)), 0.8, 7)
+        second = partition_model_ids((f"chair_{index}" for index in range(10)), 0.8, 7)
+
+        self.assertEqual(first, second)
+        self.assertEqual(set(first), {"train", "val", "all"})
+        self.assertEqual(len(first["train"]), 8)
+        self.assertEqual(len(first["val"]), 2)
+        self.assertFalse(set(first["train"]) & set(first["val"]))
+        self.assertEqual(set(first["train"]) | set(first["val"]), set(first["all"]))
+
     def test_point_normalization_matches_abo_convention(self):
         points = np.asarray(
             [[1.0, -2.0, 5.0], [5.0, 2.0, 7.0], [3.0, 0.0, 6.0]],
@@ -72,6 +84,8 @@ class ShapeNetPartPreparationTests(unittest.TestCase):
                 class_name="CHAIR",
                 category_id="03001627",
                 split_prefix="shapenetpart_CHAIR",
+                train_ratio=2 / 3,
+                split_seed=0,
                 workers=2,
                 limit=None,
                 skip_existing=False,
@@ -102,9 +116,19 @@ class ShapeNetPartPreparationTests(unittest.TestCase):
                     / "shapenetpart_CHAIR_train.json"
                 ).read_text(encoding="utf-8")
             )
-            self.assertEqual(
-                train_manifest,
-                {"shapenetpart": {"CHAIR": ["chair_train"]}},
+            train_ids = train_manifest["shapenetpart"]["CHAIR"]
+            val_manifest = json.loads(
+                (
+                    output_root / "splits" / "shapenetpart_CHAIR_val.json"
+                ).read_text(encoding="utf-8")
+            )
+            val_ids = val_manifest["shapenetpart"]["CHAIR"]
+            self.assertEqual(len(train_ids), 2)
+            self.assertEqual(len(val_ids), 1)
+            self.assertFalse(set(train_ids) & set(val_ids))
+            self.assertEqual(set(train_ids) | set(val_ids), set(model_ids))
+            self.assertFalse(
+                (output_root / "splits" / "shapenetpart_CHAIR_test.json").exists()
             )
             self.assertEqual(set(summary["splits"]["all"]), set(model_ids))
 

@@ -7,8 +7,9 @@ The normalized ShapeNetPart archive stores one text file per object. Its first
 three columns are XYZ coordinates; the remaining columns (normals and part
 labels) are not inputs to the COD surface encoder. This script writes the
 surface-only ``cod_sdf.npz`` layout expected by ``SurfacePointLoader`` and
-translates the archive's official train/validation/test lists into this
-repository's split-manifest format.
+deterministically partitions every available chair into train and validation
+manifests. The official test partition is intentionally folded back into this
+pretraining pool.
 
 These records are suitable for latent extraction and diffusion training. They
 do not contain SDF supervision and therefore cannot be used for stage-one SDF
@@ -34,17 +35,21 @@ DEFAULT_DATASET_KEY = "shapenetpart"
 DEFAULT_CLASS_NAME = "CHAIR"
 DEFAULT_CATEGORY_ID = "03001627"
 DEFAULT_SPLIT_PREFIX = "shapenetpart_CHAIR"
-SPLIT_FILENAMES = {
-    "train": "shuffled_train_file_list.json",
-    "val": "shuffled_val_file_list.json",
-    "test": "shuffled_test_file_list.json",
-}
+DEFAULT_TRAIN_RATIO = 0.9
+DEFAULT_SPLIT_SEED = 0
 
 
 def positive_int(value: str) -> int:
     parsed = int(value)
     if parsed < 1:
         raise argparse.ArgumentTypeError("value must be >= 1")
+    return parsed
+
+
+def train_ratio(value: str) -> float:
+    parsed = float(value)
+    if not 0.0 < parsed < 1.0:
+        raise argparse.ArgumentTypeError("value must be strictly between 0 and 1")
     return parsed
 
 
@@ -55,9 +60,9 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_SOURCE_DIR,
         help=(
-            "Extracted ShapeNetPart root containing the category directory and "
-            "train_test_split. A parent containing the standard nested archive "
-            "directory is also accepted."
+            "Extracted ShapeNetPart root containing the category directory. A "
+            "parent containing the standard nested archive directory is also "
+            "accepted."
         ),
     )
     parser.add_argument("--datasets-root", type=Path, default=DEFAULT_DATASETS_ROOT)
@@ -65,6 +70,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--class-name", default=DEFAULT_CLASS_NAME)
     parser.add_argument("--category-id", default=DEFAULT_CATEGORY_ID)
     parser.add_argument("--split-prefix", default=DEFAULT_SPLIT_PREFIX)
+    parser.add_argument(
+        "--train-ratio",
+        type=train_ratio,
+        default=DEFAULT_TRAIN_RATIO,
+        help="Fraction of all available chairs assigned to training (default: 0.9).",
+    )
+    parser.add_argument(
+        "--split-seed",
+        type=int,
+        default=DEFAULT_SPLIT_SEED,
+        help="Seed for the deterministic train/validation partition.",
+    )
     parser.add_argument(
         "--workers",
         type=positive_int,
@@ -92,13 +109,11 @@ def resolve_source_root(source_dir: Path, category_id: str) -> Path:
         source_dir / "shapenetcore_partanno_segmentation_benchmark_v0_normal",
     )
     for candidate in candidates:
-        if (candidate / category_id).is_dir() and (
-            candidate / "train_test_split"
-        ).is_dir():
+        if (candidate / category_id).is_dir():
             return candidate
     raise FileNotFoundError(
-        "could not find the ShapeNetPart category and split directories below "
-        f"{source_dir}; expected {category_id}/ and train_test_split/"
+        "could not find the ShapeNetPart category directory below "
+        f"{source_dir}; expected {category_id}/"
     )
 
 
@@ -168,24 +183,25 @@ def convert_one(
     return "written"
 
 
-def split_model_ids(path: Path, category_id: str) -> list[str]:
-    entries = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(entries, list):
-        raise ValueError(f"ShapeNetPart split must contain a JSON list: {path}")
+def partition_model_ids(
+    model_ids: Iterable[str],
+    ratio: float,
+    seed: int,
+) -> dict[str, list[str]]:
+    ids = sorted(set(model_ids))
+    if len(ids) < 2:
+        raise ValueError("at least two objects are required for train/validation splits")
+    if not 0.0 < ratio < 1.0:
+        raise ValueError("train ratio must be strictly between 0 and 1")
 
-    model_ids = []
-    seen = set()
-    for entry in entries:
-        if not isinstance(entry, str):
-            raise ValueError(f"non-string entry in ShapeNetPart split: {path}")
-        parts = Path(entry).parts
-        if category_id not in parts:
-            continue
-        model_id = Path(entry).name
-        if model_id and model_id not in seen:
-            seen.add(model_id)
-            model_ids.append(model_id)
-    return sorted(model_ids)
+    shuffled = list(ids)
+    np.random.default_rng(seed).shuffle(shuffled)
+    train_count = min(max(int(len(shuffled) * ratio), 1), len(shuffled) - 1)
+    return {
+        "train": sorted(shuffled[:train_count]),
+        "val": sorted(shuffled[train_count:]),
+        "all": ids,
+    }
 
 
 def write_manifest(
@@ -243,27 +259,22 @@ def prepare_dataset(args: argparse.Namespace) -> dict[str, object]:
             if index % 250 == 0 or index == len(futures):
                 print(f"converted {index}/{len(futures)}", flush=True)
 
-    splits: dict[str, list[str]] = {}
-    split_dir = source_root / "train_test_split"
-    for split_name, filename in SPLIT_FILENAMES.items():
-        ids = split_model_ids(split_dir / filename, args.category_id)
-        splits[split_name] = [model_id for model_id in ids if model_id in available_ids]
-    splits["all"] = sorted(available_ids)
-
-    assigned = set().union(*(splits[name] for name in SPLIT_FILENAMES))
-    missing_from_official_splits = sorted(available_ids - assigned)
-    if missing_from_official_splits and args.limit is None:
-        preview = ", ".join(missing_from_official_splits[:5])
-        raise RuntimeError(
-            f"{len(missing_from_official_splits)} converted objects are absent from the "
-            f"official splits; first IDs: {preview}"
-        )
+    splits = partition_model_ids(
+        available_ids,
+        ratio=args.train_ratio,
+        seed=args.split_seed,
+    )
 
     manifest_paths = {}
     for split_name, ids in splits.items():
         path = args.datasets_root / "splits" / f"{args.split_prefix}_{split_name}.json"
         write_manifest(path, args.dataset_key, args.class_name, ids)
         manifest_paths[split_name] = str(path)
+
+    obsolete_test_manifest = (
+        args.datasets_root / "splits" / f"{args.split_prefix}_test.json"
+    )
+    obsolete_test_manifest.unlink(missing_ok=True)
 
     metadata_path = (
         args.datasets_root / args.dataset_key / "preprocessing_metadata.json"
@@ -276,6 +287,11 @@ def prepare_dataset(args: argparse.Namespace) -> dict[str, object]:
         "source_format": "ShapeNetPart normalized point clouds (XYZ columns only)",
         "usage": "stage_two_latent_extraction_and_diffusion_only",
         "normalization": "x_prime = scale * (x - bbox_center), isotropic max_abs_0.999",
+        "partition": {
+            "method": "deterministic_random_train_val_over_all_available_chairs",
+            "train_ratio": args.train_ratio,
+            "seed": args.split_seed,
+        },
         "counts": {name: len(ids) for name, ids in splits.items()},
         "records_written": results["written"],
         "records_skipped": results["skipped"],
@@ -294,8 +310,7 @@ def main() -> None:
         "summary: "
         f"written={summary['written']} skipped={summary['skipped']} "
         f"train={len(summary['splits']['train'])} "
-        f"val={len(summary['splits']['val'])} "
-        f"test={len(summary['splits']['test'])}",
+        f"val={len(summary['splits']['val'])}",
         flush=True,
     )
 

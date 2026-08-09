@@ -288,8 +288,9 @@ scores are stored in `modulations/latent_quality.json`. The primary multi-ray
 unconditional and image-conditioned profiles share this manifest and use a
 maximum Chamfer distance of 0.005.
 
-A separate unconditional experiment directory is available for a clean run
-whose checkpoints and logs do not overlap the original profile:
+A separate unconditional experiment uses the best reconstruction-preserving
+learned-query encoder-refined checkpoint, a dedicated filtered latent cache,
+and checkpoints/logs that do not overlap the original profile:
 
     python train.py \
       -e config/cod/stage2_transformer_diffusion_multiray21_quality_filtered \
