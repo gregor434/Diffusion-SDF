@@ -9,6 +9,70 @@ from torch.nn import functional as F
 from models.archs.condition_encoders import ConditionEncoderSet
 
 
+def latent_set_distance_matrix(
+    left,
+    right=None,
+    *,
+    metric="sliced_wasserstein",
+    mmd_bandwidth=1.0,
+    projections=None,
+):
+    """Differentiable, permutation-invariant distances between latent sets.
+
+    ``left`` and ``right`` contain batches of sets shaped ``[B, M, D]``.  The
+    returned matrix has one distance for every pair of sets.  Sliced
+    Wasserstein is the default because it is scale-stable and avoids assigning
+    COD tokens to one another.  RBF MMD is available for ablations.
+    """
+    right = left if right is None else right
+    if left.ndim != 3 or right.ndim != 3:
+        raise ValueError("latent sets must have shape [batch, tokens, channels]")
+    if left.shape[1:] != right.shape[1:]:
+        raise ValueError(
+            "latent-set distance requires equal token and channel dimensions, "
+            f"got {tuple(left.shape[1:])} and {tuple(right.shape[1:])}"
+        )
+
+    if metric == "sliced_wasserstein":
+        if projections is None:
+            projections = torch.eye(
+                left.shape[-1], device=left.device, dtype=left.dtype
+            )
+        projections = F.normalize(projections.to(left), dim=-1)
+        left_sorted = torch.sort(left @ projections.T, dim=1).values
+        right_sorted = torch.sort(right @ projections.T, dim=1).values
+        squared = (
+            left_sorted[:, None] - right_sorted[None, :]
+        ).square().mean(dim=(-1, -2))
+        # Self-distances lie exactly on zero.  sqrt has an infinite derivative
+        # there, which can contaminate gradients even when callers later mask
+        # the matrix diagonal (zero upstream gradient times infinity is NaN).
+        return squared.clamp_min(1e-12).sqrt()
+
+    if metric == "mmd":
+        bandwidth = float(mmd_bandwidth)
+        if bandwidth <= 0:
+            raise ValueError("mmd_bandwidth must be positive")
+
+        def kernel_mean(first, second):
+            squared = torch.cdist(first.float(), second.float()).square()
+            return torch.exp(-squared / (2.0 * bandwidth**2)).mean(dim=(-1, -2))
+
+        left_self = kernel_mean(left, left)
+        right_self = kernel_mean(right, right)
+        batch_left, batch_right = left.shape[0], right.shape[0]
+        expanded_left = left[:, None].expand(-1, batch_right, -1, -1)
+        expanded_right = right[None, :].expand(batch_left, -1, -1, -1)
+        cross = kernel_mean(
+            expanded_left.reshape(-1, left.shape[1], left.shape[2]),
+            expanded_right.reshape(-1, right.shape[1], right.shape[2]),
+        ).reshape(batch_left, batch_right)
+        mmd_squared = left_self[:, None] + right_self[None, :] - 2.0 * cross
+        return mmd_squared.clamp_min(1e-12).sqrt()
+
+    raise ValueError(f"unknown latent-set distance: {metric}")
+
+
 def zero_module(module):
     for parameter in module.parameters():
         nn.init.zeros_(parameter)

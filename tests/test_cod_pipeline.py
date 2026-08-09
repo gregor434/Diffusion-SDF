@@ -15,7 +15,7 @@ from models.combined_model import (
     validate_training_specs,
 )
 from models.cod_vae.checkpoint import load_cod_checkpoint
-from models.diffusion import CODLatentTransformer
+from models.diffusion import CODLatentTransformer, latent_set_distance_matrix
 from models.sdf_model import SdfModel
 
 
@@ -52,6 +52,92 @@ def tiny_specs():
 
 
 class CODPipelineTests(unittest.TestCase):
+    def test_latent_set_distances_are_permutation_invariant(self):
+        first = torch.randn(3, 5, 4)
+        second = torch.randn(2, 5, 4)
+        projections = torch.randn(12, 4)
+        token_permutation = torch.tensor([3, 0, 4, 1, 2])
+        for metric in ("sliced_wasserstein", "mmd"):
+            with self.subTest(metric=metric):
+                expected = latent_set_distance_matrix(
+                    first,
+                    second,
+                    metric=metric,
+                    projections=projections,
+                )
+                actual = latent_set_distance_matrix(
+                    first[:, token_permutation],
+                    second[:, token_permutation.flip(0)],
+                    metric=metric,
+                    projections=projections,
+                )
+                torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+
+    def test_pairwise_adaptation_uses_frozen_source_and_shared_noise(self):
+        specs = {
+            "training_task": "diffusion",
+            "diffusion_specs": {
+                "sigma_data": 1.0,
+                "P_mean": -1.2,
+                "P_std": 1.2,
+                "sampling_steps": 2,
+            },
+            "diffusion_model_specs": {
+                "latent_tokens": 3,
+                "latent_dimension": 4,
+                "width": 16,
+                "depth": 1,
+                "heads": 4,
+                "dropout": 0.0,
+            },
+            "lambda_pairwise": 2.0,
+            "pairwise_distance": "sliced_wasserstein",
+            "pairwise_num_projections": 8,
+        }
+        source = CombinedModel({**specs, "lambda_pairwise": 0.0})
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "source.ckpt"
+            torch.save({"state_dict": source.state_dict()}, path)
+            adapted = CombinedModel({
+                **specs,
+                "source_diffusion_checkpoint": str(path),
+            })
+
+        self.assertFalse(any(
+            parameter.requires_grad
+            for parameter in adapted.source_diffusion_model.parameters()
+        ))
+        self.assertFalse(any(
+            key.startswith("source_diffusion_model")
+            for key in adapted.state_dict()
+        ))
+        clean = torch.randn(4, 3, 4)
+        noise = torch.randn_like(clean)
+        sigma = torch.rand(4) + 0.1
+        initial = adapted.stage2_losses(
+            {"latent": clean}, noise=noise, sigma=sigma
+        )
+        self.assertAlmostEqual(initial["pairwise"].item(), 0.0, places=6)
+        initial["loss"].backward()
+        self.assertTrue(all(
+            parameter.grad is None or torch.isfinite(parameter.grad).all()
+            for parameter in adapted.diffusion_model.parameters()
+        ))
+        adapted.zero_grad(set_to_none=True)
+        with torch.no_grad():
+            weight = adapted.diffusion_model.model.output_projection.weight
+            weight.copy_(
+                torch.linspace(-0.5, 0.5, weight.numel()).reshape_as(weight)
+            )
+        changed = adapted.stage2_losses(
+            {"latent": clean}, noise=noise, sigma=sigma
+        )
+        self.assertGreater(changed["pairwise"].item(), 0.0)
+        torch.testing.assert_close(
+            changed["loss"],
+            changed["diffusion"] + 2.0 * changed["pairwise"],
+        )
+
     def test_diffusion_slot_embeddings_break_token_permutation_equivariance(self):
         plain = CODLatentTransformer(
             latent_tokens=3,

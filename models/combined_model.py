@@ -8,7 +8,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from models.diffusion import EDMLatentDiffusion
+from models.diffusion import EDMLatentDiffusion, latent_set_distance_matrix
 from models.sdf_model import SdfModel
 
 
@@ -124,8 +124,110 @@ class CombinedModel(pl.LightningModule):
                 specs["diffusion_model_specs"], specs["diffusion_specs"]
             )
 
+        self._configure_few_shot_adaptation()
+
         self._configure_trainability()
         self._load_latent_statistics()
+
+    def _configure_few_shot_adaptation(self):
+        """Create the frozen source prior without registering it in checkpoints."""
+        self.lambda_pairwise = float(self.specs.get("lambda_pairwise", 0.0))
+        if self.lambda_pairwise < 0:
+            raise ValueError("lambda_pairwise must be non-negative")
+        self.pairwise_distance = self.specs.get(
+            "pairwise_distance", "sliced_wasserstein"
+        )
+        if self.pairwise_distance not in {"sliced_wasserstein", "mmd"}:
+            raise ValueError(
+                f"unknown pairwise_distance: {self.pairwise_distance}"
+            )
+        self.mmd_bandwidth = float(self.specs.get("pairwise_mmd_bandwidth", 1.0))
+        projection_count = int(self.specs.get("pairwise_num_projections", 32))
+        if projection_count <= 0:
+            raise ValueError("pairwise_num_projections must be positive")
+        dimension = int(
+            self.specs.get("diffusion_model_specs", {}).get("latent_dimension", 32)
+        )
+        generator = torch.Generator().manual_seed(
+            int(self.specs.get("pairwise_projection_seed", 0))
+        )
+        projections = torch.randn(projection_count, dimension, generator=generator)
+        self.register_buffer(
+            "pairwise_projections", F.normalize(projections, dim=-1), persistent=False
+        )
+        self._training_latent_bank = []
+
+        source = None
+        source_path = self.specs.get("source_diffusion_checkpoint")
+        if self.lambda_pairwise > 0 and self.task != "diffusion":
+            raise ValueError("pairwise adaptation is currently supported for stage 2")
+        if self.lambda_pairwise > 0 and not source_path:
+            raise ValueError(
+                "a positive lambda_pairwise requires source_diffusion_checkpoint"
+            )
+        if source_path:
+            if self.task != "diffusion":
+                raise ValueError("source_diffusion_checkpoint is only valid for stage 2")
+            source = EDMLatentDiffusion(
+                self.specs["diffusion_model_specs"], self.specs["diffusion_specs"]
+            )
+            self._load_source_diffusion(source, source_path)
+            source.requires_grad_(False).eval()
+        # Deliberately bypass nn.Module registration: the immutable source is
+        # reconstructed from its configured checkpoint and is not duplicated in
+        # every target checkpoint.
+        object.__setattr__(self, "source_diffusion_model", source)
+
+    @staticmethod
+    def _load_source_diffusion(source, checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        if not isinstance(checkpoint, dict) or "state_dict" not in checkpoint:
+            raise ValueError(
+                "source_diffusion_checkpoint must be a Lightning checkpoint "
+                "with a state_dict"
+            )
+        state = checkpoint["state_dict"]
+        prefix = "diffusion_model."
+        selected = {
+            key[len(prefix):]: value
+            for key, value in state.items()
+            if key.startswith(prefix)
+        }
+        if not selected and all(
+            key.startswith(("model.",)) or key in {
+                "latent_mean", "latent_std", "pairwise_projections"
+            }
+            for key in state
+        ):
+            selected = {key: value for key, value in state.items() if key.startswith("model.")}
+        if not selected:
+            raise ValueError(
+                "source checkpoint does not contain diffusion_model parameters"
+            )
+        source.load_state_dict(selected, strict=True)
+
+    def latent_set_distances(self, left, right=None):
+        return latent_set_distance_matrix(
+            left,
+            right,
+            metric=self.pairwise_distance,
+            mmd_bandwidth=self.mmd_bandwidth,
+            projections=self.pairwise_projections,
+        )
+
+    def pairwise_preservation_loss(self, target, source):
+        if target.shape[0] < 2:
+            return target.new_zeros(())
+        target_distances = self.latent_set_distances(target)
+        with torch.no_grad():
+            source_distances = self.latent_set_distances(source)
+        indices = torch.triu_indices(
+            target.shape[0], target.shape[0], offset=1, device=target.device
+        )
+        return F.mse_loss(
+            target_distances[indices[0], indices[1]],
+            source_distances[indices[0], indices[1]],
+        )
 
     def _configure_trainability(self):
         if self.task == "modulation":
@@ -376,10 +478,25 @@ class CombinedModel(pl.LightningModule):
         }
 
     def stage2_losses(self, batch, noise=None, sigma=None):
-        loss, clean_estimate, _, _ = self.diffusion_model.training_loss(
+        diffusion_loss, clean_estimate, noisy, sigma = self.diffusion_model.training_loss(
             batch["latent"], self._conditioning(batch), noise=noise, sigma=sigma
         )
-        return {"loss": loss, "diffusion": loss, "clean_latent": clean_estimate}
+        pairwise = diffusion_loss.new_zeros(())
+        if self.lambda_pairwise > 0:
+            source = self.source_diffusion_model
+            source.to(noisy.device).eval()
+            with torch.no_grad():
+                source_estimate = source(noisy, sigma, self._conditioning(batch))
+            pairwise = self.pairwise_preservation_loss(
+                clean_estimate, source_estimate
+            )
+        total = diffusion_loss + self.lambda_pairwise * pairwise
+        return {
+            "loss": total,
+            "diffusion": diffusion_loss,
+            "pairwise": pairwise,
+            "clean_latent": clean_estimate,
+        }
 
     def deterministic_validation_noise(self, clean, batch_idx):
         seed = int(self.specs.get("validation_noise_seed", 0)) + int(batch_idx)
@@ -478,6 +595,8 @@ class CombinedModel(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         losses = self._losses(batch)
+        if self.task == "diffusion":
+            self._update_training_latent_bank(batch["latent"])
         batch_size = (
             batch["latent"].shape[0]
             if self.task == "diffusion"
@@ -490,6 +609,62 @@ class CombinedModel(pl.LightningModule):
                     batch_size=batch_size,
                 )
         return losses["loss"]
+
+    def _update_training_latent_bank(self, latent):
+        monitoring = self.specs.get("few_shot_monitoring", {})
+        if not bool(monitoring.get("enabled", False)):
+            return
+        capacity = max(1, int(monitoring.get("train_bank_size", 256)))
+        self._training_latent_bank.append(latent.detach().cpu())
+        total = sum(value.shape[0] for value in self._training_latent_bank)
+        while total > capacity and self._training_latent_bank:
+            removed = self._training_latent_bank.pop(0)
+            total -= removed.shape[0]
+
+    def on_validation_epoch_end(self):
+        if self.task != "diffusion" or not self._training_latent_bank:
+            return
+        monitoring = self.specs.get("few_shot_monitoring", {})
+        if not bool(monitoring.get("enabled", False)):
+            return
+        frequency = max(1, int(monitoring.get("every_n_epochs", 1)))
+        if (self.current_epoch + 1) % frequency:
+            return
+        count = max(2, int(monitoring.get("num_samples", 16)))
+        steps = int(
+            monitoring.get("sampling_steps", self.diffusion_model.sampling_steps)
+        )
+        device = next(self.diffusion_model.parameters()).device
+        generator = torch.Generator(device=device).manual_seed(
+            int(monitoring.get("seed", 0)) + int(self.current_epoch)
+        )
+        noise = torch.randn(
+            count,
+            self.diffusion_model.latent_tokens,
+            self.diffusion_model.latent_dimension,
+            device=device,
+            generator=generator,
+        )
+        conditioning = None
+        if self.diffusion_model.model.conditional:
+            return
+        with torch.no_grad():
+            generated = self.diffusion_model.sample(
+                count, conditioning=conditioning, noise=noise, num_steps=steps
+            )
+            training = torch.cat(self._training_latent_bank, dim=0).to(device)
+            nearest = self.latent_set_distances(generated, training).min(dim=1).values
+            diversity_matrix = self.latent_set_distances(generated)
+            indices = torch.triu_indices(count, count, offset=1, device=device)
+            diversity = diversity_matrix[indices[0], indices[1]].mean()
+        self.log(
+            "val/generated_to_training_nn", nearest.mean(), on_epoch=True,
+            sync_dist=True,
+        )
+        self.log(
+            "val/generation_diversity", diversity, on_epoch=True,
+            sync_dist=True,
+        )
 
     def validation_step(self, batch, batch_idx):
         if self.task == "diffusion":
