@@ -1,5 +1,5 @@
 {
-  "Description": "Pre-train medium unconditional diffusion on ShapeNetCore-v2 chair latents from the frozen FPS COD encoder, decoded with the trained SDF-head VAE",
+  "Description": "Pre-train large unconditional diffusion without dropout on ShapeNetCore-v2 chair latents from the frozen FPS COD encoder, decoded with the trained SDF-head VAE",
   "DataSource": "datasets",
   "TrainSplit": "datasets/splits/shapenetcore_CHAIR_train.json",
   "ValSplit": "datasets/splits/shapenetcore_CHAIR_val.json",
@@ -27,7 +27,7 @@
   },
   "SdfModelSpecs": {"hidden_dim": 512, "feature_dim": 32},
   "diffusion_specs": {"sigma_data": 1.0, "P_mean": -1.2, "P_std": 1.2, "sigma_min": 0.002, "sigma_max": 80.0, "rho": 7.0, "sampling_steps": 40},
-  "diffusion_model_specs": {"latent_tokens": 32, "latent_dimension": 32, "width": 256, "depth": 8, "heads": 8, "mlp_ratio": 4, "dropout": 0.25, "cond": false},
+  "diffusion_model_specs": {"latent_tokens": 32, "latent_dimension": 32, "width": 512, "depth": 12, "heads": 8, "mlp_ratio": 4, "dropout": 0.0, "cond": false},
   "learning_rates": {"diffusion": 0.00001},
   "lr_scheduler": {"type": "cosine", "min_lr": 0.000001, "epochs": 2000},
   "early_stopping": {"monitor": "val/loss", "mode": "min", "patience": 80, "min_delta": 0.00001},
