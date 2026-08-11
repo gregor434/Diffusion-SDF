@@ -194,26 +194,6 @@ joint VAE fine-tune regressed validation SDF reconstruction:
     python train.py -e config/cod/stage2_transformer_diffusion_multiray21_learned_query -b 32 -w 8
     python train.py -e config/cod/stage2_transformer_image_diffusion_multiray21_learned_query -b 32 -w 8
 
-To compare resampling stability with an FPS baseline report, pass
-`--baseline-report` to `scripts/analyze_latent_manifold.py`. The report includes
-both token-set Chamfer and token-aligned posterior-mean MSE; it records relative
-deltas without automatically selecting a patch-FPS replacement.
-
-To compare query-only adaptation with the later encoder-refined checkpoint on
-exactly paired point-cloud resamples, run:
-
-    python scripts/compare_encoder_resampling.py \
-      --baseline-checkpoint config/cod/stage1_learned_query_adaptation_multiray21/best-v2.ckpt \
-      --candidate-checkpoint config/cod/stage1_learned_query_encoder_refinement_multiray21/best.ckpt \
-      --split datasets/splits/abo_fullchairs_multiray21_CHAIR_val.json \
-      --surface-samples 8 --surface-points 2048 --query-points 4096 \
-      --seed 0 \
-      --output config/cod/stage1_learned_query_encoder_refinement_multiray21/resampling_comparison.json
-
-The comparison uses posterior means and reports aligned latent MSE, token-set
-Chamfer, SDF-field disagreement, sign flips, and ground-truth SDF error. Run it
-after encoder refinement has finished writing its final best checkpoint.
-
 The latent-preserving geometry experiment keeps the encoder, posterior
 projection, and latent decoder frozen, and trains only the tri-plane decoder
 (including a zero-initialized residual convolutional refiner) and SDF head.

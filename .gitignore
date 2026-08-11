@@ -1,5 +1,7 @@
 .DS_Store
 __pycache__/
+*.swp
+*.so
 
 datasets/
 datasets
@@ -8,10 +10,18 @@ outputs/
 runs/
 reports/generated/
 tensorboard_logs/
+combined_logs/
 tmp/
-config/*/*/code/
-config/*/*/recon/
-config/*/*/modulations/
+**/code/
+**/evaluation/
+**/latent_manifold/
+**/lightning_logs/
+**/modulations/
+**/recon/
+**/reconstructions/
+**/summary*.json
+**/report.json
+**/resampling_comparison.json
 *.ckpt
 *.pth
 *.pt
@@ -21,3 +31,11 @@ config/*/*/modulations/
 *.obj
 *.glb
 *.csv
+
+# Local experiment-analysis utilities, not part of the runnable pipeline.
+scripts/analyze_latent_manifold.py
+scripts/compare_encoder_resampling.py
+scripts/evaluate_config.py
+scripts/inspect_checkpoint.py
+tests/test_compare_encoder_resampling.py
+tests/test_evaluate_config.py
