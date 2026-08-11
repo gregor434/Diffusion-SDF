@@ -78,6 +78,8 @@ def validate_training_specs(specs):
         )
     ):
         active.add("diffusion_slot_embeddings")
+    if bool(specs.get("diffusion_model_specs", {}).get("cond", False)):
+        active.add("diffusion_conditioning")
     decoder_specs = specs.get("CODVaeSpecs", {}).get("decoder_params", {})
     if (
         "triplane_decoder" in active
@@ -159,6 +161,9 @@ class CombinedModel(pl.LightningModule):
         self._training_latent_bank = []
 
         source = None
+        self.source_diffusion_uses_conditioning = bool(
+            self.specs.get("source_diffusion_uses_conditioning", True)
+        )
         source_path = self.specs.get("source_diffusion_checkpoint")
         if self.lambda_pairwise > 0 and self.task != "diffusion":
             raise ValueError("pairwise adaptation is currently supported for stage 2")
@@ -169,8 +174,12 @@ class CombinedModel(pl.LightningModule):
         if source_path:
             if self.task != "diffusion":
                 raise ValueError("source_diffusion_checkpoint is only valid for stage 2")
+            source_model_specs = self.specs.get(
+                "source_diffusion_model_specs",
+                self.specs["diffusion_model_specs"],
+            )
             source = EDMLatentDiffusion(
-                self.specs["diffusion_model_specs"], self.specs["diffusion_specs"]
+                source_model_specs, self.specs["diffusion_specs"]
             )
             self._load_source_diffusion(source, source_path)
             source.requires_grad_(False).eval()
@@ -490,7 +499,12 @@ class CombinedModel(pl.LightningModule):
             source = self.source_diffusion_model
             source.to(noisy.device).eval()
             with torch.no_grad():
-                source_estimate = source(noisy, sigma, self._conditioning(batch))
+                source_conditioning = (
+                    self._conditioning(batch)
+                    if self.source_diffusion_uses_conditioning
+                    else None
+                )
+                source_estimate = source(noisy, sigma, source_conditioning)
             pairwise = self.pairwise_preservation_loss(
                 clean_estimate, source_estimate
             )
@@ -754,6 +768,19 @@ class CombinedModel(pl.LightningModule):
                         "diffusion",
                         self.specs.get("diff_lr", 1e-5),
                     ),
+                )
+            if "diffusion_conditioning" in rates:
+                transformer = self.diffusion_model.model
+                conditioning_parameters = list(
+                    transformer.condition_encoder.parameters()
+                ) + list(transformer.condition_projection.parameters())
+                for block in transformer.blocks:
+                    conditioning_parameters.extend(block.norm_cross.parameters())
+                    conditioning_parameters.extend(block.cross_attention.parameters())
+                add_group(
+                    "diffusion_conditioning",
+                    nn.ParameterList(conditioning_parameters),
+                    rates["diffusion_conditioning"],
                 )
             add_group("diffusion", self.diffusion_model, self.specs.get("diff_lr", 1e-5))
         if not groups:

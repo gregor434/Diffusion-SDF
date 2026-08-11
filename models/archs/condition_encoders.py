@@ -24,13 +24,24 @@ class PointCloudConditionEncoder(ConditionEncoder):
 
 
 class ImageConditionEncoder(ConditionEncoder):
-    def __init__(self, condition_dim, clip_feature_dim=512, **kwargs):
+    def __init__(
+        self,
+        condition_dim,
+        clip_feature_dim=512,
+        num_tokens=1,
+        **kwargs,
+    ):
         super().__init__()
         self.clip_feature_dim = clip_feature_dim
-        if clip_feature_dim == condition_dim:
+        self.condition_dim = int(condition_dim)
+        self.num_tokens = int(num_tokens)
+        if self.num_tokens < 1:
+            raise ValueError("image condition num_tokens must be positive")
+        output_dim = self.condition_dim * self.num_tokens
+        if clip_feature_dim == output_dim:
             self.proj = nn.Identity()
         else:
-            self.proj = nn.Linear(clip_feature_dim, condition_dim)
+            self.proj = nn.Linear(clip_feature_dim, output_dim)
 
     def forward(self, image_features):
         if image_features.dim() == 2:
@@ -43,7 +54,12 @@ class ImageConditionEncoder(ConditionEncoder):
             raise ValueError(
                 f"image condition last dimension must be {self.clip_feature_dim}, got {image_features.shape[-1]}"
             )
-        return self.proj(image_features)
+        projected = self.proj(image_features)
+        return projected.reshape(
+            projected.shape[0],
+            projected.shape[1] * self.num_tokens,
+            self.condition_dim,
+        )
 
 
 class ConditionEncoderSet(nn.Module):
