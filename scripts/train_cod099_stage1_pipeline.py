@@ -92,10 +92,15 @@ def parse_args(argv=None):
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--workers", type=int, default=8)
     for stage in ("bootstrap", "polish", "refinement"):
+        skip_help = (
+            "Do not run convolutional refinement."
+            if stage == "refinement"
+            else f"Use the existing {stage} best checkpoint."
+        )
         parser.add_argument(
             f"--skip-{stage}",
             action="store_true",
-            help=f"Use the existing {stage} best checkpoint.",
+            help=skip_help,
         )
         parser.add_argument(
             f"--resume-{stage}",
@@ -137,9 +142,6 @@ def main(argv=None):
     require_quality(POLISH / "best.ckpt", "polish", args.dry_run)
 
     if args.skip_refinement:
-        require_checkpoint(
-            REFINEMENT / "best.ckpt", "refinement best checkpoint", args.dry_run
-        )
         return
     train_stage(
         REFINEMENT,
