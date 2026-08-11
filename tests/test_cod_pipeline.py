@@ -305,6 +305,43 @@ class CODPipelineTests(unittest.TestCase):
                     sdf_trainable,
                 )
 
+    def test_sdf_head_conv_refine_mode_freezes_the_rest_of_cod(self):
+        specs = tiny_specs()
+        specs["CODVaeSpecs"]["decoder_params"]["use_conv_refine"] = True
+        model = SdfModel(specs)
+        groups = model.component_parameters()
+
+        selected = STAGE1_COMPONENTS["sdf_head_conv_refine"]
+        model.set_trainable_components(selected)
+
+        expected = {
+            id(parameter)
+            for name in selected
+            for parameter in groups[name]
+        }
+        actual = {
+            id(parameter)
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        }
+        self.assertEqual(actual, expected)
+        self.assertTrue(expected)
+        for name in (
+            "point_encoder", "variational_block", "latent_decoder"
+        ):
+            self.assertTrue(
+                all(not parameter.requires_grad for parameter in groups[name]),
+                name,
+            )
+        conv_ids = {id(parameter) for parameter in groups["conv_refine"]}
+        self.assertTrue(
+            all(
+                not parameter.requires_grad
+                for parameter in groups["triplane_decoder"]
+                if id(parameter) not in conv_ids
+            )
+        )
+
     def test_stage_two_validation_noise_and_cosine_schedule(self):
         specs = {
             "training_task": "diffusion",

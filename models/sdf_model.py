@@ -199,6 +199,8 @@ class SdfModel(nn.Module):
         groups = OrderedDict(
             (name, parameters(module)) for name, module in coarse.items()
         )
+        if ae.decoder.conv_refine is not None:
+            groups["conv_refine"] = parameters(ae.decoder.conv_refine)
 
         compact_attention = []
         patch_backbone = [ae.point_embed, encoder.norm_point]
@@ -236,6 +238,8 @@ class SdfModel(nn.Module):
             )
         compact_attention.append(encoder.last_block)
         modules = OrderedDict(self.component_modules())
+        if ae.decoder.conv_refine is not None:
+            modules["conv_refine"] = ae.decoder.conv_refine
         modules.update(
             compact_queries=ae.norm_latent,
             compact_token_attention=nn.ModuleList(compact_attention),

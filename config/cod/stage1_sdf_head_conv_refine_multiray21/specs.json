@@ -1,15 +1,15 @@
 {
-  "Description": "Full COD encoder-decoder refinement with paired surface latent consistency on deduplicated multi-ray ABO chairs",
+  "Description": "Continue refining the SDF head and convolutional tri-plane refiner from the trained multi-ray ABO SDF-head checkpoint",
   "DataSource": "datasets",
   "TrainSplit": "datasets/splits/abo_fullchairs_multiray21_CHAIR_train.json",
   "ValSplit": "datasets/splits/abo_fullchairs_multiray21_CHAIR_val.json",
   "TestSplit": "datasets/splits/abo_fullchairs_multiray21_CHAIR_val.json",
   "ModulationSplit": "datasets/splits/abo_fullchairs_multiray21_CHAIR_all.json",
+  "init_from_checkpoint": "config/cod/stage1_sdf_head_multiray21/best-v2.ckpt",
   "training_task": "modulation",
-  "stage1_mode": "full_cod_finetune",
-  "sample_posterior": true,
+  "stage1_mode": "sdf_head_conv_refine",
+  "sample_posterior": false,
   "validation_sample_posterior": false,
-  "PairedSurfaceSampling": true,
   "DeterministicValidationSampling": true,
   "ValidationSamplingSeed": 0,
   "ValidateGeometryRegularization": true,
@@ -59,35 +59,22 @@
     "cod_aux": 0.0,
     "uncertainty": 0.0,
     "surface_zero": 1.0,
-    "eikonal": 0.01,
-    "normal": 0.01,
-    "kl": 0.0001,
-    "latent_consistency": 0.01
+    "eikonal": 0.02,
+    "normal": 0.02,
+    "kl": 0.0
   },
   "learning_rates": {
-    "point_encoder": 0.000002,
-    "variational_block": 0.00001,
-    "latent_decoder": 0.00001,
-    "triplane_decoder": 0.00001,
-    "conv_refine": 0.0002,
-    "sdf_network": 0.0001
+    "conv_refine": 0.00005,
+    "sdf_network": 0.00002
   },
   "lr_scheduler": {
     "type": "cosine",
     "min_lr": 0.000001,
-    "epochs": 500
+    "epochs": 1000
   },
-  "early_stopping": {
-    "monitor": "val/loss",
-    "mode": "min",
-    "patience": 50,
-    "min_delta": 0.00001
-  },
-  "checkpoint_monitor": "val/loss",
-  "checkpoint_mode": "min",
   "weight_decay": 0.0,
   "gradient_clip_val": 1.0,
-  "num_epochs": 500,
-  "log_freq": 100,
+  "num_epochs": 1000,
+  "log_freq": 50,
   "log_every_n_steps": 20
 }

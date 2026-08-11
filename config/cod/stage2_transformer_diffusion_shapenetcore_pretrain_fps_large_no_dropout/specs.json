@@ -1,9 +1,9 @@
 {
-  "Description": "Pre-train large unconditional diffusion without dropout on ShapeNetCore-v2 chair latents from the frozen FPS COD encoder, decoded with the trained SDF-head VAE",
+  "Description": "Pre-train large unconditional diffusion without dropout on ShapeNetCore-v2 chair latents from the frozen FPS COD encoder, decoded with the convolution-refined SDF-head VAE",
   "DataSource": "datasets",
   "TrainSplit": "datasets/splits/shapenetcore_CHAIR_train.json",
   "ValSplit": "datasets/splits/shapenetcore_CHAIR_val.json",
-  "modulation_ckpt_path": "config/cod/stage1_sdf_head_multiray21/best-v2.ckpt",
+  "modulation_ckpt_path": "config/cod/stage1_sdf_head_conv_refine_multiray21/best.ckpt",
   "modulation_cache_path": "config/cod/stage2_transformer_diffusion_shapenetcore_pretrain_fps/modulations",
   "data_path": "config/cod/stage2_transformer_diffusion_shapenetcore_pretrain_fps/modulations",
   "latent_stats_path": "config/cod/stage2_transformer_diffusion_shapenetcore_pretrain_fps/modulations/latent_stats.npz",

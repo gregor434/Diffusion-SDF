@@ -14,6 +14,7 @@ from models.sdf_model import SdfModel
 
 STAGE1_COMPONENTS = {
     "sdf_head_only": {"sdf_network"},
+    "sdf_head_conv_refine": {"conv_refine", "sdf_network"},
     "encoder_finetune": {"point_encoder", "variational_block"},
     "triplane_sdf_finetune": {"triplane_decoder", "sdf_network"},
     "cod_decoder_finetune": {"latent_decoder", "triplane_decoder", "sdf_network"},

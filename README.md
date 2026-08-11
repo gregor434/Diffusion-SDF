@@ -167,8 +167,8 @@ points:
 
     python train.py -e config/cod/stage1_overfit_one -b 10 -w 8 --virtual_train_size 100
 
-Available stage1_mode values are sdf_head_only, triplane_sdf_finetune,
-cod_decoder_finetune, full_cod_finetune, train_from_scratch,
+Available stage1_mode values are sdf_head_only, sdf_head_conv_refine,
+triplane_sdf_finetune, cod_decoder_finetune, full_cod_finetune, train_from_scratch,
 learned_query_adaptation, learned_query_encoder_refinement, and
 learned_query_vae_finetune.
 
