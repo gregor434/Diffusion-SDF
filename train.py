@@ -218,8 +218,7 @@ def train():
             model.diffusion_model.load_state_dict(diffusion_state)
         resume = None
     elif args.resume is not None:
-        ckpt = "{}.ckpt".format(args.resume) if args.resume=='last' else "epoch={}.ckpt".format(args.resume)
-        resume = os.path.join(args.exp_dir, ckpt)
+        resume = resolve_resume_checkpoint(args.exp_dir, args.resume)
     else:
         resume = None  
 
@@ -242,6 +241,23 @@ def resolve_initialization_checkpoint(arguments, experiment_specs):
     if arguments.init_from is not None:
         return arguments.init_from
     return experiment_specs.get("init_from_checkpoint")
+
+
+def resolve_resume_checkpoint(exp_dir, resume):
+    """Return the checkpoint selected by a ``--resume`` argument.
+
+    ``last`` and ``best`` are checkpoint aliases, while numeric values refer to
+    periodic ``epoch=<number>.ckpt`` checkpoints.  Accepting an explicit
+    ``.ckpt`` filename also lets callers resume from versioned best checkpoints
+    without accidentally adding both an epoch prefix and a second suffix.
+    """
+    if resume.endswith(".ckpt"):
+        filename = resume
+    elif resume in {"last", "best"} or resume.startswith(("last-", "best-")):
+        filename = f"{resume}.ckpt"
+    else:
+        filename = f"epoch={resume}.ckpt"
+    return os.path.join(exp_dir, filename)
 
 
 def load_weights_only(
