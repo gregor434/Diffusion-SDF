@@ -4,8 +4,8 @@
     "conditioning": null,
     "data_format": "cod_sdf.npz",
     "data_source": "/cluster/51/boschmann/datasets",
-    "description": "Slot-aware medium unconditional diffusion warm-started on reconstruction-preserving learned-query encoder-refined latents",
-    "path": "/cluster/51/boschmann/code/Diffusion-SDF/config/cod/stage2_transformer_diffusion_multiray21_learned_query_slot_aware",
+    "description": "Long, dropout-free few-shot ABO refinement from the ShapeNetCore-v2 learned-query slot-aware diffusion prior",
+    "path": "/cluster/51/boschmann/code/Diffusion-SDF/config/cod/stage2_fewshot_shapenetcore_learned_query_slot_aware_pretrained_refinement",
     "test_split": "/cluster/51/boschmann/datasets/splits/abo_fullchairs_multiray21_CHAIR_val.json",
     "training_task": "diffusion"
   },
@@ -21,23 +21,23 @@
     "valid_reconstructions": 100
   },
   "distribution": {
-    "coverage_cd": 0.47368421052631576,
-    "jsd": 0.06814698174215808,
-    "mmd_cd": 0.13845836841007078,
-    "one_nn_cd_accuracy": 0.6931818181818182,
-    "one_nn_cd_reference_accuracy": 0.6578947368421053,
-    "one_nn_cd_sample_accuracy": 0.72,
+    "coverage_cd": 0.39473684210526316,
+    "jsd": 0.07360470877665662,
+    "mmd_cd": 0.14628465826253337,
+    "one_nn_cd_accuracy": 0.6875,
+    "one_nn_cd_reference_accuracy": 0.7894736842105263,
+    "one_nn_cd_sample_accuracy": 0.61,
     "reference_count": 76,
     "sample_count": 100
   },
   "mesh_health": {
-    "component_count_omitted": 24,
+    "component_count_omitted": 29,
     "discovered": 100,
     "invalid": 0,
-    "mean_outside_domain_vertex_fraction": 0.00020385561140257236,
+    "mean_outside_domain_vertex_fraction": 0.0003823442654129549,
     "multi_component_fraction": 1.0,
     "valid": 100,
-    "watertight_fraction": 0.95
+    "watertight_fraction": 1.0
   },
   "metric_definitions": {
     "chamfer": {
@@ -57,14 +57,14 @@
     "invalid": {},
     "latent_statistics": {
       "error": null,
-      "path": "/cluster/51/boschmann/code/Diffusion-SDF/config/cod/stage2_transformer_diffusion_multiray21_learned_query/modulations/latent_stats.npz",
+      "path": "/cluster/51/boschmann/code/Diffusion-SDF/config/cod/stage2_fewshot_shapenetcore_learned_query_slot_aware_shared/modulations/latent_stats.npz",
       "valid": true
     },
     "missing": [],
     "observed_shapes": {
       "32x32": 76
     },
-    "path": "/cluster/51/boschmann/code/Diffusion-SDF/config/cod/stage2_transformer_diffusion_multiray21_learned_query/modulations",
+    "path": "/cluster/51/boschmann/code/Diffusion-SDF/config/cod/stage2_fewshot_shapenetcore_learned_query_slot_aware_shared/modulations",
     "valid": 76
   },
   "parameters": {

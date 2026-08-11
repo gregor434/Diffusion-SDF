@@ -4,7 +4,7 @@
   "TrainSplit": "datasets/splits/abo_fullchairs_multiray21_cod099_CHAIR_train.json",
   "ValSplit": "datasets/splits/abo_fullchairs_multiray21_cod099_CHAIR_val.json",
   "TestSplit": "datasets/splits/abo_fullchairs_multiray21_cod099_CHAIR_val.json",
-  "modulation_ckpt_path": "config/cod/stage1_sdf_head_conv_refine_multiray21_cod099/best.ckpt",
+  "modulation_ckpt_path": "config/cod/stage1_decoder_conv_head_multiray21_cod099/best.ckpt",
   "modulation_cache_path": "config/cod/stage2_fewshot_fps_cod099_shared/modulations",
   "data_path": "config/cod/stage2_fewshot_fps_cod099_shared/modulations",
   "latent_stats_path": "config/cod/stage2_fewshot_fps_cod099_shared/modulations/latent_stats.npz",
@@ -13,7 +13,7 @@
   "validation_noise_seed": 0,
   "conditioning": null,
   "training_task": "diffusion",
-  "init_from_checkpoint": "config/cod/stage2_transformer_diffusion_shapenetcore_pretrain_fps_cod099/best.ckpt",
+  "init_from_checkpoint": "config/cod/stage2_transformer_diffusion_shapenetcore_pretrain_fps_cod099/best-v1.ckpt",
   "init_from_excluded_keys": [
     "latent_mean",
     "latent_std"

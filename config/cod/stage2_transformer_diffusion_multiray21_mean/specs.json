@@ -4,7 +4,7 @@
   "TrainSplit": "datasets/splits/abo_fullchairs_multiray21_CHAIR_train.json",
   "ValSplit": "datasets/splits/abo_fullchairs_multiray21_CHAIR_val.json",
   "TestSplit": "datasets/splits/abo_fullchairs_multiray21_CHAIR_val.json",
-  "modulation_ckpt_path": "config/cod/stage1_decoder_conv_head_multiray21/best.ckpt",
+  "modulation_ckpt_path": "config/cod/stage1_decoder_conv_head_multiray21/best-v1.ckpt",
   "modulation_cache_path": "config/cod/stage2_transformer_diffusion_multiray21/modulations",
   "data_path": "config/cod/stage2_transformer_diffusion_multiray21/modulations",
   "latent_stats_path": "config/cod/stage2_transformer_diffusion_multiray21/modulations/latent_stats.npz",
