@@ -4,8 +4,8 @@
     "conditioning": null,
     "data_format": "cod_sdf.npz",
     "data_source": "/cluster/51/boschmann/datasets",
-    "description": "Dropout-free pairwise-preserving few-shot ABO adaptation from the shared FPS COD-0.99 ShapeNetCore-v2 chair diffusion prior, decoded with the trained decoder, convolutional refiner, and SDF-head VAE",
-    "path": "/cluster/51/boschmann/code/Diffusion-SDF/config/cod/stage2_fewshot_sdf_head_shapenetcore_fps_pairwise_adaptation_cod099",
+    "description": "Dropout-free few-shot ordinary ABO fine-tuning from the shared FPS COD-0.99 ShapeNetCore-v2 chair diffusion prior, decoded with the trained decoder, convolutional refiner, and SDF-head VAE",
+    "path": "/cluster/51/boschmann/code/Diffusion-SDF/config/cod/stage2_fewshot_sdf_head_shapenetcore_fps_pretrained_finetune_cod099",
     "test_split": "/cluster/51/boschmann/datasets/splits/abo_fullchairs_multiray21_cod099_CHAIR_val.json",
     "training_task": "diffusion"
   },
@@ -21,23 +21,23 @@
     "valid_reconstructions": 100
   },
   "distribution": {
-    "coverage_cd": 0.5921052631578947,
-    "jsd": 0.06432512577558713,
-    "mmd_cd": 0.14572136775012398,
+    "coverage_cd": 0.5263157894736842,
+    "jsd": 0.06670239279768167,
+    "mmd_cd": 0.14724709614152473,
     "one_nn_cd_accuracy": 0.6931818181818182,
-    "one_nn_cd_reference_accuracy": 0.8157894736842105,
-    "one_nn_cd_sample_accuracy": 0.6,
+    "one_nn_cd_reference_accuracy": 0.8421052631578947,
+    "one_nn_cd_sample_accuracy": 0.58,
     "reference_count": 76,
     "sample_count": 100
   },
   "mesh_health": {
-    "component_count_omitted": 32,
+    "component_count_omitted": 35,
     "discovered": 100,
     "invalid": 0,
-    "mean_outside_domain_vertex_fraction": 0.0001707266504349257,
+    "mean_outside_domain_vertex_fraction": 0.0003874705930960428,
     "multi_component_fraction": 1.0,
     "valid": 100,
-    "watertight_fraction": 0.98
+    "watertight_fraction": 0.93
   },
   "metric_definitions": {
     "chamfer": {

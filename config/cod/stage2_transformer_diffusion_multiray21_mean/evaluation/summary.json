@@ -4,7 +4,7 @@
     "conditioning": null,
     "data_format": "cod_sdf.npz",
     "data_source": "/cluster/51/boschmann/datasets",
-    "description": "Unconditional COD token diffusion on deduplicated multi-ray ABO chairs",
+    "description": "Unconditional COD token diffusion on deduplicated multi-ray ABO chair latents from the frozen COD encoder, decoded with the trained decoder, convolutional refiner, and SDF head",
     "path": "/cluster/51/boschmann/code/Diffusion-SDF/config/cod/stage2_transformer_diffusion_multiray21_mean",
     "test_split": "/cluster/51/boschmann/datasets/splits/abo_fullchairs_multiray21_CHAIR_val.json",
     "training_task": "diffusion"

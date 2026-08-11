@@ -1,5 +1,5 @@
 {
-  "Description": "Large CLIP image-conditioned COD token diffusion on deduplicated multi-ray ABO chairs",
+  "Description": "Large CLIP image-conditioned COD token diffusion on deduplicated multi-ray ABO chair latents from the frozen COD encoder, decoded with the trained decoder, convolutional refiner, and SDF head",
   "DataSource": "datasets",
   "TrainSplit": "datasets/splits/abo_fullchairs_multiray21_CHAIR_train.json",
   "ValSplit": "datasets/splits/abo_fullchairs_multiray21_CHAIR_val.json",

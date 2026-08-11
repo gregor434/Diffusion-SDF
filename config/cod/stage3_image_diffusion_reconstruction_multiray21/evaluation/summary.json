@@ -1990,7 +1990,7 @@
     },
     "data_format": "cod_sdf.npz",
     "data_source": "/cluster/51/boschmann/datasets",
-    "description": "Reconstruction-guided refinement of CLIP image-conditioned COD diffusion on multi-ray ABO chairs",
+    "description": "Reconstruction-guided refinement of CLIP image-conditioned COD diffusion on multi-ray ABO chair latents from the frozen COD encoder, using the trained decoder, convolutional refiner, and SDF head",
     "path": "/cluster/51/boschmann/code/Diffusion-SDF/config/cod/stage3_image_diffusion_reconstruction_multiray21",
     "test_split": "/cluster/51/boschmann/datasets/splits/abo_fullchairs_multiray21_CHAIR_val.json",
     "training_task": "combined"

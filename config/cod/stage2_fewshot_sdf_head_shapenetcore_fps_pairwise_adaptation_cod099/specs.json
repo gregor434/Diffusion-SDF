@@ -1,5 +1,5 @@
 {
-  "Description": "Dropout-free pairwise-preserving few-shot ABO adaptation from the shared FPS COD-0.99 ShapeNetCore-v2 chair diffusion prior, decoded with the trained SDF-head VAE",
+  "Description": "Dropout-free pairwise-preserving few-shot ABO adaptation from the shared FPS COD-0.99 ShapeNetCore-v2 chair diffusion prior, decoded with the trained decoder, convolutional refiner, and SDF-head VAE",
   "DataSource": "datasets",
   "TrainSplit": "datasets/splits/abo_fullchairs_multiray21_cod099_CHAIR_train.json",
   "ValSplit": "datasets/splits/abo_fullchairs_multiray21_cod099_CHAIR_val.json",

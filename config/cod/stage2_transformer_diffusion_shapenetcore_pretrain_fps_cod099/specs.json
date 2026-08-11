@@ -1,5 +1,5 @@
 {
-  "Description": "Pre-train medium unconditional diffusion on COD-0.99 ShapeNetCore-v2 chair latents from the frozen FPS COD encoder, decoded with the trained SDF-head VAE",
+  "Description": "Pre-train medium unconditional diffusion on COD-0.99 ShapeNetCore-v2 chair latents from the frozen FPS COD encoder, decoded with the trained decoder, convolutional refiner, and SDF-head VAE",
   "DataSource": "datasets",
   "TrainSplit": "datasets/splits/shapenetcore_cod099_CHAIR_train.json",
   "ValSplit": "datasets/splits/shapenetcore_cod099_CHAIR_val.json",
