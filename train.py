@@ -100,6 +100,9 @@ def train():
             paired_surface_sampling=bool(
                 specs.get("PairedSurfaceSampling", False)
             ),
+            encoder_surface_jitter_std=float(
+                specs.get("EncoderSurfaceJitterStd", 0.0)
+            ),
             sampling_seed=int(specs.get("TrainSurfaceSamplingSeed", 0)),
         )
         val_dataset = (
@@ -300,6 +303,7 @@ def build_dataset(
     deterministic_sampling=False,
     deterministic_surface_sampling=False,
     paired_surface_sampling=False,
+    encoder_surface_jitter_std=0.0,
     sampling_seed=None,
 ):
     if specs['training_task'] == 'diffusion':
@@ -326,6 +330,7 @@ def build_dataset(
         deterministic_sampling=deterministic_sampling,
         deterministic_surface_sampling=deterministic_surface_sampling,
         paired_surface_sampling=paired_surface_sampling,
+        encoder_surface_jitter_std=encoder_surface_jitter_std,
         sampling_seed=(
             int(specs.get("ValidationSamplingSeed", 0))
             if sampling_seed is None

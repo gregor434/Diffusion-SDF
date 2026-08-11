@@ -27,6 +27,7 @@ class SdfLoader(Dataset):
         deterministic_sampling=False,
         deterministic_surface_sampling=False,
         paired_surface_sampling=False,
+        encoder_surface_jitter_std=0.0,
         sampling_seed=0,
         **_,
     ):
@@ -44,11 +45,14 @@ class SdfLoader(Dataset):
             deterministic_surface_sampling
         )
         self.paired_surface_sampling = bool(paired_surface_sampling)
+        self.encoder_surface_jitter_std = float(encoder_surface_jitter_std)
         self.sampling_seed = int(sampling_seed)
         if not 0 <= self.near_surface_ratio <= 1:
             raise ValueError("near_surface_ratio must be in [0, 1]")
         if self.surface_point_count <= 0:
             raise ValueError("surface_point_count must be positive")
+        if self.encoder_surface_jitter_std < 0:
+            raise ValueError("encoder_surface_jitter_std must be non-negative")
 
         self.records = []
         data_source = Path(data_source)
@@ -152,8 +156,17 @@ class SdfLoader(Dataset):
             (np.ones(near_count, dtype=np.bool_), np.zeros(uniform_count, dtype=np.bool_))
         )[permutation]
         surface = torch.from_numpy(np.asarray(surface, dtype=np.float32))
+        encoder_surface = surface.clone()
+        if self.encoder_surface_jitter_std > 0:
+            jitter = surface_rng.normal(
+                0.0, self.encoder_surface_jitter_std, tuple(surface.shape)
+            ).astype(np.float32)
+            encoder_surface = (encoder_surface + torch.from_numpy(jitter)).clamp(
+                -1.0, 1.0
+            )
         item = {
             "surface_points": surface,
+            "encoder_surface_points": encoder_surface,
             "query_points": torch.from_numpy(
                 np.asarray(query_points[permutation], dtype=np.float32)
             ),
@@ -166,9 +179,21 @@ class SdfLoader(Dataset):
             "class_name": class_name,
         }
         if paired_surface is not None:
-            item["paired_surface_points"] = torch.from_numpy(
+            paired_surface = torch.from_numpy(
                 np.asarray(paired_surface, dtype=np.float32)
             )
+            paired_encoder_surface = paired_surface.clone()
+            if self.encoder_surface_jitter_std > 0:
+                paired_jitter = surface_rng.normal(
+                    0.0,
+                    self.encoder_surface_jitter_std,
+                    tuple(paired_surface.shape),
+                ).astype(np.float32)
+                paired_encoder_surface = (
+                    paired_encoder_surface + torch.from_numpy(paired_jitter)
+                ).clamp(-1.0, 1.0)
+            item["paired_surface_points"] = paired_surface
+            item["paired_encoder_surface_points"] = paired_encoder_surface
         if self.conditioning_sources:
             item["conditioning"] = {
                 source.name: source.load(record)

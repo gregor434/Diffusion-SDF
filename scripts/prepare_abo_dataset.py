@@ -45,6 +45,11 @@ DEFAULT_REPAIRED_MESH_DIRNAME = "repaired_meshes_cod_0999"
 REPAIR_NONE = "none"
 REPAIR_MANIFOLDPLUS = "manifoldplus"
 SIGN_RAY_COUNT = 21
+DEFAULT_NORMALIZATION_EXTENT = 0.999
+DEFAULT_ACCEPTED_PROXY_DIR = Path("datasets/repaired_meshes_cod_0999/abo/ABO")
+DEFAULT_ACCEPTED_METADATA = Path(
+    "datasets/abo_multiray21/fullchairs_preprocessing_metadata.json"
+)
 
 
 def fibonacci_sphere_directions(count: int) -> np.ndarray:
@@ -109,6 +114,48 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split-prefix", default=DEFAULT_SPLIT_PREFIX)
     parser.add_argument("--metadata-in", type=Path, default=DEFAULT_METADATA_IN)
     parser.add_argument("--metadata-out", type=Path, default=None)
+    parser.add_argument(
+        "--normalization-extent",
+        type=float,
+        default=DEFAULT_NORMALIZATION_EXTENT,
+        help="Maximum absolute normalized coordinate (legacy default: 0.999).",
+    )
+    parser.add_argument(
+        "--accepted-proxy-mode",
+        action="store_true",
+        help=(
+            "Regenerate records directly from already accepted repaired proxies. "
+            "This mode never loads raw GLBs, repairs meshes, checks fidelity, "
+            "deduplicates, or repartitions."
+        ),
+    )
+    parser.add_argument(
+        "--accepted-proxy-dir",
+        "--proxy-source-dir",
+        dest="accepted_proxy_dir",
+        type=Path,
+        default=DEFAULT_ACCEPTED_PROXY_DIR,
+    )
+    parser.add_argument(
+        "--source-all-manifest",
+        type=Path,
+        default=Path("datasets/splits/abo_fullchairs_multiray21_CHAIR_all.json"),
+    )
+    parser.add_argument(
+        "--source-train-manifest",
+        type=Path,
+        default=Path("datasets/splits/abo_fullchairs_multiray21_CHAIR_train.json"),
+    )
+    parser.add_argument(
+        "--source-val-manifest",
+        type=Path,
+        default=Path("datasets/splits/abo_fullchairs_multiray21_CHAIR_val.json"),
+    )
+    parser.add_argument(
+        "--source-preprocessing-metadata",
+        type=Path,
+        default=DEFAULT_ACCEPTED_METADATA,
+    )
     parser.add_argument(
         "--train-ratio",
         type=float,
@@ -378,6 +425,7 @@ def normalize_mesh_with_transform(
     mesh: trimesh.Trimesh,
     *,
     copy: bool = True,
+    extent: float = DEFAULT_NORMALIZATION_EXTENT,
 ) -> tuple[trimesh.Trimesh, np.ndarray, float]:
     if copy:
         mesh = mesh.copy()
@@ -386,7 +434,9 @@ def normalize_mesh_with_transform(
     radius = float(np.abs(np.asarray(mesh.vertices) - center).max())
     if radius <= 0:
         raise ValueError("mesh has zero extent")
-    scale = 0.999 / radius
+    if not 0.0 < float(extent) <= 1.0:
+        raise ValueError("normalization extent must be in (0, 1]")
+    scale = float(extent) / radius
     mesh.apply_translation(-center)
     mesh.apply_scale(scale)
     return mesh, center.astype(np.float32), scale
@@ -1308,8 +1358,185 @@ def default_metadata_out(args: argparse.Namespace) -> Path:
     return args.datasets_root / args.dataset_key / "preprocessing_metadata.json"
 
 
+def manifest_members(path: Path) -> list[str]:
+    """Read one single-class manifest without changing its stored order."""
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    classes = [classes for classes in payload.values() if isinstance(classes, dict)]
+    object_lists = [ids for classes_value in classes for ids in classes_value.values()]
+    if len(object_lists) != 1 or not isinstance(object_lists[0], list):
+        raise ValueError(f"expected one dataset/class object list in {path}")
+    members = object_lists[0]
+    if not all(isinstance(value, str) for value in members):
+        raise ValueError(f"manifest contains non-string object IDs: {path}")
+    if len(members) != len(set(members)):
+        raise ValueError(f"manifest contains duplicate object IDs: {path}")
+    return members
+
+
+def process_accepted_proxy(
+    proxy_path: Path,
+    output_path: Path,
+    *,
+    extent: float,
+    surface_point_count: int,
+    near_surface_stds: tuple[float, float],
+    uniform_point_count: int,
+    batch_size: int,
+    seed: int,
+    skip_existing: bool,
+) -> dict[str, Any]:
+    """Sample an authoritative repaired proxy without repair or filtering."""
+    if skip_existing and output_path.is_file():
+        with np.load(output_path) as record:
+            center = np.asarray(record["normalization_center"], dtype=np.float32)
+            scale = float(np.asarray(record["normalization_scale"]).item())
+        return {"normalization_center": center.tolist(), "normalization_scale": scale}
+
+    proxy = load_repaired_mesh(proxy_path)
+    proxy, center, scale = normalize_mesh_with_transform(
+        proxy, copy=False, extent=extent
+    )
+    scene = make_raycast_scene(proxy)
+    arrays = sample_cod_supervision(
+        mesh=proxy,
+        scene=scene,
+        surface_point_count=surface_point_count,
+        near_surface_stds=near_surface_stds,
+        uniform_point_count=uniform_point_count,
+        batch_size=batch_size,
+        rng=np.random.default_rng(seed),
+        sign_method="occupancy",
+    )
+    arrays.update(
+        normalization_center=center,
+        normalization_scale=np.asarray(scale, dtype=np.float32),
+        canonical_extent=np.asarray(extent, dtype=np.float32),
+        surface_source=np.asarray("accepted_repaired_proxy"),
+        fidelity_status=np.asarray("inherited"),
+    )
+    save_cod_sdf(output_path, arrays)
+    return {
+        "normalization_center": center.tolist(),
+        "normalization_scale": scale,
+    }
+
+
+def prepare_accepted_proxies(args: argparse.Namespace) -> dict[str, Any]:
+    """Create an isolated dataset from the previously accepted proxy set."""
+    extent = float(args.normalization_extent)
+    if not 0.0 < extent <= 1.0:
+        raise ValueError("--normalization-extent must be in (0, 1]")
+    source_manifests = {
+        "all": args.source_all_manifest,
+        "train": args.source_train_manifest,
+        "val": args.source_val_manifest,
+    }
+    splits = {name: manifest_members(path) for name, path in source_manifests.items()}
+    all_ids = set(splits["all"])
+    if set(splits["train"]) | set(splits["val"]) != all_ids:
+        raise ValueError("source train/val membership does not exactly cover source all")
+    if set(splits["train"]) & set(splits["val"]):
+        raise ValueError("source train and validation manifests overlap")
+
+    source_metadata = load_input_metadata(args.source_preprocessing_metadata)
+    source_products = source_metadata.get("products", {})
+    missing_metadata = sorted(all_ids - set(source_products))
+    if missing_metadata:
+        raise ValueError(
+            f"{len(missing_metadata)} accepted IDs are absent from source metadata; "
+            f"first IDs: {', '.join(missing_metadata[:5])}"
+        )
+
+    products: dict[str, dict[str, Any]] = {}
+    for index, model_id in enumerate(splits["all"], start=1):
+        proxy_path = args.accepted_proxy_dir / f"{model_id}.obj"
+        if not proxy_path.is_file():
+            raise FileNotFoundError(f"accepted proxy does not exist: {proxy_path}")
+        inherited = source_products[model_id]
+        if not inherited.get("training_eligible", False):
+            raise ValueError(f"source manifest contains ineligible object: {model_id}")
+        if inherited.get("duplicate_of") or inherited.get("filter_reason"):
+            raise ValueError(f"source manifest contains filtered/duplicate object: {model_id}")
+
+        output_path = object_output_paths(
+            args.datasets_root, args.dataset_key, args.class_name, model_id
+        )
+        print(f"[{index}/{len(splits['all'])}] sampling accepted proxy {model_id}")
+        transform = process_accepted_proxy(
+            proxy_path,
+            output_path,
+            extent=extent,
+            surface_point_count=args.surface_point_count,
+            near_surface_stds=tuple(args.near_surface_stds),
+            uniform_point_count=args.uniform_point_count,
+            batch_size=args.batch_size,
+            seed=model_seed(args.seed, model_id),
+            skip_existing=args.skip_existing,
+        )
+        inherited_repair = inherited.get("preprocessing_repair", {})
+        products[model_id] = {
+            "instance_id": model_id,
+            "3dmodel_id": model_id,
+            "processed": True,
+            "training_eligible": True,
+            "cod_sdf_path": str(output_path),
+            "source_proxy_path": str(proxy_path),
+            "source_proxy_sha256": file_sha256(proxy_path),
+            "source_preprocessing_metadata": str(args.source_preprocessing_metadata),
+            "source_preprocessing_record": inherited,
+            "inherited_fidelity_result": inherited_repair.get("fidelity"),
+            "fidelity_status": "inherited",
+            "filtering_performed": False,
+            "canonical_extent": extent,
+            **transform,
+        }
+
+    manifest_paths: dict[str, str] = {}
+    for name, ids in splits.items():
+        path = args.datasets_root / "splits" / f"{args.split_prefix}_{name}.json"
+        write_manifest(path, args.dataset_key, args.class_name, ids)
+        manifest_paths[name] = str(path)
+
+    metadata_path = args.metadata_out or default_metadata_out(args)
+    metadata = {
+        "dataset_key": args.dataset_key,
+        "class_name": args.class_name,
+        "mode": "accepted_repaired_proxies",
+        "fidelity_status": "inherited",
+        "filtering_performed": False,
+        "filtering_note": "No repair, fidelity evaluation, deduplication, or filtering was performed.",
+        "canonical_extent": extent,
+        "normalization": "proxy exact bbox center plus isotropic max-absolute scaling",
+        "source_preprocessing_metadata": str(args.source_preprocessing_metadata),
+        "source_preprocessing_metadata_sha256": file_sha256(
+            args.source_preprocessing_metadata
+        ),
+        "source_preprocessing_settings": source_metadata.get("preprocessing"),
+        "source_manifest_lineage": {
+            name: {"path": str(path), "sha256": file_sha256(path)}
+            for name, path in source_manifests.items()
+        },
+        "pool_settings": {
+            "surface_point_count": args.surface_point_count,
+            "near_surface_stds": list(args.near_surface_stds),
+            "near_surface_point_count": args.surface_point_count * len(args.near_surface_stds),
+            "uniform_point_count": args.uniform_point_count,
+            "sdf_sign_method": f"multi_ray_majority_{SIGN_RAY_COUNT}",
+        },
+        "counts": {name: len(ids) for name, ids in splits.items()},
+        "manifests": manifest_paths,
+        "products": products,
+    }
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    return {"splits": splits, "metadata_path": str(metadata_path)}
+
+
 def main() -> None:
     args = parse_args()
+    if args.accepted_proxy_mode:
+        prepare_accepted_proxies(args)
+        return
     if args.model_workers <= 0:
         raise ValueError("--model-workers must be positive")
     if args.no_model_isolation and args.model_workers != 1:

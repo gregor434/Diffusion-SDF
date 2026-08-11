@@ -371,7 +371,7 @@ class CombinedModel(pl.LightningModule):
                 )
             )
         output = self.sdf_model(
-            batch["surface_points"],
+            batch.get("encoder_surface_points", batch["surface_points"]),
             batch["query_points"],
             sample_posterior=sample_posterior,
             return_initial_sdf=needs_initial_sdf or needs_uncertainty,
@@ -405,7 +405,10 @@ class CombinedModel(pl.LightningModule):
             )
         latent_consistency = sdf.new_zeros(())
         if float(weights.get("latent_consistency", 0.0)) > 0:
-            paired_surface = batch.get("paired_surface_points")
+            paired_surface = batch.get(
+                "paired_encoder_surface_points",
+                batch.get("paired_surface_points"),
+            )
             if paired_surface is None:
                 raise ValueError(
                     "a positive latent_consistency weight requires "

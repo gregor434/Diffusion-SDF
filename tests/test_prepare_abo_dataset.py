@@ -1,6 +1,7 @@
 import tempfile
 import threading
 import unittest
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -70,6 +71,110 @@ class CODPreprocessingTests(unittest.TestCase):
         transformed = (mesh.vertices - center) * scale
         np.testing.assert_allclose(transformed, normalized.vertices, atol=1e-6)
         self.assertEqual(np.asarray(scale).shape, ())
+
+    def test_normalization_extent_uses_actual_off_center_proxy_bounds(self):
+        mesh = trimesh.creation.box(extents=(2.0, 4.0, 6.0))
+        mesh.apply_translation((13.0, -7.0, 2.5))
+        normalized, center, scale = normalize_mesh_with_transform(
+            mesh, extent=0.99
+        )
+
+        np.testing.assert_allclose(center, [13.0, -7.0, 2.5], atol=1e-6)
+        np.testing.assert_allclose(normalized.bounds.mean(axis=0), 0.0, atol=1e-6)
+        self.assertAlmostEqual(
+            float(np.abs(np.asarray(normalized.vertices)).max()), 0.99, places=6
+        )
+        np.testing.assert_allclose(
+            normalized.vertices, (mesh.vertices - center) * scale, atol=1e-6
+        )
+
+    def test_accepted_proxy_mode_inherits_exact_splits_without_filtering(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            proxy_dir = root / "proxies"
+            proxy_dir.mkdir()
+            split_members = {
+                "all": ["accepted_b", "accepted_a"],
+                "train": ["accepted_b"],
+                "val": ["accepted_a"],
+            }
+            manifests = {}
+            for name, members in split_members.items():
+                path = root / f"source_{name}.json"
+                path.write_text(
+                    json.dumps({"abo_multiray21": {"ABO": members}}),
+                    encoding="utf-8",
+                )
+                manifests[name] = path
+            fidelity = self.accepted_fidelity()
+            source_metadata = root / "source_metadata.json"
+            source_metadata.write_text(
+                json.dumps({
+                    "products": {
+                        model_id: {
+                            "training_eligible": True,
+                            "preprocessing_repair": {"fidelity": fidelity},
+                        }
+                        for model_id in split_members["all"]
+                    }
+                }),
+                encoding="utf-8",
+            )
+            for model_id in split_members["all"]:
+                (proxy_dir / f"{model_id}.obj").write_text(
+                    f"authoritative proxy {model_id}\n", encoding="utf-8"
+                )
+            args = SimpleNamespace(
+                normalization_extent=0.99,
+                source_all_manifest=manifests["all"],
+                source_train_manifest=manifests["train"],
+                source_val_manifest=manifests["val"],
+                source_preprocessing_metadata=source_metadata,
+                accepted_proxy_dir=proxy_dir,
+                datasets_root=root / "output",
+                dataset_key="abo_cod099",
+                class_name="ABO",
+                split_prefix="abo_fullchairs_multiray21_cod099_CHAIR",
+                metadata_out=None,
+                surface_point_count=8,
+                near_surface_stds=(0.005, 0.0005),
+                uniform_point_count=8,
+                batch_size=8,
+                seed=3,
+                skip_existing=False,
+            )
+
+            with mock.patch.object(
+                preprocessing,
+                "process_accepted_proxy",
+                return_value={
+                    "normalization_center": [1.0, 2.0, 3.0],
+                    "normalization_scale": 0.5,
+                },
+            ) as process_proxy, mock.patch.object(
+                preprocessing, "repair_mesh_with_manifoldplus"
+            ) as repair, mock.patch.object(
+                preprocessing, "repaired_mesh_fidelity"
+            ) as evaluate_fidelity:
+                result = preprocessing.prepare_accepted_proxies(args)
+
+            self.assertEqual(process_proxy.call_count, 2)
+            repair.assert_not_called()
+            evaluate_fidelity.assert_not_called()
+            for name, expected in split_members.items():
+                generated = json.loads(
+                    (root / "output" / "splits" / f"{args.split_prefix}_{name}.json")
+                    .read_text(encoding="utf-8")
+                )
+                self.assertEqual(generated["abo_cod099"]["ABO"], expected)
+            metadata = json.loads(Path(result["metadata_path"]).read_text())
+            self.assertEqual(metadata["fidelity_status"], "inherited")
+            self.assertFalse(metadata["filtering_performed"])
+            self.assertEqual(metadata["canonical_extent"], 0.99)
+            self.assertEqual(metadata["counts"], {"all": 2, "train": 1, "val": 1})
+            for product in metadata["products"].values():
+                self.assertEqual(product["inherited_fidelity_result"], fidelity)
+                self.assertEqual(len(product["source_proxy_sha256"]), 64)
 
     def test_cod_npz_has_separate_surface_and_supervision_arrays(self):
         arrays = {

@@ -173,6 +173,64 @@ class CODPipelineTests(unittest.TestCase):
             with self.subTest(path=path):
                 validate_training_specs(json.loads(path.read_text()))
 
+    def test_cod099_profiles_have_isolated_checkpoint_and_cache_lineage(self):
+        repository = Path(__file__).resolve().parents[1]
+        config_root = repository / "config" / "cod"
+        names = {
+            name: json.loads((config_root / name / "specs.json").read_text())
+            for name in (
+                "stage1_sdf_head_multiray21_cod099",
+                "stage1_sdf_head_polish_multiray21_cod099",
+                "stage1_sdf_head_conv_refine_multiray21_cod099",
+                "stage2_transformer_diffusion_shapenetcore_pretrain_fps_cod099",
+                "stage2_fewshot_sdf_head_shapenetcore_fps_pretrained_finetune_cod099",
+                "stage2_fewshot_sdf_head_shapenetcore_fps_pairwise_adaptation_cod099",
+            )
+        }
+        bootstrap, polish, refinement, pretrain, finetune, pairwise = names.values()
+        self.assertNotIn("init_from_checkpoint", bootstrap)
+        self.assertEqual(bootstrap["stage1_mode"], "sdf_head_only")
+        self.assertEqual(bootstrap["learning_rates"], {"sdf_network": 2e-4})
+        self.assertEqual(bootstrap["loss_weights"]["eikonal"], 0.0)
+        self.assertEqual(bootstrap["loss_weights"]["normal"], 0.0)
+        self.assertEqual(bootstrap["early_stopping"]["patience"], 30)
+        self.assertEqual(
+            polish["init_from_checkpoint"],
+            "config/cod/stage1_sdf_head_multiray21_cod099/best.ckpt",
+        )
+        self.assertEqual(polish["learning_rates"], {"sdf_network": 1e-4})
+        self.assertEqual(polish["early_stopping"]["patience"], 20)
+        self.assertEqual(
+            refinement["init_from_checkpoint"],
+            "config/cod/stage1_sdf_head_polish_multiray21_cod099/best.ckpt",
+        )
+        self.assertEqual(refinement["early_stopping"]["patience"], 150)
+        self.assertEqual(refinement["early_stopping"]["min_delta"], 5e-5)
+        for stage1 in (bootstrap, polish, refinement):
+            self.assertEqual(stage1["EncoderSurfaceJitterStd"], 0.005)
+            self.assertIn(
+                "abo_fullchairs_multiray21_cod099", stage1["TrainSplit"]
+            )
+        self.assertIn("shapenetcore_cod099", pretrain["TrainSplit"])
+        self.assertEqual(
+            pretrain["modulation_ckpt_path"],
+            "config/cod/stage1_sdf_head_conv_refine_multiray21_cod099/best.ckpt",
+        )
+        prior = (
+            "config/cod/"
+            "stage2_transformer_diffusion_shapenetcore_pretrain_fps_cod099/best.ckpt"
+        )
+        shared_cache = "config/cod/stage2_fewshot_fps_cod099_shared/modulations"
+        for profile in (finetune, pairwise):
+            self.assertEqual(profile["init_from_checkpoint"], prior)
+            self.assertEqual(profile["modulation_cache_path"], shared_cache)
+            self.assertEqual(profile["latent_stats_path"], shared_cache + "/latent_stats.npz")
+            self.assertEqual(profile["init_from_excluded_keys"], ["latent_mean", "latent_std"])
+        self.assertEqual(finetune["lambda_pairwise"], 0.0)
+        self.assertNotIn("source_diffusion_checkpoint", finetune)
+        self.assertEqual(pairwise["lambda_pairwise"], 0.1)
+        self.assertEqual(pairwise["source_diffusion_checkpoint"], prior)
+
     def test_cod_sdf_forward_preserves_native_shapes(self):
         model = SdfModel(tiny_specs()).eval()
         output = model(
@@ -1049,6 +1107,73 @@ class CODPipelineTests(unittest.TestCase):
         )
         torch.testing.assert_close(
             item["query_sdf"], repeated["query_sdf"], rtol=0, atol=0
+        )
+
+    def test_sdf_loader_jitters_only_reproducible_encoder_surfaces(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "abo" / "ABO" / "item" / "cod_sdf.npz"
+            path.parent.mkdir(parents=True)
+            surface = np.linspace(-1.2, 1.2, 180, dtype=np.float32).reshape(60, 3)
+            near = np.linspace(-0.8, 0.8, 90, dtype=np.float32).reshape(30, 3)
+            uniform = np.linspace(-1.0, 1.0, 90, dtype=np.float32).reshape(30, 3)
+            np.savez(
+                path,
+                surface_points=surface,
+                surface_normals=np.ones_like(surface),
+                near_surface_query_points=near,
+                near_surface_sdf=np.arange(30, dtype=np.float32),
+                uniform_query_points=uniform,
+                uniform_sdf=np.arange(30, 60, dtype=np.float32),
+            )
+            kwargs = dict(
+                data_source=tmpdir,
+                split_file={"abo": {"ABO": ["item"]}},
+                samples_per_mesh=20,
+                surface_point_count=12,
+                paired_surface_sampling=True,
+                deterministic_sampling=True,
+                sampling_seed=41,
+            )
+            clean = SdfLoader(**kwargs)[0]
+            jittered_dataset = SdfLoader(
+                **kwargs, encoder_surface_jitter_std=0.005
+            )
+            jittered = jittered_dataset[0]
+            repeated = jittered_dataset[0]
+
+        for key in (
+            "surface_points",
+            "paired_surface_points",
+            "surface_normals",
+            "query_points",
+            "query_sdf",
+            "query_is_near",
+        ):
+            torch.testing.assert_close(jittered[key], clean[key], rtol=0, atol=0)
+        self.assertFalse(
+            torch.equal(jittered["encoder_surface_points"], jittered["surface_points"])
+        )
+        self.assertFalse(torch.equal(
+            jittered["paired_encoder_surface_points"],
+            jittered["paired_surface_points"],
+        ))
+        self.assertFalse(torch.equal(
+            jittered["encoder_surface_points"],
+            jittered["paired_encoder_surface_points"],
+        ))
+        self.assertLessEqual(jittered["encoder_surface_points"].max().item(), 1.0)
+        self.assertGreaterEqual(jittered["encoder_surface_points"].min().item(), -1.0)
+        torch.testing.assert_close(
+            jittered["encoder_surface_points"],
+            repeated["encoder_surface_points"],
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            jittered["paired_encoder_surface_points"],
+            repeated["paired_encoder_surface_points"],
+            rtol=0,
+            atol=0,
         )
 
     def test_sdf_loader_can_fix_surface_without_fixing_query_supervision(self):

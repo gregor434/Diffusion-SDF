@@ -33,6 +33,7 @@ import trimesh
 try:
     from scripts.prepare_shapenetpart_chairs import (
         normalize_points_abo,
+        normalization_extent,
         output_path,
         partition_model_ids,
         positive_int,
@@ -42,6 +43,7 @@ try:
 except ModuleNotFoundError:  # Direct execution: python scripts/prepare_....py
     from prepare_shapenetpart_chairs import (  # type: ignore[no-redef]
         normalize_points_abo,
+        normalization_extent,
         output_path,
         partition_model_ids,
         positive_int,
@@ -60,6 +62,7 @@ DEFAULT_SURFACE_POINT_COUNT = 10_000
 DEFAULT_TRAIN_RATIO = 0.9
 DEFAULT_SPLIT_SEED = 0
 DEFAULT_SAMPLING_SEED = 0
+DEFAULT_NORMALIZATION_EXTENT = 0.999
 MESH_RELATIVE_PATH = Path("models/model_normalized.obj")
 
 
@@ -79,6 +82,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--class-name", default=DEFAULT_CLASS_NAME)
     parser.add_argument("--category-id", default=DEFAULT_CATEGORY_ID)
     parser.add_argument("--split-prefix", default=DEFAULT_SPLIT_PREFIX)
+    parser.add_argument(
+        "--normalization-extent",
+        type=normalization_extent,
+        default=DEFAULT_NORMALIZATION_EXTENT,
+        help="Maximum absolute normalized mesh coordinate (default: 0.999).",
+    )
     parser.add_argument(
         "--surface-point-count",
         type=positive_int,
@@ -208,6 +217,7 @@ def convert_one(
     sampling_seed: int,
     skip_existing: bool,
     require_watertight: bool,
+    normalization_extent: float = DEFAULT_NORMALIZATION_EXTENT,
 ) -> str:
     if skip_existing and destination.is_file():
         return "skipped"
@@ -217,7 +227,9 @@ def convert_one(
     if require_watertight and not is_watertight:
         raise ValueError("mesh is not watertight")
 
-    normalized_vertices, center, scale = normalize_points_abo(mesh.vertices)
+    normalized_vertices, center, scale = normalize_points_abo(
+        mesh.vertices, normalization_extent
+    )
     rng = np.random.default_rng(object_seed(sampling_seed, model_id))
     surface_points = sample_surface_area_weighted(
         normalized_vertices, mesh.faces, surface_point_count, rng
@@ -232,6 +244,7 @@ def convert_one(
                 surface_points=surface_points,
                 normalization_center=center,
                 normalization_scale=scale,
+                canonical_extent=np.asarray(normalization_extent, dtype=np.float32),
                 source_is_watertight=np.asarray(is_watertight),
                 source_format=np.asarray("shapenetcore_v2_model_normalized_obj"),
             )
@@ -266,6 +279,9 @@ def prepare_dataset(args: argparse.Namespace) -> dict[str, object]:
             sampling_seed=args.sampling_seed,
             skip_existing=args.skip_existing,
             require_watertight=args.require_watertight,
+            normalization_extent=getattr(
+                args, "normalization_extent", DEFAULT_NORMALIZATION_EXTENT
+            ),
         )
         return model_id, status
 
@@ -303,7 +319,13 @@ def prepare_dataset(args: argparse.Namespace) -> dict[str, object]:
         "source_category_dir": str(category_dir),
         "source_format": "ShapeNetCore-v2 model_normalized.obj",
         "usage": "stage_two_latent_extraction_and_diffusion_only",
-        "normalization": "x_prime = scale * (x - exact_mesh_bbox_center), isotropic max_abs_0.999",
+        "normalization": (
+            "x_prime = scale * (x - exact_mesh_bbox_center), isotropic max_abs_"
+            f"{getattr(args, 'normalization_extent', DEFAULT_NORMALIZATION_EXTENT):g}"
+        ),
+        "canonical_extent": getattr(
+            args, "normalization_extent", DEFAULT_NORMALIZATION_EXTENT
+        ),
         "surface_sampling": {
             "method": "triangle_area_weighted",
             "points_per_mesh": args.surface_point_count,

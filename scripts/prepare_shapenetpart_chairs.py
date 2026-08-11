@@ -37,6 +37,7 @@ DEFAULT_CATEGORY_ID = "03001627"
 DEFAULT_SPLIT_PREFIX = "shapenetpart_CHAIR"
 DEFAULT_TRAIN_RATIO = 0.9
 DEFAULT_SPLIT_SEED = 0
+DEFAULT_NORMALIZATION_EXTENT = 0.999
 
 
 def positive_int(value: str) -> int:
@@ -50,6 +51,13 @@ def train_ratio(value: str) -> float:
     parsed = float(value)
     if not 0.0 < parsed < 1.0:
         raise argparse.ArgumentTypeError("value must be strictly between 0 and 1")
+    return parsed
+
+
+def normalization_extent(value: str) -> float:
+    parsed = float(value)
+    if not 0.0 < parsed <= 1.0:
+        raise argparse.ArgumentTypeError("normalization extent must be in (0, 1]")
     return parsed
 
 
@@ -70,6 +78,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--class-name", default=DEFAULT_CLASS_NAME)
     parser.add_argument("--category-id", default=DEFAULT_CATEGORY_ID)
     parser.add_argument("--split-prefix", default=DEFAULT_SPLIT_PREFIX)
+    parser.add_argument(
+        "--normalization-extent",
+        type=normalization_extent,
+        default=DEFAULT_NORMALIZATION_EXTENT,
+        help="Maximum absolute normalized coordinate (default: 0.999).",
+    )
     parser.add_argument(
         "--train-ratio",
         type=train_ratio,
@@ -119,8 +133,9 @@ def resolve_source_root(source_dir: Path, category_id: str) -> Path:
 
 def normalize_points_abo(
     points: np.ndarray,
+    extent: float = DEFAULT_NORMALIZATION_EXTENT,
 ) -> tuple[np.ndarray, np.ndarray, np.float32]:
-    """Apply the ABO/COD bbox-center and isotropic max-abs-0.999 transform."""
+    """Apply the ABO/COD bbox-center and isotropic max-abs transform."""
     points = np.asarray(points, dtype=np.float32)
     if points.ndim != 2 or points.shape[1] != 3 or len(points) == 0:
         raise ValueError(f"expected a non-empty (N, 3) point array, got {points.shape}")
@@ -134,7 +149,9 @@ def normalize_points_abo(
     radius = float(np.abs(centered).max())
     if radius <= 0:
         raise ValueError("point cloud has zero extent")
-    scale = np.float32(0.999 / radius)
+    if not 0.0 < float(extent) <= 1.0:
+        raise ValueError("normalization extent must be in (0, 1]")
+    scale = np.float32(float(extent) / radius)
     normalized = (centered * scale).astype(np.float32)
     return normalized, center, scale
 
@@ -161,11 +178,14 @@ def convert_one(
     destination: Path,
     *,
     skip_existing: bool,
+    normalization_extent: float = DEFAULT_NORMALIZATION_EXTENT,
 ) -> str:
     if skip_existing and destination.is_file():
         return "skipped"
 
-    normalized, center, scale = normalize_points_abo(load_xyz(source_path))
+    normalized, center, scale = normalize_points_abo(
+        load_xyz(source_path), normalization_extent
+    )
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f"{destination.name}.tmp.{os.getpid()}")
     try:
@@ -175,6 +195,7 @@ def convert_one(
                 surface_points=normalized,
                 normalization_center=center,
                 normalization_scale=scale,
+                canonical_extent=np.asarray(normalization_extent, dtype=np.float32),
                 source_format=np.asarray("shapenetpart_normal_txt"),
             )
         temporary.replace(destination)
@@ -243,6 +264,9 @@ def prepare_dataset(args: argparse.Namespace) -> dict[str, object]:
             source_path,
             destination,
             skip_existing=args.skip_existing,
+            normalization_extent=getattr(
+                args, "normalization_extent", DEFAULT_NORMALIZATION_EXTENT
+            ),
         )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
@@ -286,7 +310,13 @@ def prepare_dataset(args: argparse.Namespace) -> dict[str, object]:
         "source_root": str(source_root),
         "source_format": "ShapeNetPart normalized point clouds (XYZ columns only)",
         "usage": "stage_two_latent_extraction_and_diffusion_only",
-        "normalization": "x_prime = scale * (x - bbox_center), isotropic max_abs_0.999",
+        "normalization": (
+            "x_prime = scale * (x - bbox_center), isotropic max_abs_"
+            f"{getattr(args, 'normalization_extent', DEFAULT_NORMALIZATION_EXTENT):g}"
+        ),
+        "canonical_extent": getattr(
+            args, "normalization_extent", DEFAULT_NORMALIZATION_EXTENT
+        ),
         "partition": {
             "method": "deterministic_random_train_val_over_all_available_chairs",
             "train_ratio": args.train_ratio,

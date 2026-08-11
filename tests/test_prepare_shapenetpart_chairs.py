@@ -41,6 +41,11 @@ class ShapeNetPartPreparationTests(unittest.TestCase):
         self.assertAlmostEqual(float(np.abs(normalized).max()), 0.999, places=6)
         np.testing.assert_allclose(normalized, (points - center) * scale)
 
+    def test_point_normalization_supports_explicit_cod099_extent(self):
+        points = np.asarray([[-4.0, 2.0, 8.0], [2.0, 6.0, 10.0]], np.float32)
+        normalized, _, _ = normalize_points_abo(points, extent=0.99)
+        self.assertAlmostEqual(float(np.abs(normalized).max()), 0.99, places=6)
+
     def test_converts_xyz_only_and_writes_pipeline_manifests(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

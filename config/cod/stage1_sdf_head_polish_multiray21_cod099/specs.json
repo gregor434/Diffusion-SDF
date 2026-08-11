@@ -1,22 +1,20 @@
 {
-  "Description": "250-epoch geometry continuation with fast convolution refinement and deterministic validation",
+  "Description": "Polish the geometry-free COD-0.99 SDF head with a fresh lower-rate optimizer",
   "DataSource": "datasets",
-  "TrainSplit": "datasets/splits/abo_fullchairs_CHAIR_train.json",
-  "ValSplit": "datasets/splits/abo_fullchairs_CHAIR_val.json",
-  "TestSplit": "datasets/splits/abo_fullchairs_CHAIR_val.json",
-  "ModulationSplit": "datasets/splits/abo_fullchairs_CHAIR_all.json",
+  "TrainSplit": "datasets/splits/abo_fullchairs_multiray21_cod099_CHAIR_train.json",
+  "ValSplit": "datasets/splits/abo_fullchairs_multiray21_cod099_CHAIR_val.json",
+  "TestSplit": "datasets/splits/abo_fullchairs_multiray21_cod099_CHAIR_val.json",
+  "ModulationSplit": "datasets/splits/abo_fullchairs_multiray21_cod099_CHAIR_all.json",
+  "init_from_checkpoint": "config/cod/stage1_sdf_head_multiray21_cod099/best.ckpt",
   "training_task": "modulation",
-  "stage1_mode": "triplane_sdf_finetune",
-  "sample_posterior": true,
+  "stage1_mode": "sdf_head_only",
+  "sample_posterior": false,
   "validation_sample_posterior": false,
   "DeterministicValidationSampling": true,
   "ValidationSamplingSeed": 0,
   "ValidateGeometryRegularization": true,
   "GeometryRegularizationSamples": 512,
   "GeometryFiniteDifferenceStep": 0.01,
-  "init_from_allowed_missing_prefixes": [
-    "sdf_model.cod_vae.autoencoder.decoder.conv_refine."
-  ],
   "CODVaeSpecs": {
     "checkpoint_path": "tmp/cod_vae_m32_weights.pt",
     "strict_checkpoint_loading": true,
@@ -61,23 +59,29 @@
     "cod_aux": 0.0,
     "uncertainty": 0.0,
     "surface_zero": 1.0,
-    "eikonal": 0.02,
-    "normal": 0.02,
+    "eikonal": 0.0,
+    "normal": 0.0,
     "kl": 0.0
   },
   "learning_rates": {
-    "conv_refine": 0.0001,
-    "triplane_decoder": 0.00001,
-    "sdf_network": 0.00004
+    "sdf_network": 0.0001
   },
   "lr_scheduler": {
     "type": "cosine",
-    "min_lr": 0.000001,
-    "epochs": 250
+    "min_lr": 0.000002,
+    "epochs": 100
+  },
+  "early_stopping": {
+    "monitor": "val/loss",
+    "mode": "min",
+    "patience": 20,
+    "min_delta": 0.0001,
+    "verbose": true
   },
   "weight_decay": 0.0,
   "gradient_clip_val": 1.0,
-  "num_epochs": 250,
-  "log_freq": 50,
-  "log_every_n_steps": 20
+  "num_epochs": 100,
+  "log_freq": 25,
+  "log_every_n_steps": 20,
+  "EncoderSurfaceJitterStd": 0.005
 }
